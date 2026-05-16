@@ -87,6 +87,7 @@ public class PostMapper {
         metadata.put("sentiment_score", rs.getDouble("sentiment_score"));
         metadata.put("likes", rs.getInt("like_count"));
         metadata.put("comments", rs.getInt("comments_count"));
+        metadata.put("media_type", rs.getString("media_type"));
         metadata.put("permalink", rs.getString("permalink"));
 
         return new UniversalPost(postId, authorId, content, timestamp, platform, metadata);

@@ -116,7 +116,7 @@ public class GenreInterestProfiler {
     }
 
     private List<ScoredPost> fetchYoutubeComments() {
-        String sql = "SELECT id, author, text, keyword, sentiment_score, like_count " +
+        String sql = "SELECT id, author, text, keyword, sentiment_score, likes_count " +
                      "FROM youtube_comments WHERE author IS NOT NULL AND author <> ''";
         return jdbc.query(sql, (rs, rowNum) -> {
             Map<String, Object> metadata = new HashMap<>();
@@ -128,8 +128,8 @@ public class GenreInterestProfiler {
                     null,
                     "youtube_comments",
                     metadata);
-            // No views column → use like_count as the engagement proxy.
-            double interest = baseInterest(rs.getDouble("sentiment_score"), rs.getLong("like_count"));
+            // No views column → use likes_count as the engagement proxy.
+            double interest = baseInterest(rs.getDouble("sentiment_score"), rs.getLong("likes_count"));
             return new ScoredPost(post, interest);
         });
     }

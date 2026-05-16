@@ -6,9 +6,11 @@ import org.springframework.stereotype.Service;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.regex.Pattern;
 
 @Service
@@ -33,6 +35,21 @@ public class GenreClassifier {
     public GenreClassifier(Map<String, List<String>> genreKeywords) {
         this.genreKeywords = genreKeywords;
         this.compiledPatterns = compilePatterns(genreKeywords);
+    }
+
+    /** Genre names known to this classifier, in registration order. */
+    public Set<String> knownGenres() {
+        return Collections.unmodifiableSet(genreKeywords.keySet());
+    }
+
+    /** Keyword vocabulary for {@code genre}, or empty if the genre is unknown. */
+    public List<String> keywordsFor(String genre) {
+        for (Map.Entry<String, List<String>> entry : genreKeywords.entrySet()) {
+            if (entry.getKey().equalsIgnoreCase(genre)) {
+                return Collections.unmodifiableList(entry.getValue());
+            }
+        }
+        return List.of();
     }
 
     public List<GenreLabel> classifyPost(UniversalPost post) {

@@ -21,6 +21,8 @@ of REST endpoints that can be consumed by an ad-buying or campaign-planning serv
    - [User Report (`/api/marketing/user-report`)](#3-user-report-api)
    - [Author Categorisation (`/api/marketing/users`)](#4-author-categorisation-api)
    - [Genre Marketing (`/api/marketing/genre`)](#5-genre-marketing-api)
+   - [Political Marketing (`/api/marketing/party`)](#5a-political-marketing-api)
+   - [Celebrity Marketing (`/api/marketing/celebrity`)](#5b-celebrity-marketing-api)
    - [Viral Seeds & Aspect Drivers (`/api/marketing`)](#6-viral-seeds--aspect-drivers)
    - [Top Spreaders (`/api/marketing/top-50-spreaders`)](#7-top-spreaders)
    - [Lookalike Discovery (`/api/marketing/find-lookalikes`)](#8-lookalike-discovery)
@@ -337,8 +339,24 @@ This endpoint is also fired automatically every 24h by the scheduler.
 
 ### 5. Genre Marketing API
 
-Three flat-JSON endpoints designed for an ad-buying dashboard. The `{genre}` path
+Flat-JSON endpoints designed for an ad-buying dashboard. The `{genre}` path
 parameter accepts case-insensitive labels (e.g. `horror`, `Action`, `thriller`).
+
+**`GET /api/marketing/genre`**
+
+Lists every movie genre the classifier can score against. Use this to discover
+valid `{genre}` path values for the three endpoints below.
+
+```json
+{
+  "totalGenres": 12,
+  "genres": [
+    { "genre": "Horror",   "keywordCount": 12 },
+    { "genre": "Sci-Fi",   "keywordCount": 12 },
+    { "genre": "Thriller", "keywordCount":  9 }
+  ]
+}
+```
 
 **`GET /api/marketing/genre/{genre}/potential-viewers`**
 
@@ -387,7 +405,7 @@ Per-platform reach and a copy-ready `headline` string. Reach metric is platform-
 | Platform   | Reach proxy     |
 |------------|-----------------|
 | X          | `views_count`   |
-| YouTube    | `like_count`    |
+| YouTube    | `likes_count`   |
 | Reddit     | `num_comments`  |
 | Instagram  | `like_count`    |
 
@@ -406,6 +424,137 @@ Per-platform reach and a copy-ready `headline` string. Reach metric is platform-
   ]
 }
 ```
+
+---
+
+### 5a. Political Marketing API
+
+Party-scoped equivalents of the Genre endpoints. The `{party}` path parameter
+is matched (case-insensitive) against `entity_keywords.keyword` for rows where
+`category = 'media.politics'`. There is no precomputed per-user party-affinity
+column, so each call aggregates the source post tables on the fly — slightly
+slower than the genre endpoints, but uses only data already collected.
+
+**`GET /api/marketing/party`**
+
+Lists every party known to `entity_keywords` (grouped by `entity_id`, joined to
+`managed_entities` for the canonical name). `state` is taken from
+`entity_keywords.state`; `keywords` lists all keyword variants for that entity.
+
+```json
+{
+  "category":     "media.politics",
+  "totalParties": 2,
+  "parties": [
+    { "entityId": 41, "name": "DMK", "type": "POLITICAL_PARTY", "state": "Tamil Nadu", "keywords": ["DMK","dmk"] },
+    { "entityId": 42, "name": "BJP", "type": "POLITICAL_PARTY", "state": "Tamil Nadu", "keywords": ["BJP","bjp"] }
+  ]
+}
+```
+
+**`GET /api/marketing/party/{party}/potential-voters`**
+
+Users who have posted with `keyword = {party}` on any platform. The affinity
+score is a soft-saturated function of post count and total engagement; users
+are sorted by `p_conv = sigmoid(affinity_score * influence_rank)`.
+
+```json
+{
+  "party": "DMK",
+  "scoringModel": "p_conv = 1 / (1 + exp(-(affinity_score * influence_rank)))",
+  "totalVoters": 312,
+  "voters": [
+    {
+      "global_user_id": "@stalin_official",
+      "tribe_label": "Political-Engager",
+      "platform_handles": { "primary_platform": "x", "by_platform": {"x": {"profile_url": "..."}} },
+      "peak_activity_times": { "hours": [19, 20, 21] },
+      "post_count": 47,
+      "total_engagement": 18234,
+      "affinity_score": 0.91,
+      "influence_rank": 0.78,
+      "moi_score": 14.2,
+      "p_conv": 0.671
+    }
+  ]
+}
+```
+
+**`GET /api/marketing/party/{party}/super-spreaders`**
+
+Top **50** users who posted about `{party}`, ranked by Hawkes α
+(`influence_rank`).
+
+```json
+{
+  "party": "DMK",
+  "limit": 50,
+  "rankingMetric": "hawkes_alpha (stored as influence_rank)",
+  "totalSpreaders": 50,
+  "spreaders": [ { "global_user_id": "...", "hawkes_alpha": 0.93, "post_count": 22, "...": "..." } ]
+}
+```
+
+**`GET /api/marketing/party/{party}/channel-strategy`**
+
+Per-platform reach for the party keyword, with copy-ready `headline`. Reach
+proxies:
+
+| Platform   | Reach proxy     |
+|------------|-----------------|
+| X          | `views_count`   |
+| YouTube    | `likes_count`   |
+| Reddit     | `num_comments`  |
+| Instagram  | `like_count`    |
+
+```json
+{
+  "party": "DMK",
+  "audienceSize": 312,
+  "reachMetric": {"X":"views_count","YouTube":"likes_count","Reddit":"num_comments","Instagram":"like_count"},
+  "topChannel": "X",
+  "headline": "DMK supporters is 2.4x more active on X than YouTube.",
+  "channels": [ { "platform": "X", "reach": 184321, "postCount": 412, "relative_strength": 1.0 } ]
+}
+```
+
+---
+
+### 5b. Celebrity Marketing API
+
+Mirror of the political endpoints but filtered to `category = 'media.celebrity'`.
+Audience and spreaders are renamed `fans` / `superFans`.
+
+**`GET /api/marketing/celebrity`**
+
+```json
+{
+  "category": "media.celebrity",
+  "totalCelebrities": 14,
+  "celebrities": [
+    { "entityId": 33, "name": "Sai Dharam Tej", "type": "CELEBRITY", "industry": "Tollywood",
+      "keywords": ["SaiDharamTej","saidharamtej"] },
+    { "entityId": 34, "name": "Surya", "type": "CELEBRITY", "industry": "Kollywood, Tollywood",
+      "keywords": ["Surya","surya"] }
+  ]
+}
+```
+
+**`GET /api/marketing/celebrity/{celebrity}/potential-fans`**
+
+Same shape as `/party/{party}/potential-voters` — `voters` is renamed to `fans`,
+`totalVoters` to `totalFans`. All other fields identical.
+
+**`GET /api/marketing/celebrity/{celebrity}/super-fans`**
+
+Top 50 users who posted about the celebrity keyword, ranked by Hawkes α. Same
+shape as the party spreaders endpoint with `spreaders` → `superFans` and
+`totalSpreaders` → `totalSuperFans`.
+
+**`GET /api/marketing/celebrity/{celebrity}/channel-strategy`**
+
+Same shape as `/party/{party}/channel-strategy` with `party` replaced by
+`celebrity`. Reach proxies are identical.
 
 ---
 

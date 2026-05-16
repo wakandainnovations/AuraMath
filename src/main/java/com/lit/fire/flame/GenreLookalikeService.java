@@ -157,7 +157,7 @@ public class GenreLookalikeService {
     private Map<String, Long> loadViewsByUser(Map<String, String> identities) {
         // Cross-platform reach proxy, matching GenreInterestProfiler:
         //   x_posts          → views_count   (real impressions)
-        //   youtube_comments → like_count    (proxy)
+        //   youtube_comments → likes_count   (proxy)
         //   reddit_posts     → num_comments  (proxy)
         //   instagram_posts  → like_count    (proxy)
         // Sum is per-author across all four; then mapped to global_user_id.
@@ -166,7 +166,7 @@ public class GenreLookalikeService {
                 "  SELECT author, COALESCE(views_count, 0)  AS metric FROM x_posts " +
                 "    WHERE author IS NOT NULL AND author <> '' " +
                 "  UNION ALL " +
-                "  SELECT author, COALESCE(like_count, 0)   AS metric FROM youtube_comments " +
+                "  SELECT author, COALESCE(likes_count, 0)  AS metric FROM youtube_comments " +
                 "    WHERE author IS NOT NULL AND author <> '' " +
                 "  UNION ALL " +
                 "  SELECT author, COALESCE(num_comments, 0) AS metric FROM reddit_posts " +

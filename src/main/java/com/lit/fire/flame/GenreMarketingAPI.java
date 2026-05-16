@@ -37,6 +37,27 @@ public class GenreMarketingAPI {
     private final Gson gson = new Gson();
 
     // -------------------------------------------------------------------------
+    // GET /api/marketing/genre
+    //
+    // Lists every movie genre this service can score against. The genre names
+    // are the path values accepted by /api/marketing/genre/{genre}/... below.
+    // -------------------------------------------------------------------------
+    @GetMapping({"", "/"})
+    public ResponseEntity<Map<String, Object>> listGenres() {
+        List<Map<String, Object>> genres = new ArrayList<>();
+        for (String name : classifier.knownGenres()) {
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("genre", name);
+            entry.put("keywordCount", classifier.keywordsFor(name).size());
+            genres.add(entry);
+        }
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("totalGenres", genres.size());
+        body.put("genres", genres);
+        return ResponseEntity.ok(body);
+    }
+
+    // -------------------------------------------------------------------------
     // GET /api/marketing/genre/{genre}/potential-viewers
     //
     // Users whose GenreInterestScore for {genre} > 0.7, sorted by conversion
@@ -138,7 +159,7 @@ public class GenreMarketingAPI {
     //
     // Reach proxy (matches GenreInterestProfiler):
     //   X        → views_count
-    //   YouTube  → like_count
+    //   YouTube  → likes_count
     //   Reddit   → num_comments
     //   Instagram→ like_count
     // -------------------------------------------------------------------------
@@ -183,7 +204,7 @@ public class GenreMarketingAPI {
         body.put("audienceSize",   audienceSize == null ? 0L : audienceSize);
         body.put("reachMetric",    Map.of(
                 "X",         "views_count",
-                "YouTube",   "like_count",
+                "YouTube",   "likes_count",
                 "Reddit",    "num_comments",
                 "Instagram", "like_count"));
         body.put("topChannel",     topChannel);
@@ -238,7 +259,7 @@ public class GenreMarketingAPI {
                         }
                     });
             case "youtube_comments" -> jdbc.query(
-                    "SELECT id, text, keyword, COALESCE(like_count, 0) AS metric " +
+                    "SELECT id, text, keyword, COALESCE(likes_count, 0) AS metric " +
                     "FROM youtube_comments",
                     rs -> {
                         Map<String, Object> meta = new HashMap<>();
