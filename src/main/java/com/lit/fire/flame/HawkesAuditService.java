@@ -64,9 +64,9 @@ public class HawkesAuditService {
         /** Derives tone from the 0-100 sentiment score. */
         public String tone() {
             if (sentimentScore == null) return "neutral";
-            if (sentimentScore <= 33)  return "negative";
-            if (sentimentScore <= 66)  return "neutral";
-            return "positive";
+            if (sentimentScore < 50)   return "negative";
+            if (sentimentScore > 75)   return "positive";
+            return "neutral";
         }
     }
 
