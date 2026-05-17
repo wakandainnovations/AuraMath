@@ -21,7 +21,8 @@ public class MarketingInsightsRepository {
     public static final String COLUMN_PLATFORM_HANDLES = "platform_handles"; // JSON string
     public static final String COLUMN_TRIBE_LABEL = "tribe_label";
     public static final String COLUMN_INFLUENCE_RANK = "influence_rank";
-    public static final String COLUMN_TOP_GENRES = "top_genres"; // JSON string
+    public static final String COLUMN_TOP_GENRES = "top_genres"; // JSON string — noun/aspect terms from posts
+    public static final String COLUMN_TOP_MOVIE_GENRES = "top_movie_genres"; // JSON string — movie-genre weights from GenreClassifier
     public static final String COLUMN_PEAK_ACTIVITY_TIMES = "peak_activity_times"; // JSON string
     public static final String COLUMN_MOI_SCORE = "moi_score";
 
@@ -33,9 +34,13 @@ public class MarketingInsightsRepository {
                 COLUMN_TRIBE_LABEL + " TEXT," +
                 COLUMN_INFLUENCE_RANK + " REAL," +
                 COLUMN_TOP_GENRES + " TEXT," +
+                COLUMN_TOP_MOVIE_GENRES + " TEXT," +
                 COLUMN_PEAK_ACTIVITY_TIMES + " TEXT," +
                 COLUMN_MOI_SCORE + " REAL)";
         jdbcTemplate.execute(sql);
+        // Idempotent migration for existing deployments where the table predates this column.
+        jdbcTemplate.execute("ALTER TABLE " + TABLE_MARKETING_TARGET_PROFILES +
+                " ADD COLUMN IF NOT EXISTS " + COLUMN_TOP_MOVIE_GENRES + " jsonb");
     }
 
     /**
@@ -44,9 +49,14 @@ public class MarketingInsightsRepository {
      * @param profile The UserPersonaProfile to upsert.
      * @param platformHandles A JSON string representing platform handles.
      * @param peakActivityTimes A JSON string representing peak activity times.
+     * @param topMovieGenresJson JSON string of movie-genre weights from GenreClassifier (may be null/empty).
      * @param moiScore The user's MOI score.
      */
-    public void upsertUserPersonaProfile(UserPersonaProfile profile, String platformHandles, String peakActivityTimes, double moiScore) {
+    public void upsertUserPersonaProfile(UserPersonaProfile profile,
+                                         String platformHandles,
+                                         String peakActivityTimes,
+                                         String topMovieGenresJson,
+                                         double moiScore) {
         String topGenresJson = gson.toJson(profile.getAverageAspectSentiments());
 
         String sql = "INSERT INTO " + TABLE_MARKETING_TARGET_PROFILES + " (" +
@@ -55,14 +65,16 @@ public class MarketingInsightsRepository {
                 COLUMN_TRIBE_LABEL + ", " +
                 COLUMN_INFLUENCE_RANK + ", " +
                 COLUMN_TOP_GENRES + ", " +
+                COLUMN_TOP_MOVIE_GENRES + ", " +
                 COLUMN_PEAK_ACTIVITY_TIMES + ", " +
                 COLUMN_MOI_SCORE +
-                ") VALUES (?, ?::jsonb, ?, ?, ?::jsonb, ?::jsonb, ?) " +
+                ") VALUES (?, ?::jsonb, ?, ?, ?::jsonb, ?::jsonb, ?::jsonb, ?) " +
                 "ON CONFLICT (" + COLUMN_GLOBAL_USER_ID + ") DO UPDATE SET " +
                 COLUMN_PLATFORM_HANDLES + " = EXCLUDED." + COLUMN_PLATFORM_HANDLES + ", " +
                 COLUMN_TRIBE_LABEL + " = EXCLUDED." + COLUMN_TRIBE_LABEL + ", " +
                 COLUMN_INFLUENCE_RANK + " = EXCLUDED." + COLUMN_INFLUENCE_RANK + ", " +
                 COLUMN_TOP_GENRES + " = EXCLUDED." + COLUMN_TOP_GENRES + ", " +
+                COLUMN_TOP_MOVIE_GENRES + " = EXCLUDED." + COLUMN_TOP_MOVIE_GENRES + ", " +
                 COLUMN_PEAK_ACTIVITY_TIMES + " = EXCLUDED." + COLUMN_PEAK_ACTIVITY_TIMES + ", " +
                 COLUMN_MOI_SCORE + " = EXCLUDED." + COLUMN_MOI_SCORE;
 
@@ -72,6 +84,7 @@ public class MarketingInsightsRepository {
                 profile.getTribe(),
                 profile.getInfectivityScore(),
                 topGenresJson,
+                topMovieGenresJson,
                 peakActivityTimes,
                 moiScore);
     }

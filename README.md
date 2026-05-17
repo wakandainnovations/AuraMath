@@ -124,7 +124,7 @@ They are unwrapped to proper JSON trees (not embedded strings) before the respon
 
 ---
 
-## Endpoint Reference
+## Endpoint Reference   
 
 ### 1. Marketing Intelligence (`/v1`)
 

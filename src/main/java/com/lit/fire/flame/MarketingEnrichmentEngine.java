@@ -39,6 +39,9 @@ public class MarketingEnrichmentEngine {
     @Autowired
     private CrossPlatformIdentityResolver crossPlatformIdentityResolver;
 
+    @Autowired
+    private GenreClassifier genreClassifier;
+
     private static final String[] PLATFORM_TABLES = {"x_posts", "youtube_comments", "reddit_posts", "instagram_posts"};
     private static final int NUM_TRIBES = 12;
     private static final int CLUSTERING_TOP_ASPECTS_K = 100;
@@ -95,9 +98,27 @@ public class MarketingEnrichmentEngine {
             List<UniversalPost> authorPosts = postsByAuthor.get(authorId);
             String platformHandles = buildPlatformHandlesJson(authorId, authorPosts);
             String peakActivityTimes = buildPeakActivityTimesJson(authorPosts);
+            String topMovieGenres = buildTopMovieGenresJson(authorPosts);
 
-            marketingInsightsRepository.upsertUserPersonaProfile(profile, platformHandles, peakActivityTimes, d.moi());
+            marketingInsightsRepository.upsertUserPersonaProfile(profile, platformHandles, peakActivityTimes, topMovieGenres, d.moi());
         }
+    }
+
+    /**
+     * Aggregates {@link GenreClassifier} weights across a user's posts into
+     * {@code {"Action": 4.5, "Drama": 2.0, ...}}. Returns "{}" if no posts
+     * matched any genre vocabulary — never null, so the column stays valid jsonb.
+     */
+    private String buildTopMovieGenresJson(List<UniversalPost> posts) {
+        Map<String, Double> totals = new LinkedHashMap<>();
+        if (posts != null) {
+            for (UniversalPost p : posts) {
+                for (GenreClassifier.GenreLabel label : genreClassifier.classifyPost(p)) {
+                    totals.merge(label.genre(), label.weight(), Double::sum);
+                }
+            }
+        }
+        return gson.toJson(totals);
     }
 
     private String buildPlatformHandlesJson(String authorId, List<UniversalPost> posts) {
