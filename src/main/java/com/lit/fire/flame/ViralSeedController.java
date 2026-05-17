@@ -31,8 +31,18 @@ public class ViralSeedController {
     // on large datasets without skewing results (most-recent posts are most relevant).
     private static final int MAX_POSTS_PER_PLATFORM = 1000;
 
+    // Top-N kept in the response after composite-score ranking.
+    private static final int RESPONSE_LIMIT = 50;
+
+    // Wider candidate pool fed into composite ranking — pre-filtering by α alone would hide
+    // strong moi/reach candidates whose α happens to fall outside the top RESPONSE_LIMIT.
+    private static final int CANDIDATE_POOL = 200;
+
     @Autowired
     private JdbcTemplate jdbcTemplate;
+
+    @Autowired
+    private SeedScoreCalibrator seedScoreCalibrator;
 
     private final Gson gson = new Gson();
 
@@ -73,7 +83,7 @@ public class ViralSeedController {
                 "       SELECT DISTINCT author FROM instagram_posts      WHERE keyword ILIKE ?" +
                 "   ) " +
                 "ORDER BY mtp.influence_rank DESC " +
-                "LIMIT 50";
+                "LIMIT " + CANDIDATE_POOL;
 
         List<Map<String, Object>> profiles = jdbcTemplate.queryForList(profileSql, kw, kw, kw, kw, kw);
         if (profiles.isEmpty()) return Collections.emptyList();
@@ -101,7 +111,10 @@ public class ViralSeedController {
                 "SELECT author, COUNT(*) AS total FROM youtube_comments " +
                 "WHERE author IN (" + inClause + ") GROUP BY author", idArray);
 
-        List<Map<String, Object>> result = new ArrayList<>();
+        double wMoi   = seedScoreCalibrator.getMoiWeight();
+        double wReach = seedScoreCalibrator.getReachWeight();
+
+        List<Map<String, Object>> scored = new ArrayList<>();
         for (Map<String, Object> profile : profiles) {
             String authorId = (String) profile.get("global_user_id");
 
@@ -109,17 +122,23 @@ public class ViralSeedController {
             long igL = igLikes.getOrDefault(authorId, 0L);
             long rdS = redditScore.getOrDefault(authorId, 0L);
             long ytC = ytCount.getOrDefault(authorId, 0L);
+            long totalReach = xV + igL + rdS + ytC;
 
             // Hawkes α saturates at the optimizer's upper bound (β − ε ≈ 1.0) for
             // authors with clustered low-engagement timestamps, producing α = 1.0
             // even when the user has no measurable reach. Drop these — a viral
             // seed with zero reach is not a viral seed.
-            if (xV + igL + rdS + ytC == 0) continue;
+            if (totalReach == 0) continue;
+
+            double alpha = toDouble(profile.get("influence_rank"));
+            double moi   = toDouble(profile.get("moi_score"));
+            double score = seedScoreCalibrator.seedScore(alpha, moi, totalReach);
 
             String primaryPlatform = resolvePrimaryPlatform(xV, igL, rdS, ytC);
 
             Map<String, Object> entry = new LinkedHashMap<>();
             entry.put("author",          authorId);
+            entry.put("seedScore",       round4(score));
             entry.put("hawkesAlpha",     profile.get("influence_rank"));
             entry.put("moiScore",        profile.get("moi_score"));
             entry.put("tribe",           profile.get("tribe_label"));
@@ -133,8 +152,23 @@ public class ViralSeedController {
             signals.put("youtube_comment_count", ytC);
             entry.put("reachSignals", signals);
 
-            result.add(entry);
+            Map<String, Object> breakdown = new LinkedHashMap<>();
+            breakdown.put("alphaTerm", round4(alpha));
+            breakdown.put("moiTerm",   round4(wMoi * moi));
+            breakdown.put("reachTerm", round4(wReach * Math.log1p(totalReach)));
+            breakdown.put("weights",   Map.of("wMoi", wMoi, "wReach", wReach));
+            entry.put("scoreBreakdown", breakdown);
+
+            scored.add(entry);
         }
+
+        scored.sort((a, b) -> Double.compare(
+                ((Number) b.get("seedScore")).doubleValue(),
+                ((Number) a.get("seedScore")).doubleValue()));
+
+        List<Map<String, Object>> result = scored.size() > RESPONSE_LIMIT
+                ? new ArrayList<>(scored.subList(0, RESPONSE_LIMIT))
+                : scored;
 
         int rank = 1;
         for (Map<String, Object> entry : result) {
@@ -146,6 +180,10 @@ public class ViralSeedController {
         }
 
         return result;
+    }
+
+    private double round4(double v) {
+        return Math.round(v * 10000.0) / 10000.0;
     }
 
     // ─── /aspect-drivers/{keyword} ───────────────────────────────────────────────
