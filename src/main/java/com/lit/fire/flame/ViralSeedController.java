@@ -102,7 +102,6 @@ public class ViralSeedController {
                 "WHERE author IN (" + inClause + ") GROUP BY author", idArray);
 
         List<Map<String, Object>> result = new ArrayList<>();
-        int rank = 1;
         for (Map<String, Object> profile : profiles) {
             String authorId = (String) profile.get("global_user_id");
 
@@ -111,10 +110,15 @@ public class ViralSeedController {
             long rdS = redditScore.getOrDefault(authorId, 0L);
             long ytC = ytCount.getOrDefault(authorId, 0L);
 
+            // Hawkes α saturates at the optimizer's upper bound (β − ε ≈ 1.0) for
+            // authors with clustered low-engagement timestamps, producing α = 1.0
+            // even when the user has no measurable reach. Drop these — a viral
+            // seed with zero reach is not a viral seed.
+            if (xV + igL + rdS + ytC == 0) continue;
+
             String primaryPlatform = resolvePrimaryPlatform(xV, igL, rdS, ytC);
 
             Map<String, Object> entry = new LinkedHashMap<>();
-            entry.put("rank",            rank++);
             entry.put("author",          authorId);
             entry.put("hawkesAlpha",     profile.get("influence_rank"));
             entry.put("moiScore",        profile.get("moi_score"));
@@ -130,6 +134,15 @@ public class ViralSeedController {
             entry.put("reachSignals", signals);
 
             result.add(entry);
+        }
+
+        int rank = 1;
+        for (Map<String, Object> entry : result) {
+            LinkedHashMap<String, Object> ranked = new LinkedHashMap<>();
+            ranked.put("rank", rank++);
+            ranked.putAll(entry);
+            entry.clear();
+            entry.putAll(ranked);
         }
 
         return result;
