@@ -633,22 +633,37 @@ so a 4-post outlier can't outrank a 200-post consensus.
 **`GET /api/marketing/top-50-spreaders/{keyword}`**
 
 Top 50 authors on **X** for posts matching `{keyword}` in the last 90 days, ranked by
-**Viral Potential Score** (`total_views × Hawkes α`). Requires at least 2 matching posts
-per author.
+**Viral Potential Score**:
+
+```
+VPS = (likes + 3 × comments) × (1 + α)
+```
+
+Engagement count rewards authors whose audience actively reacts (not just passive viewers).
+The `(1 + α)` factor lets Hawkes infectivity boost bursty cascade-starters without zeroing
+out high-engagement organic spreaders whose cadence fits α ≈ 0. Comments are weighted 3×
+likes (more user effort, stronger sharing signal). Requires at least 2 matching posts per
+author.
 
 ```json
 [
   {
     "author": "janedoe",
-    "viral_potential_score": 904732.5,
-    "alpha": 0.92,
-    "total_views": 982121,
+    "viral_potential_score": 759.0,
+    "alpha": 0.0,
+    "engagement_count": 759.0,
+    "total_likes": 666,
+    "total_comments": 31,
+    "total_views": 9518,
+    "engagement_rate": 0.0797,
     "average_sentiment_score": 0.41
   }
 ]
 ```
 
 Use `average_sentiment_score` to avoid seeding with high-influence detractors.
+`engagement_rate` (engagement / views) is a useful secondary filter for picking authors
+whose audience converts impressions into reactions.
 
 ---
 

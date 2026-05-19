@@ -18,6 +18,7 @@ import java.util.stream.Collectors;
 public class TopSpreadersController {
 
     private static final int TOP_N = 50;
+    private static final double COMMENT_WEIGHT = 3.0;
 
     @Autowired
     private JdbcTemplate jdbcTemplate;
@@ -26,16 +27,23 @@ public class TopSpreadersController {
     private HawkesIntensityCalculator hawkesIntensityCalculator;
 
     /**
-     * Returns the top 50 authors ranked by Viral Potential Score (VPS = total_views × α),
-     * where α is the Hawkes-process infectivity fitted to that author's posting timestamps
-     * over the last 90 days matching the given keyword.
+     * Returns the top 50 authors on X for posts matching {keyword} in the last 90 days,
+     * ranked by Viral Potential Score:
      *
-     * High α identifies authors whose activity self-excites into bursty engagement cascades.
+     *   VPS = (likes + 3 × comments) × (1 + α)
+     *
+     * The engagement count rewards authors whose audience actively reacts (not just passive
+     * viewers), and the (1 + α) factor lets Hawkes infectivity boost bursty cascade-starters
+     * without zeroing out high-engagement organic spreaders whose post cadence fits α ≈ 0.
+     *
+     * Comments are weighted 3× likes because they require materially more user effort and
+     * correlate more strongly with downstream sharing. Requires ≥ 2 matching posts per author.
+     *
      * average_sentiment_score is included so the team avoids seeding with high-influence detractors.
      */
     @GetMapping("/top-50-spreaders/{keyword}")
     public List<Map<String, Object>> getTopSpreaders(@PathVariable String keyword) {
-        String sql = "SELECT id, author, views_count, sentiment_score, created_at " +
+        String sql = "SELECT id, author, views_count, likes_count, comment_count, sentiment_score, created_at " +
                      "FROM x_posts " +
                      "WHERE keyword ILIKE ? " +
                      "AND created_at >= NOW() - INTERVAL '90 days' " +
@@ -59,6 +67,14 @@ public class TopSpreadersController {
         long totalViews = authorPosts.stream()
                 .mapToLong(r -> ((Number) r.getOrDefault("views_count", 0)).longValue())
                 .sum();
+        long totalLikes = authorPosts.stream()
+                .mapToLong(r -> ((Number) r.getOrDefault("likes_count", 0)).longValue())
+                .sum();
+        long totalComments = authorPosts.stream()
+                .mapToLong(r -> ((Number) r.getOrDefault("comment_count", 0)).longValue())
+                .sum();
+
+        double engagementCount = totalLikes + COMMENT_WEIGHT * totalComments;
 
         double avgSentiment = authorPosts.stream()
                 .filter(r -> r.get("sentiment_score") != null && ((Number) r.get("sentiment_score")).doubleValue() != 0.0)
@@ -81,9 +97,13 @@ public class TopSpreadersController {
 
         Map<String, Object> record = new LinkedHashMap<>();
         record.put("author", author);
-        record.put("viral_potential_score", totalViews * alpha);
+        record.put("viral_potential_score", engagementCount * (1.0 + alpha));
         record.put("alpha", alpha);
+        record.put("engagement_count", engagementCount);
+        record.put("total_likes", totalLikes);
+        record.put("total_comments", totalComments);
         record.put("total_views", totalViews);
+        record.put("engagement_rate", totalViews > 0 ? engagementCount / (double) totalViews : 0.0);
         record.put("average_sentiment_score", avgSentiment);
         return record;
     }
