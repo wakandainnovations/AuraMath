@@ -22,9 +22,11 @@ public class UserProfileAPI {
     @GetMapping("/user-profile/{globalUserId}")
     public ResponseEntity<Map<String, Object>> getUserProfile(@PathVariable String globalUserId) {
 
+        String normalizedId = globalUserId.toLowerCase().replaceAll("[^a-zA-Z0-9]", "");
+
         List<String> authors = jdbcTemplate.queryForList(
-                "SELECT normalized_author FROM user_identity_link WHERE global_user_id = ?",
-                String.class, globalUserId);
+                "SELECT normalized_author FROM user_identity_link WHERE REGEXP_REPLACE(LOWER(global_user_id), '[^a-zA-Z0-9]', '', 'g') = ?",
+                String.class, normalizedId);
 
         if (authors.isEmpty()) {
             return ResponseEntity.notFound().build();
