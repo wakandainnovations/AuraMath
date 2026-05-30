@@ -46,9 +46,6 @@ public class ViralSeedController {
 
     private final Gson gson = new Gson();
 
-    // StanfordCoreNLP initialisation is expensive; hold one instance per application lifecycle.
-    private final AspectSentimentAnalyzer aspectAnalyzer = new AspectSentimentAnalyzer();
-
     // ─── /viral-seeds ────────────────────────────────────────────────────────────
 
     /**
@@ -193,17 +190,20 @@ public class ViralSeedController {
      * and splits the results into Strengths (avg sentiment > 0) and Weaknesses (avg < 0).
      *
      * How it works:
-     *   - Stanford CoreNLP extracts every noun from each post's text.
-     *   - The post's pre-stored sentiment_score (x_posts) or a numeric conversion of
-     *     sentiment_category (youtube / reddit / instagram) is assigned to every noun.
-     *   - Scores are averaged across all posts that mention the same noun.
-     *   - Aspects mentioned in fewer than MIN_ASPECT_MENTIONS posts are dropped as noise.
+     *   - The expensive part — running Stanford CoreNLP over every post to extract aspect
+     *     nouns — is done offline by {@link AspectDriversPrecomputer}, which rebuilds the
+     *     aspect_drivers_agg / aspect_drivers_post_counts tables once every 24 hours.
+     *   - This endpoint simply re-aggregates those pre-summed rows for keywords matching the
+     *     requested substring (preserving the original ILIKE semantics), so it returns in
+     *     milliseconds instead of running thousands of NLP pipelines on the request thread.
+     *   - Each aspect's averageSentiment is sentiment_sum / mention_count across all matched
+     *     rows; aspects mentioned in fewer than MIN_ASPECT_MENTIONS posts are dropped as noise.
      *
      * The byPlatform breakdown lets the team see platform-specific perception gaps —
      * e.g. Reddit criticises pacing while Instagram praises the visuals — and pick
      * the right trailer cut for each channel.
      *
-     * sentiment_score sourcing:
+     * sentiment_score sourcing (applied during precompute):
      *   x_posts        → real sentiment_score column (continuous [-1, 1])
      *   youtube_comments, reddit_posts, instagram_posts → sentiment_category converted:
      *                    "positive" → +0.6 | "negative" → -0.6 | anything else → 0.0
@@ -211,77 +211,53 @@ public class ViralSeedController {
     @GetMapping("/aspect-drivers/{keyword}")
     public Map<String, Object> getAspectDrivers(@PathVariable String keyword) {
         String kw = "%" + keyword + "%";
-        int limit = MAX_POSTS_PER_PLATFORM;
 
-        // Per-platform accumulators: aspect noun → list of sentiment scores across posts
-        Map<String, List<Double>> xAspects      = new HashMap<>();
-        Map<String, List<Double>> ytAspects     = new HashMap<>();
-        Map<String, List<Double>> redditAspects = new HashMap<>();
-        Map<String, List<Double>> igAspects     = new HashMap<>();
+        // Post counts per platform — summed across every precomputed keyword the substring matches.
+        Map<String, Integer> postCounts = new HashMap<>();
+        jdbcTemplate.query(
+                "SELECT platform, SUM(post_count) AS c FROM aspect_drivers_post_counts " +
+                "WHERE keyword ILIKE ? GROUP BY platform",
+                rs -> { postCounts.put(rs.getString("platform"), rs.getInt("c")); }, kw);
 
-        // ── x_posts: real sentiment_score ────────────────────────────────────────
-        List<Map<String, Object>> xRows = jdbcTemplate.queryForList(
-                "SELECT text, sentiment_score FROM x_posts " +
-                "WHERE keyword ILIKE ? AND text IS NOT NULL " +
-                "ORDER BY created_at DESC LIMIT " + limit, kw);
-        for (Map<String, Object> row : xRows) {
-            String text = (String) row.get("text");
-            if (text == null || text.isBlank()) continue;
-            double score = toDouble(row.get("sentiment_score"));
-            collectAspects(text, score, xAspects);
+        // Aspect aggregates per platform: aspect → [sentiment_sum, mention_count].
+        // SUM() merges the per-keyword rows for every keyword matching the substring.
+        Map<String, Map<String, double[]>> byPlatformAgg = new HashMap<>();
+        jdbcTemplate.query(
+                "SELECT platform, aspect, SUM(sentiment_sum) AS s, SUM(mention_count) AS n " +
+                "FROM aspect_drivers_agg WHERE keyword ILIKE ? GROUP BY platform, aspect",
+                rs -> {
+                    double[] acc = byPlatformAgg
+                            .computeIfAbsent(rs.getString("platform"), k -> new HashMap<>())
+                            .computeIfAbsent(rs.getString("aspect"), k -> new double[2]);
+                    acc[0] += rs.getDouble("s");
+                    acc[1] += rs.getInt("n");
+                }, kw);
+
+        // Overall view: merge every platform's aspect aggregates by summing sums and counts.
+        Map<String, double[]> overallAspects = new HashMap<>();
+        for (Map<String, double[]> platformAspects : byPlatformAgg.values()) {
+            for (Map.Entry<String, double[]> e : platformAspects.entrySet()) {
+                double[] acc = overallAspects.computeIfAbsent(e.getKey(), k -> new double[2]);
+                acc[0] += e.getValue()[0];
+                acc[1] += e.getValue()[1];
+            }
         }
-
-        // ── youtube_comments: sentiment_category → numeric ───────────────────────
-        List<Map<String, Object>> ytRows = jdbcTemplate.queryForList(
-                "SELECT text, sentiment_category FROM youtube_comments " +
-                "WHERE keyword ILIKE ? AND text IS NOT NULL " +
-                "ORDER BY published_at DESC LIMIT " + limit, kw);
-        for (Map<String, Object> row : ytRows) {
-            String text = (String) row.get("text");
-            if (text == null || text.isBlank()) continue;
-            collectAspects(text, categoryToScore((String) row.get("sentiment_category")), ytAspects);
-        }
-
-        // ── reddit_posts: title + body, sentiment_category → numeric ─────────────
-        // Reddit titles carry as much signal as the body; concatenate both.
-        List<Map<String, Object>> redditRows = jdbcTemplate.queryForList(
-                "SELECT title, text, sentiment_category FROM reddit_posts " +
-                "WHERE keyword ILIKE ? " +
-                "ORDER BY created_at DESC LIMIT " + limit, kw);
-        for (Map<String, Object> row : redditRows) {
-            String combined = combine((String) row.get("title"), (String) row.get("text"));
-            if (combined.isBlank()) continue;
-            collectAspects(combined, categoryToScore((String) row.get("sentiment_category")), redditAspects);
-        }
-
-        // ── instagram_posts: caption, sentiment_category → numeric ────────────────
-        List<Map<String, Object>> igRows = jdbcTemplate.queryForList(
-                "SELECT text, sentiment_category FROM instagram_posts " +
-                "WHERE keyword ILIKE ? AND text IS NOT NULL " +
-                "ORDER BY timestamp DESC LIMIT " + limit, kw);
-        for (Map<String, Object> row : igRows) {
-            String text = (String) row.get("text");
-            if (text == null || text.isBlank()) continue;
-            collectAspects(text, categoryToScore((String) row.get("sentiment_category")), igAspects);
-        }
-
-        // ── Merge all platforms for the overall view ──────────────────────────────
-        Map<String, List<Double>> overallAspects = new HashMap<>();
-        mergeInto(overallAspects, xAspects);
-        mergeInto(overallAspects, ytAspects);
-        mergeInto(overallAspects, redditAspects);
-        mergeInto(overallAspects, igAspects);
 
         // ── Assemble response ─────────────────────────────────────────────────────
         Map<String, Object> response = new LinkedHashMap<>();
         response.put("keyword", keyword);
 
+        int xCount  = postCounts.getOrDefault("x", 0);
+        int ytCount = postCounts.getOrDefault("youtube", 0);
+        int rdCount = postCounts.getOrDefault("reddit", 0);
+        int igCount = postCounts.getOrDefault("instagram", 0);
+
         Map<String, Integer> counts = new LinkedHashMap<>();
-        counts.put("x",         xRows.size());
-        counts.put("youtube",   ytRows.size());
-        counts.put("reddit",    redditRows.size());
-        counts.put("instagram", igRows.size());
-        counts.put("total",     xRows.size() + ytRows.size() + redditRows.size() + igRows.size());
+        counts.put("x",         xCount);
+        counts.put("youtube",   ytCount);
+        counts.put("reddit",    rdCount);
+        counts.put("instagram", igCount);
+        counts.put("total",     xCount + ytCount + rdCount + igCount);
         response.put("totalPostsAnalyzed", counts);
 
         Map<String, Object> overall = buildStrengthsWeaknesses(overallAspects);
@@ -290,10 +266,10 @@ public class ViralSeedController {
 
         // Per-platform breakdown — omit platforms with no matching posts.
         Map<String, Object> byPlatform = new LinkedHashMap<>();
-        if (!xRows.isEmpty())      byPlatform.put("x",         buildStrengthsWeaknesses(xAspects));
-        if (!ytRows.isEmpty())     byPlatform.put("youtube",   buildStrengthsWeaknesses(ytAspects));
-        if (!redditRows.isEmpty()) byPlatform.put("reddit",    buildStrengthsWeaknesses(redditAspects));
-        if (!igRows.isEmpty())     byPlatform.put("instagram", buildStrengthsWeaknesses(igAspects));
+        if (xCount  > 0) byPlatform.put("x",         buildStrengthsWeaknesses(byPlatformAgg.getOrDefault("x",         Map.of())));
+        if (ytCount > 0) byPlatform.put("youtube",   buildStrengthsWeaknesses(byPlatformAgg.getOrDefault("youtube",   Map.of())));
+        if (rdCount > 0) byPlatform.put("reddit",    buildStrengthsWeaknesses(byPlatformAgg.getOrDefault("reddit",    Map.of())));
+        if (igCount > 0) byPlatform.put("instagram", buildStrengthsWeaknesses(byPlatformAgg.getOrDefault("instagram", Map.of())));
         response.put("byPlatform", byPlatform);
 
         return response;
@@ -302,31 +278,21 @@ public class ViralSeedController {
     // ─── Helpers ─────────────────────────────────────────────────────────────────
 
     /**
-     * Runs the aspect analyzer on one post's text and accumulates the aspect→score
-     * pairs into the target map, appending to the existing list for each aspect.
+     * Aggregates a precomputed aspect map into Strengths and Weaknesses lists.
+     * Each entry maps an aspect to [sentiment_sum, mention_count]; averageSentiment is
+     * sentiment_sum / mention_count. Aspects mentioned fewer than MIN_ASPECT_MENTIONS times
+     * are dropped. Each list is sorted by absolute sentiment (strongest first).
      */
-    private void collectAspects(String text, double score, Map<String, List<Double>> target) {
-        Map<String, Double> aspects = aspectAnalyzer.analyze(text, score);
-        for (Map.Entry<String, Double> e : aspects.entrySet()) {
-            target.computeIfAbsent(e.getKey(), k -> new ArrayList<>()).add(e.getValue());
-        }
-    }
-
-    /**
-     * Aggregates an aspect map into Strengths and Weaknesses lists.
-     * Aspects mentioned fewer than MIN_ASPECT_MENTIONS times are dropped.
-     * Each list is sorted by absolute sentiment (strongest first).
-     */
-    private Map<String, Object> buildStrengthsWeaknesses(Map<String, List<Double>> aspectMap) {
+    private Map<String, Object> buildStrengthsWeaknesses(Map<String, double[]> aspectMap) {
         List<Map<String, Object>> strengths  = new ArrayList<>();
         List<Map<String, Object>> weaknesses = new ArrayList<>();
 
-        for (Map.Entry<String, List<Double>> e : aspectMap.entrySet()) {
-            List<Double> scores = e.getValue();
-            int n = scores.size();
+        for (Map.Entry<String, double[]> e : aspectMap.entrySet()) {
+            double sum = e.getValue()[0];
+            int n = (int) e.getValue()[1];
             if (n < MIN_ASPECT_MENTIONS) continue;
 
-            double avg = scores.stream().mapToDouble(d -> d).average().orElse(0.0);
+            double avg = sum / n;
             if (avg == 0.0) continue;
 
             // Shrinkage toward 0 so a 3-post outlier can't outrank a high-volume consensus.
@@ -350,30 +316,6 @@ public class ViralSeedController {
         result.put("strengths",  strengths);
         result.put("weaknesses", weaknesses);
         return result;
-    }
-
-    /** Merges all entries from source into target, appending score lists. */
-    private void mergeInto(Map<String, List<Double>> target, Map<String, List<Double>> source) {
-        for (Map.Entry<String, List<Double>> e : source.entrySet()) {
-            target.computeIfAbsent(e.getKey(), k -> new ArrayList<>()).addAll(e.getValue());
-        }
-    }
-
-    /**
-     * Converts a stored sentiment_category string to a numeric score.
-     * Used for platforms that don't store a continuous sentiment_score.
-     */
-    private double categoryToScore(String category) {
-        if (category == null) return 0.0;
-        return switch (category.toLowerCase()) {
-            case "positive" -> 0.6;
-            case "negative" -> -0.6;
-            default         -> 0.0;
-        };
-    }
-
-    private String combine(String a, String b) {
-        return ((a != null ? a : "") + " " + (b != null ? b : "")).trim();
     }
 
     private double toDouble(Object value) {
