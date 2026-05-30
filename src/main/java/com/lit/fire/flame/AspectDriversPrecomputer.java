@@ -10,10 +10,14 @@ import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import javax.sql.DataSource;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 
 /**
  * Offline producer for the /aspect-drivers/{keyword} endpoint.
@@ -49,9 +53,18 @@ public class AspectDriversPrecomputer implements InitializingBean {
     private static final int BATCH_SIZE = 1000;
     private static final int FETCH_SIZE = 500;
 
+    // Posts buffered before each parallel NLP flush. Bounds memory while giving the parallel
+    // stream enough work per flush to keep every core busy.
+    private static final int NLP_BATCH = 2000;
+
+    // Application-defined key for pg_advisory_lock so only one instance rebuilds at a time.
+    // Arbitrary constant (ASCII "AspectDr"); just needs to be stable and unique to this job.
+    private static final long ADVISORY_LOCK_KEY = 0x4173706563744472L;
+
     // Packs (keyword, platform) into one map key; this control char can't appear in a keyword.
     private static final char KEY_SEP = '\u0001';
 
+    private final DataSource dataSource;      // owns the connection that holds the advisory lock
     private final JdbcTemplate jdbc;          // schema management + publish writes
     private final JdbcTemplate streamingJdbc; // cursor-based reads (FETCH_SIZE) for the source scans
     private final TransactionTemplate readTx;
@@ -61,6 +74,7 @@ public class AspectDriversPrecomputer implements InitializingBean {
     public AspectDriversPrecomputer(DataSource dataSource,
                                     PlatformTransactionManager txManager,
                                     AspectSentimentAnalyzer analyzer) {
+        this.dataSource = dataSource;
         this.jdbc = new JdbcTemplate(dataSource);
         this.streamingJdbc = new JdbcTemplate(dataSource);
         this.streamingJdbc.setFetchSize(FETCH_SIZE);
@@ -106,42 +120,74 @@ public class AspectDriversPrecomputer implements InitializingBean {
 
     /**
      * Rebuilds the aspect-drivers tables. Runs 60s after startup (DB warm-up) then every 24 hours.
+     *
+     * A Postgres session-level advisory lock guards the whole run, so when the service is scaled
+     * to multiple replicas only one rebuilds the shared tables — the rest skip rather than doing
+     * the same multi-minute NLP scan and contending on the publish TRUNCATE.
+     *
      * The heavy NLP scan runs outside any write transaction; only the final truncate-and-insert
      * publish step is transactional, so a failure mid-scan leaves the live tables intact.
      */
     @Scheduled(initialDelay = 60_000L, fixedRate = 24L * 60 * 60 * 1000)
     public void refresh() {
-        long start = System.currentTimeMillis();
-        try {
-            ensureSchema();
-
-            // (keyword|platform) -> aspect -> [sentiment_sum, mention_count]
-            Map<String, Map<String, double[]>> agg = new HashMap<>();
-            // (keyword|platform) -> posts considered
-            Map<String, Integer> postCounts = new HashMap<>();
-
-            readTx.executeWithoutResult(status -> {
-                scanX(agg, postCounts);
-                scanCategoryPlatform(agg, postCounts, "youtube",
-                        "youtube_comments", "text", null, "published_at");
-                scanCategoryPlatform(agg, postCounts, "reddit",
-                        "reddit_posts", "text", "title", "created_at");
-                scanCategoryPlatform(agg, postCounts, "instagram",
-                        "instagram_posts", "text", null, "timestamp");
-            });
-
-            publish(agg, postCounts);
-
-            int rows = agg.values().stream().mapToInt(Map::size).sum();
-            log.info("Aspect-drivers precompute complete: {} (keyword,platform) groups, {} aspect rows, in {} ms",
-                    postCounts.size(), rows, System.currentTimeMillis() - start);
+        // The advisory lock is session-scoped, so it must be acquired and released on the same
+        // physical connection — hold one open for the duration rather than going through JdbcTemplate.
+        try (Connection lockConn = dataSource.getConnection()) {
+            if (!tryAdvisoryLock(lockConn)) {
+                log.info("Aspect-drivers precompute skipped: another instance holds the refresh lock");
+                return;
+            }
+            try {
+                doRefresh();
+            } finally {
+                releaseAdvisoryLock(lockConn);
+            }
         } catch (Exception e) {
             log.error("Aspect-drivers precompute failed; previously published tables left in place", e);
         }
     }
 
+    private void doRefresh() {
+        long start = System.currentTimeMillis();
+        ensureSchema();
+
+        Accumulator acc = new Accumulator();
+        readTx.executeWithoutResult(status -> {
+            scanX(acc);
+            scanCategoryPlatform(acc, "youtube",   "youtube_comments", "text", null,    "published_at");
+            scanCategoryPlatform(acc, "reddit",    "reddit_posts",     "text", "title", "created_at");
+            scanCategoryPlatform(acc, "instagram", "instagram_posts",  "text", null,    "timestamp");
+            acc.flush(); // annotate the final partial batch before the cursor closes
+        });
+
+        publish(acc);
+
+        int rows = acc.agg.values().stream().mapToInt(Map::size).sum();
+        log.info("Aspect-drivers precompute complete: {} (keyword,platform) groups, {} aspect rows, in {} ms",
+                acc.postCounts.size(), rows, System.currentTimeMillis() - start);
+    }
+
+    private boolean tryAdvisoryLock(Connection conn) throws Exception {
+        try (PreparedStatement ps = conn.prepareStatement("SELECT pg_try_advisory_lock(?)")) {
+            ps.setLong(1, ADVISORY_LOCK_KEY);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() && rs.getBoolean(1);
+            }
+        }
+    }
+
+    private void releaseAdvisoryLock(Connection conn) {
+        try (PreparedStatement ps = conn.prepareStatement("SELECT pg_advisory_unlock(?)")) {
+            ps.setLong(1, ADVISORY_LOCK_KEY);
+            ps.execute();
+        } catch (Exception e) {
+            // Non-fatal: closing the connection releases the session lock anyway.
+            log.warn("Could not explicitly release aspect-drivers advisory lock: {}", e.getMessage());
+        }
+    }
+
     /** x_posts carries a continuous numeric sentiment_score. */
-    private void scanX(Map<String, Map<String, double[]>> agg, Map<String, Integer> postCounts) {
+    private void scanX(Accumulator acc) {
         String sql =
                 "SELECT keyword, text, sentiment_score FROM (" +
                 "  SELECT keyword, text, sentiment_score, " +
@@ -153,7 +199,7 @@ public class AspectDriversPrecomputer implements InitializingBean {
             String text = rs.getString("text");
             double score = rs.getDouble("sentiment_score");
             if (rs.wasNull()) score = 0.0;
-            accumulate(agg, postCounts, keyword, "x", text, score);
+            acc.add(keyword, "x", text, score);
         }, MAX_POSTS_PER_PLATFORM);
     }
 
@@ -161,9 +207,8 @@ public class AspectDriversPrecomputer implements InitializingBean {
      * youtube / reddit / instagram store a sentiment_category string instead of a numeric score.
      * {@code titleCol} is non-null only for reddit, whose title is concatenated with the body.
      */
-    private void scanCategoryPlatform(Map<String, Map<String, double[]>> agg, Map<String, Integer> postCounts,
-                                      String platform, String table, String textCol, String titleCol,
-                                      String orderCol) {
+    private void scanCategoryPlatform(Accumulator acc, String platform, String table,
+                                      String textCol, String titleCol, String orderCol) {
         String selectCols = (titleCol != null ? titleCol + ", " : "") + textCol + ", sentiment_category, keyword";
         String sql =
                 "SELECT keyword, " + (titleCol != null ? titleCol + ", " : "") + textCol + ", sentiment_category FROM (" +
@@ -177,41 +222,65 @@ public class AspectDriversPrecomputer implements InitializingBean {
                     ? combine(rs.getString(titleCol), rs.getString(textCol))
                     : rs.getString(textCol);
             double score = categoryToScore(rs.getString("sentiment_category"));
-            accumulate(agg, postCounts, keyword, platform, text, score);
+            acc.add(keyword, platform, text, score);
         }, MAX_POSTS_PER_PLATFORM);
     }
 
     /**
-     * Counts the post (every row the capped query returned, matching the old rows.size() counts)
-     * and folds its aspect nouns into the running sums. Blank text contributes no aspects.
+     * Accumulates the scan results. Cheap bookkeeping (post counts, buffering) happens inline on
+     * the cursor thread; the expensive CoreNLP annotation is deferred and run NLP_BATCH posts at a
+     * time across all cores. Aspect merging is done single-threaded after each parallel flush, so
+     * the shared maps never need synchronization.
      */
-    private void accumulate(Map<String, Map<String, double[]>> agg, Map<String, Integer> postCounts,
-                            String keyword, String platform, String text, double score) {
-        if (keyword == null) return;
-        String key = keyword + KEY_SEP + platform;
-        postCounts.merge(key, 1, Integer::sum);
-        if (text == null || text.isBlank()) return;
+    private final class Accumulator {
+        // (keyword|platform) -> aspect -> [sentiment_sum, mention_count]
+        final Map<String, Map<String, double[]>> agg = new HashMap<>();
+        // (keyword|platform) -> posts considered
+        final Map<String, Integer> postCounts = new HashMap<>();
+        // Posts awaiting annotation in the current batch.
+        private final List<Post> buffer = new ArrayList<>(NLP_BATCH);
 
-        Map<String, Double> aspects = analyzer.analyze(text, score);
-        Map<String, double[]> target = agg.computeIfAbsent(key, k -> new HashMap<>());
-        for (Map.Entry<String, Double> e : aspects.entrySet()) {
-            double[] acc = target.computeIfAbsent(e.getKey(), k -> new double[2]);
-            acc[0] += e.getValue();
-            acc[1] += 1;
+        /** Counts every row the capped query returned (matching the old rows.size()); blanks add no aspects. */
+        void add(String keyword, String platform, String text, double score) {
+            if (keyword == null) return;
+            String key = keyword + KEY_SEP + platform;
+            postCounts.merge(key, 1, Integer::sum);
+            if (text == null || text.isBlank()) return;
+            buffer.add(new Post(key, text, score));
+            if (buffer.size() >= NLP_BATCH) flush();
+        }
+
+        /** Annotates the buffered posts in parallel, then folds the nouns into the running sums. */
+        void flush() {
+            if (buffer.isEmpty()) return;
+            List<Map.Entry<String, Map<String, Double>>> annotated = buffer.parallelStream()
+                    .map(p -> Map.entry(p.key(), analyzer.analyze(p.text(), p.score())))
+                    .collect(Collectors.toList());
+            for (Map.Entry<String, Map<String, Double>> e : annotated) {
+                Map<String, double[]> target = agg.computeIfAbsent(e.getKey(), k -> new HashMap<>());
+                for (Map.Entry<String, Double> a : e.getValue().entrySet()) {
+                    double[] sums = target.computeIfAbsent(a.getKey(), k -> new double[2]);
+                    sums[0] += a.getValue();
+                    sums[1] += 1;
+                }
+            }
+            buffer.clear();
         }
     }
 
+    private record Post(String key, String text, double score) {}
+
     /** Atomically swaps in the freshly computed aggregates. */
-    private void publish(Map<String, Map<String, double[]>> agg, Map<String, Integer> postCounts) {
+    private void publish(Accumulator acc) {
         List<Object[]> aggRows = new ArrayList<>();
-        for (Map.Entry<String, Map<String, double[]>> group : agg.entrySet()) {
+        for (Map.Entry<String, Map<String, double[]>> group : acc.agg.entrySet()) {
             String[] kp = splitKey(group.getKey());
             for (Map.Entry<String, double[]> a : group.getValue().entrySet()) {
                 aggRows.add(new Object[]{kp[0], kp[1], a.getKey(), a.getValue()[0], (int) a.getValue()[1]});
             }
         }
         List<Object[]> countRows = new ArrayList<>();
-        for (Map.Entry<String, Integer> e : postCounts.entrySet()) {
+        for (Map.Entry<String, Integer> e : acc.postCounts.entrySet()) {
             String[] kp = splitKey(e.getKey());
             countRows.add(new Object[]{kp[0], kp[1], e.getValue()});
         }
