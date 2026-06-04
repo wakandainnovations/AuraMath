@@ -74,6 +74,19 @@
         <artifactId>sqlite-jdbc</artifactId>
         <version>3.42.0.0</version>
     </dependency>
+    <!-- MySQL JDBC Driver — lets the Ask engine target MySQL alongside Postgres/SQLite.
+         8.0.31 is the version managed by Spring Boot 2.7.5. -->
+    <dependency>
+        <groupId>mysql</groupId>
+        <artifactId>mysql-connector-java</artifactId>
+        <version>8.0.31</version>
+    </dependency>
+    <!-- exp4j — lightweight expression evaluator for ad-hoc formula evaluation in nlq.math (later features). -->
+    <dependency>
+        <groupId>net.objecthunter</groupId>
+        <artifactId>exp4j</artifactId>
+        <version>0.4.8</version>
+    </dependency>
     <!-- Gson for JSON serialization/deserialization -->
     <dependency>
         <groupId>com.google.code.gson</groupId>

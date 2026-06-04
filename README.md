@@ -716,6 +716,18 @@ and should be put behind an internal route in production.
 
 ---
 
+### 11. Ask Engine (experimental)
+
+A natural-language → database + mathematician engine lives under `com.lit.fire.flame.nlq`. Given a
+question in plain English and a per-request target database connection, it introspects the schema,
+drafts SQL with a pluggable LLM (Claude first), validates and executes it **read-only**, and
+composes an answer. Target connections are fully isolated from AuraMath's own datasource, and
+requests may skip tables/columns. The engine is currently scaffolding only (F0) and exposes **no
+endpoints yet** — see [`docs/ask-engine/DESIGN.md`](docs/ask-engine/DESIGN.md) for the pipeline,
+guarantees, and the F0–F11 roadmap.
+
+---
+
 ## Common Models
 
 **Influence Tier** (branching ratio = α / β, where β = 1.0 minutes⁻¹):
