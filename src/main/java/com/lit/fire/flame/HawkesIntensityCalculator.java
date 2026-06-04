@@ -128,7 +128,7 @@ public class HawkesIntensityCalculator {
                     double tj = eventTimes.get(j);
                     intensity += alpha * Math.exp(-beta * (ti - tj));
                 }
-                if (intensity <= 0) return Double.POSITIVE_INFINITY; // Invalid intensity
+                if (intensity <= 0) return 1e15; // Invalid intensity: large finite penalty (Infinity breaks BOBYQA's quadratic model)
                 sumLogIntensity += Math.log(intensity);
             }
 
@@ -136,15 +136,31 @@ public class HawkesIntensityCalculator {
         };
 
         // Use BOBYQAOptimizer for derivative-free optimization with bound constraints.
+        // BOBYQA requires FINITE bounds (it uses them to scale variables and size the
+        // trust region), so derive a finite, data-driven upper bound for mu rather than
+        // passing Double.POSITIVE_INFINITY.
+        final double muUpperBound = 10.0 * eventTimes.size() / Math.max(T, 1.0);
+        final double alphaRange = beta - 1e-9;
+
+        // The initial trust-region radius must be no more than half the smallest bound
+        // range, otherwise the interpolation geometry starts out inconsistent.
+        final double initialRadius = Math.min(muUpperBound, alphaRange) / 4.0;
+        final double stoppingRadius = 1e-8;
+
+        // Initial guess for [mu, alpha], clamped strictly inside the bounds so the
+        // optimizer does not reject a starting point that lies outside the finite box.
+        final double muGuess = Math.min(Math.max(0.1, 1e-9), muUpperBound);
+        final double alphaGuess = Math.min(Math.max(0.1, 0.0), alphaRange);
+
         // Number of interpolation points: 2 * num_params + 1
-        BOBYQAOptimizer optimizer = new BOBYQAOptimizer(5);
+        BOBYQAOptimizer optimizer = new BOBYQAOptimizer(5, initialRadius, stoppingRadius);
         PointValuePair result = optimizer.optimize(
                 new MaxEval(2000),
                 new ObjectiveFunction(negLogLikelihood),
                 GoalType.MINIMIZE,
-                new InitialGuess(new double[]{0.1, 0.1}), // Initial guess for [mu, alpha]
+                new InitialGuess(new double[]{muGuess, alphaGuess}),
                 // Bounds for parameters: mu > 0 and 0 <= alpha < beta for stationarity
-                new SimpleBounds(new double[]{1e-9, 0}, new double[]{Double.POSITIVE_INFINITY, beta - 1e-9})
+                new SimpleBounds(new double[]{1e-9, 0}, new double[]{muUpperBound, alphaRange})
         );
 
         double[] optimalParams = result.getPoint();
