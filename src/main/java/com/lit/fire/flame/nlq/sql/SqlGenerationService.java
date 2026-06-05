@@ -71,6 +71,17 @@ public class SqlGenerationService {
      * @throws LlmException if the model call fails or returns no structured output
      */
     public SqlGenerationResult generate(String question, DatabaseSchema schema) throws LlmException {
+        return generate(question, schema, null);
+    }
+
+    /**
+     * As {@link #generate(String, DatabaseSchema)}, but using {@code modelId} for the underlying
+     * model call when it is non-blank (otherwise the {@link LlmClient}'s default model is used).
+     *
+     * @param modelId optional model id override; {@code null}/blank falls back to the client default
+     */
+    public SqlGenerationResult generate(String question, DatabaseSchema schema, String modelId)
+            throws LlmException {
         if (question == null || question.trim().isEmpty()) {
             throw new IllegalArgumentException("question is required");
         }
@@ -92,6 +103,7 @@ public class SqlGenerationService {
                 .jsonSchema(buildResultSchema())
                 .structuredToolName(TOOL_NAME)
                 .maxTokens(MAX_OUTPUT_TOKENS)
+                .modelId(blankToNull(modelId))
                 .build();
 
         log.debug("Generating SQL for dialect '{}' over {} table(s), maxRows={}",
@@ -268,6 +280,10 @@ public class SqlGenerationService {
             }
         }
         return out;
+    }
+
+    private static String blankToNull(String s) {
+        return (s == null || s.trim().isEmpty()) ? null : s.trim();
     }
 
     private static String loadResource(String path) {

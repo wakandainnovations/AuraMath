@@ -1,0 +1,242 @@
+package com.lit.fire.flame.nlq.api;
+
+import com.lit.fire.flame.nlq.config.AskEngineProperties;
+import com.lit.fire.flame.nlq.connection.ConnectionRequest;
+import com.lit.fire.flame.nlq.connection.DynamicConnectionFactory;
+import com.lit.fire.flame.nlq.math.AnswerSynthesisService;
+import com.lit.fire.flame.nlq.math.AskAnswer;
+import com.lit.fire.flame.nlq.schema.DatabaseSchema;
+import com.lit.fire.flame.nlq.schema.SchemaIntrospector;
+import com.lit.fire.flame.nlq.schema.SkipList;
+import com.lit.fire.flame.nlq.sql.QueryExecutionException;
+import com.lit.fire.flame.nlq.sql.QueryExecutionService;
+import com.lit.fire.flame.nlq.sql.QueryResult;
+import com.lit.fire.flame.nlq.sql.SqlGenerationResult;
+import com.lit.fire.flame.nlq.sql.SqlGenerationService;
+import com.lit.fire.flame.nlq.sql.SqlSafetyGuard;
+import com.lit.fire.flame.nlq.sql.UnsafeSqlException;
+import com.lit.fire.flame.nlq.llm.LlmException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Service;
+
+import java.sql.Connection;
+import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Feature F8 — the end-to-end orchestrator that runs one Ask through the F1–F7 pipeline:
+ *
+ * <pre>
+ *   open connection (F1) → introspect with the effective skip-list (F2) → generate SQL (F4)
+ *     → if clarification needed, return early → validate (F5) → execute (F6) → synthesize (F7)
+ * </pre>
+ *
+ * <p>The target connection (F1) is <b>always closed in a {@code finally} block</b>; it is short-lived
+ * and owned here. The effective skip-list is the union of the server-side
+ * {@code aura.ask.default-skip-tables}, the connection's own skip lists, and the request's — and it is
+ * honoured at <em>every</em> layer (removed from the schema the model sees in F2, and re-enforced by
+ * the guard in F5 and the executor in F6). Per-stage timings are recorded for the response.
+ *
+ * <p><b>No secrets leak.</b> Nothing here logs or echoes the connection's credentials; failures are
+ * raised as the pipeline's own typed, sanitized exceptions and a clarification short-circuit returns
+ * a question rather than touching the database.
+ */
+@Service
+public class AskOrchestrator {
+
+    private static final Logger log = LoggerFactory.getLogger(AskOrchestrator.class);
+
+    private final DynamicConnectionFactory connectionFactory;
+    private final SchemaIntrospector introspector;
+    private final SqlGenerationService sqlGenerationService;
+    private final SqlSafetyGuard safetyGuard;
+    private final QueryExecutionService executionService;
+    private final AnswerSynthesisService answerSynthesisService;
+    private final AskEngineProperties properties;
+
+    public AskOrchestrator(DynamicConnectionFactory connectionFactory,
+                           SchemaIntrospector introspector,
+                           SqlGenerationService sqlGenerationService,
+                           SqlSafetyGuard safetyGuard,
+                           QueryExecutionService executionService,
+                           AnswerSynthesisService answerSynthesisService,
+                           AskEngineProperties properties) {
+        this.connectionFactory = connectionFactory;
+        this.introspector = introspector;
+        this.sqlGenerationService = sqlGenerationService;
+        this.safetyGuard = safetyGuard;
+        this.executionService = executionService;
+        this.answerSynthesisService = answerSynthesisService;
+        this.properties = properties;
+    }
+
+    /**
+     * Run the full pipeline for one request and return either an answered or a clarification
+     * {@link AskResponse}.
+     *
+     * @throws IllegalArgumentException if the request is malformed (missing connection/question) or
+     *                                  the connection details fail validation (mapped to {@code 400})
+     * @throws LlmException             if a model call fails (mapped to {@code 502}/{@code 504})
+     * @throws UnsafeSqlException       if the drafted SQL fails the safety guard (mapped to {@code 422})
+     * @throws QueryExecutionException  if execution fails or times out (mapped to {@code 502}/{@code 504})
+     * @throws SQLException             if the target connection cannot be opened (mapped to {@code 502}/{@code 504})
+     */
+    public AskResponse ask(AskRequest request)
+            throws SQLException, LlmException, UnsafeSqlException, QueryExecutionException {
+        if (request == null) {
+            throw new IllegalArgumentException("request body is required");
+        }
+        ConnectionRequest connection = request.getConnection();
+        if (connection == null) {
+            throw new IllegalArgumentException("connection is required");
+        }
+        String question = request.getQuestion();
+        if (question == null || question.trim().isEmpty()) {
+            throw new IllegalArgumentException("question is required");
+        }
+
+        SkipList skipList = effectiveSkipList(request);
+        ExecutionComponents components = componentsFor(request.getMaxRows());
+        String model = blankToNull(request.getModel());
+
+        Map<String, Long> timings = new LinkedHashMap<>();
+        long startNanos = System.nanoTime();
+
+        Connection conn = null;
+        try {
+            long t = System.nanoTime();
+            conn = connectionFactory.open(connection);
+            timings.put("connectMillis", millisSince(t));
+
+            // (F2) Introspect through the effective skip-list, so skipped objects never reach the model.
+            t = System.nanoTime();
+            DatabaseSchema schema = introspector.introspect(conn, skipList);
+            timings.put("introspectMillis", millisSince(t));
+
+            // (F4) Draft a single read-only query from the question + skip-filtered schema.
+            t = System.nanoTime();
+            SqlGenerationResult generation = sqlGenerationService.generate(question, schema, model);
+            timings.put("generateMillis", millisSince(t));
+
+            if (generation.isClarificationNeeded()) {
+                timings.put("totalMillis", millisSince(startNanos));
+                log.debug("Ask returned a clarification after generation ({} table(s) visible)",
+                        schema.getTables().size());
+                return AskResponse.clarification(
+                        generation.getClarificationQuestion(), generation.getTablesUsed(), timings);
+            }
+
+            // (F5) The trust boundary: validate read-only + skip-list and bound the row cap.
+            t = System.nanoTime();
+            String safeSql = components.guard.validate(generation.getSql(), skipList, schema);
+            timings.put("validateMillis", millisSince(t));
+
+            // (F6) Execute exactly the validated SQL, read-only and bounded.
+            t = System.nanoTime();
+            QueryResult execution = components.executor.execute(conn, safeSql, skipList, schema);
+            timings.put("executeMillis", millisSince(t));
+
+            // (F7) Synthesize the final answer, applying any statistics deterministically in Java.
+            t = System.nanoTime();
+            AskAnswer answer = answerSynthesisService.answer(question, generation, execution, model);
+            timings.put("synthesizeMillis", millisSince(t));
+
+            timings.put("totalMillis", millisSince(startNanos));
+            log.debug("Ask answered: {} row(s), {} formula(s), truncated={}, total={}ms",
+                    execution.getRowCount(), answer.getFormulasApplied().size(),
+                    execution.isTruncated(), timings.get("totalMillis"));
+            return AskResponse.answered(answer, safeSql, generation.getTablesUsed(),
+                    execution.isTruncated(), execution.getRowCount(), timings);
+        } finally {
+            closeQuietly(conn);
+        }
+    }
+
+    /**
+     * The effective skip-list: the union of the server default tables, the connection's own
+     * skip lists, and the request's. Re-enforced downstream at validation and execution.
+     */
+    private SkipList effectiveSkipList(AskRequest request) {
+        ConnectionRequest connection = request.getConnection();
+        List<String> tables = new ArrayList<>();
+        addAll(tables, connection.getSkipTables());
+        addAll(tables, request.getSkipTables());
+        List<String> columns = new ArrayList<>();
+        addAll(columns, connection.getSkipColumns());
+        addAll(columns, request.getSkipColumns());
+        return SkipList.from(properties.getDefaultSkipTables(), tables, columns);
+    }
+
+    /**
+     * Choose the guard + executor to use, honouring an optional per-request {@code maxRows} override.
+     * The override is clamped to the configured ceiling (it can only lower the cap, never raise it).
+     * When it matches the ceiling — or is absent — the shared singletons are used; otherwise a pair
+     * bound to the lowered cap is built for this request so F5 and F6 agree on the limit.
+     */
+    private ExecutionComponents componentsFor(Integer maxRowsOverride) {
+        int ceiling = properties.getMaxRows();
+        if (maxRowsOverride == null) {
+            return new ExecutionComponents(safetyGuard, executionService);
+        }
+        int clamped = Math.min(Math.max(1, maxRowsOverride), ceiling);
+        if (clamped == ceiling) {
+            return new ExecutionComponents(safetyGuard, executionService);
+        }
+        AskEngineProperties effective = copyWithMaxRows(clamped);
+        SqlSafetyGuard guard = new SqlSafetyGuard(effective);
+        return new ExecutionComponents(guard, new QueryExecutionService(guard, effective));
+    }
+
+    private AskEngineProperties copyWithMaxRows(int maxRows) {
+        AskEngineProperties copy = new AskEngineProperties();
+        copy.setEnabled(properties.isEnabled());
+        copy.setMaxRows(maxRows);
+        copy.setQueryTimeoutSeconds(properties.getQueryTimeoutSeconds());
+        copy.setConnectionTimeoutSeconds(properties.getConnectionTimeoutSeconds());
+        copy.setDefaultSkipTables(properties.getDefaultSkipTables());
+        copy.setLlmProvider(properties.getLlmProvider());
+        return copy;
+    }
+
+    private void closeQuietly(Connection conn) {
+        if (conn == null) {
+            return;
+        }
+        try {
+            conn.close();
+        } catch (SQLException e) {
+            // Best-effort cleanup of a short-lived connection. Never log the connection details.
+            log.debug("failed to close target connection cleanly: {}", e.getSQLState());
+        }
+    }
+
+    private static void addAll(List<String> target, Collection<String> source) {
+        if (source != null) {
+            target.addAll(source);
+        }
+    }
+
+    private static String blankToNull(String s) {
+        return (s == null || s.trim().isEmpty()) ? null : s.trim();
+    }
+
+    private static long millisSince(long startNanos) {
+        return (System.nanoTime() - startNanos) / 1_000_000L;
+    }
+
+    /** The guard + executor pair to run a request with — either the shared singletons or a capped pair. */
+    private static final class ExecutionComponents {
+        private final SqlSafetyGuard guard;
+        private final QueryExecutionService executor;
+
+        ExecutionComponents(SqlSafetyGuard guard, QueryExecutionService executor) {
+            this.guard = guard;
+            this.executor = executor;
+        }
+    }
+}

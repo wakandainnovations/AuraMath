@@ -433,6 +433,136 @@ writable connection is refused (`NOT_READ_ONLY`), a chained statement is refused
 (`UNSAFE_SQL`), and a stubbed timed-out statement confirms the configured timeout is applied and
 mapped to `TIMEOUT`. It runs offline.
 
+## Mathematician layer (F7)
+
+`nlq.math.AnswerSynthesisService` turns the rows from F6 into a final natural-language answer,
+applying any statistics the question calls for. Its contract is
+`answer(question, SqlGenerationResult, QueryResult) -> AskAnswer`, where `AskAnswer` carries the NL
+`answer`, the `formulasApplied` (each `{name, expression, inputs, result}`), the `computedValues`
+(operation name → the figure Java computed), the `sql`, the `assumptions` (from generation plus any
+evaluation notes), and a capped `rowsPreview`.
+
+### Plan, then deterministically evaluate
+
+The layer never lets the model do arithmetic — LLMs are unreliable at it. Instead the work is split
+into a plan step and a deterministic evaluation step, with a final narration step:
+
+1. **Plan** — the `LlmClient` (structured output) returns a `ComputationPlan`: *which* catalog
+   formula(s) apply and over *which* result columns, as a list of named operations — **not** the
+   final numbers. A number written by the model here is ignored.
+2. **Evaluate** — `nlq.math.FormulaEvaluator` computes every value **in Java**. It uses
+   `commons-math3` for statistics (`DescriptiveStatistics`, `SimpleRegression`,
+   `PearsonsCorrelation`) and a **restricted** `exp4j` evaluator for ad-hoc arithmetic — only
+   numeric operators and a whitelist of functions (`abs`, `sqrt`, `pow`, `min`, `max`, `log`, `exp`,
+   `ceil`, `floor`, …); any other `name(` call is rejected, and an `expression` operation may
+   reference only earlier operations' results by name, never raw columns.
+3. **Narrate** — the `LlmClient` writes a concise answer **given** the question, the deterministic
+   `computedValues`, and the applied formulas. The system prompt forbids it from stating any figure
+   that is not in `computedValues` or a previewed row cell, so the prose cannot invent numbers.
+
+### Why arithmetic is computed in Java, not by the LLM
+
+The model is good at *choosing* the right formula and the right column from a natural-language
+question; it is not reliable at *executing* the arithmetic, and a wrong-but-plausible figure is worse
+than no figure. Splitting "decide the recipe" (model) from "do the math" (`commons-math3` / `exp4j`)
+makes every number reproducible and auditable: `formulasApplied` records exactly what was computed
+and from which inputs, and `computedValues` is the single source the narrative may quote.
+
+### Supported formula catalog
+
+`count`, `sum`, `mean`/`average`, `min`, `max`, `median`, `std_dev`, `variance`, `percentile`
+(arg `percentile`/`p`), `weighted_average` (value + weight columns), `growth_rate`, `cagr`
+(optional `periods`), `regression_slope` / `regression_intercept` (x + y columns), `correlation`
+(Pearson r, x + y columns), and `expression` (ad-hoc arithmetic over earlier results via `exp4j`).
+Common aliases (`avg`, `stddev`, `slope`, `pearson`, …) are normalized.
+
+### Guards and short-circuits
+
+Evaluation **never throws on bad data**: an empty column, a non-numeric column, a missing column,
+division by zero (e.g. zero weights, a zero base in `growth_rate`/`cagr`), or a non-finite result
+causes that one operation to be **skipped** and a note recorded in `assumptions`; other operations
+still run. Two whole-question short-circuits avoid fabricated math entirely:
+
+- **Empty result set** — F7 returns a factual *"No data: the query returned no rows…"* answer
+  **without calling the model at all**, so an empty result can never become a hallucinated number.
+- **Pure lookup** — when the plan sets `lookupOnly` (or yields no operations), the answer is composed
+  directly from the rows with no statistics, and the narrative is told there are no computed values.
+
+`FormulaEvaluatorTest` covers the deterministic core offline (exact `mean`, percentile, an
+`expression` composing earlier sums, plus the empty / non-numeric / divide-by-zero / disallowed-function
+guards). `AnswerSynthesisServiceTest` covers the acceptance case — "what is the average order value"
+plans a `mean`, `commons-math3` computes `25`, and the narrative is handed that exact figure — plus
+the empty-set "no data" short-circuit (no model call) and the lookup path. Both use a capturing stub
+`LlmClient`, so they run with no API key.
+
+## Orchestration & REST API (F8)
+
+`nlq.api.AskOrchestrator` wires F1–F7 into one end-to-end call, and `nlq.api.AskController` exposes it
+at **`POST /api/ask`** (a sibling of the F1 `POST /api/ask/test-connection`, both under `/api/ask`).
+The request is an `AskRequest` (`connection`, `question`, `skipTables`, `skipColumns`, optional
+`model`, optional `maxRows`); the success response is an `AskResponse`.
+
+### End-to-end sequence
+
+```
+POST /api/ask  (AskRequest: connection + question + skip-list + optional model/maxRows)
+        │
+        ▼
+  AskController ──[aura.ask.enabled? no → 503]
+        │ yes
+        ▼
+  AskOrchestrator.ask(request)
+        │   effective skip-list = default-skip-tables ∪ connection skips ∪ request skips
+        │   effective maxRows   = min(request.maxRows ?? ceiling, ceiling)   // clamp, never raise
+        │
+        ├─▶ 1. open target connection            (F1 DynamicConnectionFactory)   ── timing: connect
+        ├─▶ 2. introspect with skip-list          (F2 SchemaIntrospector)         ── timing: introspect
+        ├─▶ 3. generate SQL                        (F4 SqlGenerationService)       ── timing: generate
+        │        └─ clarificationNeeded? ─── yes ──▶ AskResponse.clarification ──▶ HTTP 400 (+ body)
+        ├─▶ 4. validate read-only + skip-list      (F5 SqlSafetyGuard)             ── timing: validate
+        ├─▶ 5. execute bounded + timed             (F6 QueryExecutionService)      ── timing: execute
+        ├─▶ 6. synthesize answer (plan→eval→narrate)(F7 AnswerSynthesisService)    ── timing: synthesize
+        │
+        └─[finally] close the target connection (always)
+        ▼
+  AskResponse (answer, sql, tablesUsed, formulasApplied, computedValues, assumptions,
+               rowsPreview, rowCount, truncated, timingMillis)  ──▶ HTTP 200
+```
+
+The connection is **always closed in a `finally` block**. The effective skip-list is honoured at
+*every* layer — removed from the schema in F2, then re-enforced by the guard in F5 and the executor in
+F6 — and the per-request `maxRows` override is clamped to `aura.ask.max-rows` (it can only lower the
+cap) and applied at F5/F6 so the injected `LIMIT` and the driver row cap agree. The `sql` returned is
+the **validated, row-capped** query that actually ran, not the raw F4 draft.
+
+### Clarification vs. failure
+
+A **clarification** is a normal, well-formed outcome (not an exception): when F4 cannot answer from
+the non-skipped schema it returns a question, the orchestrator returns early with
+`AskResponse.clarification(...)`, and the controller surfaces it as **HTTP 400** with the body intact.
+A question that targets a *skipped* table is the canonical case — the table is structurally absent from
+the schema the model sees, so the engine asks rather than leaks or guesses.
+
+### Error mapping
+
+The controller maps the pipeline's typed exceptions to clean, **sanitized** HTTP errors — never the
+password, raw driver text, prompt, or a stack trace; the status carries the category:
+
+| Condition | Status | Source |
+|-----------|--------|--------|
+| Engine disabled (`aura.ask.enabled=false`) | `503` | controller guard |
+| Malformed request / rejected connection details | `400` | `IllegalArgumentException` |
+| Clarification needed | `400` | early return (body is the `AskResponse`) |
+| Unsafe / ungeneratable SQL | `422` | `UnsafeSqlException`, `QueryExecutionException(UNSAFE_SQL)` |
+| LLM call failed | `502` | `LlmException` (non-timeout) |
+| Target connection / execution failed | `502` | `SQLException`, `QueryExecutionException(EXECUTION/NOT_READ_ONLY)` |
+| Timed out (LLM or query) | `504` | `LlmException(TIMEOUT)`, `QueryExecutionException(TIMEOUT)` |
+
+`AskOrchestratorTest` covers the end-to-end happy path (a question → SQL with an injected `LIMIT`, a
+rows preview, a Java-computed `mean`, and an NL answer), the skipped-table clarification (and asserts
+the skipped table never appears in the schema shown to the model), and the `maxRows` override
+truncating the result — all offline over file-backed SQLite with a capturing stub `LlmClient`.
+
 ## Configuration
 
 Bound from prefix `aura.ask` (`nlq.config.AskEngineProperties`):
@@ -459,8 +589,8 @@ fails fast at startup).
 - [x] **F4** — NL → SQL prompting (`nlq.sql`).
 - [x] **F5** — Read-only + skip-list SQL validation (`nlq.sql`).
 - [x] **F6** — Bounded, timed query execution (`nlq.sql`).
-- [ ] **F7** — Result-set mathematical post-processing (`nlq.math`).
-- [ ] **F8** — Natural-language answer composition.
-- [ ] **F9** — REST API + DTOs (`nlq.api`).
-- [ ] **F10** — End-to-end integration tests.
+- [x] **F7** — Mathematician layer: plan-then-deterministically-evaluate + answer synthesis (`nlq.math`).
+- [x] **F8** — Orchestrator (`AskOrchestrator`) + `POST /api/ask` endpoint and DTOs (`AskRequest`/`AskResponse`/`AskErrorResponse`), wiring F1–F7 end to end (`nlq.api`).
+- [ ] **F9** — REST API hardening: request validation, rate limiting, auth.
+- [ ] **F10** — Full end-to-end integration tests against Postgres/MySQL targets.
 - [ ] **F11** — Hardening, observability, and docs.

@@ -28,6 +28,7 @@ of REST endpoints that can be consumed by an ad-buying or campaign-planning serv
    - [Lookalike Discovery (`/api/marketing/find-lookalikes`)](#8-lookalike-discovery)
    - [Enrichment Admin (`/api/admin`)](#9-enrichment-admin-api)
    - [Diagnostic / Test (`/test`, `/api/test`)](#10-diagnostic--test-endpoints)
+   - [Ask Engine (`/api/ask`)](#11-ask-engine-experimental)
 7. [Common Models](#common-models)
 8. [Integration Recipes](#integration-recipes)
 9. [Errors](#errors)
@@ -785,9 +786,37 @@ enforces are:
 
 Bounded execution (F6) runs only what this guard returns.
 
+The mathematician layer (F7) is in place: `nlq.math.AnswerSynthesisService` turns the retrieved rows
+into a final natural-language answer and **applies formulas deterministically**. It is
+plan-then-evaluate: the LLM proposes *which* formula(s) apply over *which* columns (mean, weighted
+average, growth rate, std dev, regression slope, percentile, CAGR, correlation, or an ad-hoc
+expression) — **never the final numbers** — and Java computes every value with `commons-math3` and a
+restricted `exp4j` evaluator. The model then writes the prose answer *given* those computed values and
+is forbidden from inventing any figure beyond them. The returned `AskAnswer` therefore includes the
+**formulas applied** (each with its inputs and Java-computed result) and the **exact computed values**
+keyed by name, alongside the answer text, the SQL, the assumptions, and a row preview. Bad data never
+fabricates a number: an empty result set short-circuits to a factual *"no data"* answer (with no model
+call), a pure-lookup question is answered straight from the rows, and division-by-zero / non-numeric /
+empty columns skip the affected formula with a recorded note. So for *"what is the average order
+value"*, the engine plans a `mean` over the order-value column, `commons-math3` computes it, and the
+answer states that exact figure.
+
+The orchestrator and public endpoint (F8) are in place: `nlq.api.AskOrchestrator` wires F1–F7 into one
+end-to-end call exposed at **`POST /api/ask`**. It opens the per-request target connection (F1),
+introspects it through the effective skip-list (F2), drafts SQL (F4), and — unless a clarification is
+needed — validates (F5), executes (F6), and synthesizes the answer (F7), **always closing the
+connection** in a `finally` block. The effective skip-list is the union of `aura.ask.default-skip-tables`,
+the connection's skips, and the request's, honoured at every layer; an optional per-request `maxRows`
+is clamped to `aura.ask.max-rows` (it can only lower the cap). The response carries the validated SQL
+that actually ran, a rows preview, the formulas applied with their computed values, the assumptions,
+and per-stage timings. A question that can't be answered from the non-skipped schema (e.g. one
+targeting a skipped table) returns a **clarification**, never a leak. Errors are mapped to clean,
+sanitized HTTP statuses (no credentials, driver text, or prompts ever leak).
+
 | Endpoint                          | Purpose                                                              |
 |-----------------------------------|----------------------------------------------------------------------|
 | `POST /api/ask/test-connection`   | Open a read-only connection to a target DB and probe it (`SELECT 1`).|
+| `POST /api/ask`                   | Answer a natural-language question against a target DB, read-only.   |
 
 **`POST /api/ask/test-connection`** — attempts an isolated, read-only connection to the supplied
 target database and runs a trivial probe. The `driver` field is optional (auto-detected from the URL
@@ -825,6 +854,98 @@ Response (rejected URL — e.g. `jdbc:h2:mem:test`, returns `400`):
   "error": "Unsupported JDBC URL scheme. Allowed: jdbc:postgresql:, jdbc:sqlite:, jdbc:mysql:"
 }
 ```
+
+**`POST /api/ask`** — answer a natural-language `question` against the supplied target database, fully
+read-only. Runs the whole F1–F7 pipeline and returns the validated SQL that ran, a rows preview, the
+formulas applied, and a natural-language answer. Returns a **clarification** (HTTP `400`) when the
+question can't be answered from the non-skipped schema. The `password` is used only to open the
+connection and never appears in the response or logs.
+
+Request (the `connection` object is the same `ConnectionRequest` as `test-connection`; `skipTables`,
+`skipColumns`, `model`, and `maxRows` are optional):
+
+```json
+{
+  "connection": {
+    "jdbcUrl": "jdbc:postgresql://localhost:5432/analytics",
+    "username": "readonly_user",
+    "password": "***",
+    "driver": "postgresql"
+  },
+  "question": "What is the average order value for orders placed last month?",
+  "skipTables": ["audit_log", "public.users_pii"],
+  "skipColumns": ["orders.internal_notes"],
+  "model": "claude-opus-4-8",
+  "maxRows": 500
+}
+```
+
+Response (success, `200`):
+
+```json
+{
+  "clarificationNeeded": false,
+  "clarificationQuestion": null,
+  "answer": "The average order value for orders placed last month was $42.17 across 1,284 orders.",
+  "sql": "SELECT avg(amount) AS avg_order_value FROM orders WHERE created_at >= date_trunc('month', now() - interval '1 month') AND created_at < date_trunc('month', now()) LIMIT 500",
+  "tablesUsed": ["orders"],
+  "formulasApplied": [
+    {
+      "name": "average_order_value",
+      "expression": "mean(avg_order_value)",
+      "inputs": { "column": "avg_order_value", "count": 1 },
+      "result": 42.17
+    }
+  ],
+  "computedValues": { "average_order_value": 42.17 },
+  "assumptions": ["'order value' maps to orders.amount"],
+  "rowsPreview": [ { "avg_order_value": 42.17 } ],
+  "rowCount": 1,
+  "truncated": false,
+  "timingMillis": {
+    "connectMillis": 31,
+    "introspectMillis": 88,
+    "generateMillis": 940,
+    "validateMillis": 3,
+    "executeMillis": 12,
+    "synthesizeMillis": 1120,
+    "totalMillis": 2194
+  }
+}
+```
+
+Response (clarification — e.g. the question targets a skipped table, returns `400`):
+
+```json
+{
+  "clarificationNeeded": true,
+  "clarificationQuestion": "Which table holds the data you mean? The question could not be answered from the available schema.",
+  "answer": null,
+  "sql": null,
+  "tablesUsed": [],
+  "formulasApplied": [],
+  "computedValues": {},
+  "assumptions": [],
+  "rowsPreview": [],
+  "rowCount": 0,
+  "truncated": false,
+  "timingMillis": { "connectMillis": 29, "introspectMillis": 84, "generateMillis": 610, "totalMillis": 723 }
+}
+```
+
+HTTP status codes:
+
+| Status | When | Body |
+|--------|------|------|
+| `200` | A question was answered. | `AskResponse` (answer) |
+| `400` | Clarification needed (question can't be answered from the non-skipped schema). | `AskResponse` (clarification) |
+| `400` | Malformed request (missing `connection`/`question`) or rejected connection details (bad scheme/driver/denylisted parameter). | `{ "error": "…" }` |
+| `422` | The drafted query is unsafe or can't be made a single bounded read-only statement. | `{ "error": "…" }` |
+| `502` | The LLM call or the target connection/execution failed. | `{ "error": "…" }` |
+| `504` | The LLM call or the query timed out. | `{ "error": "…" }` |
+| `503` | The engine is disabled (`aura.ask.enabled=false`). | `{ "error": "the Ask engine is disabled" }` |
+
+All error bodies are **sanitized** — never the password, raw driver text, prompt, or a stack trace.
 
 ---
 
@@ -908,6 +1029,35 @@ curl -X POST 'http://localhost:8081/api/marketing/find-lookalikes' \
 curl -X POST 'http://localhost:8081/api/admin/run-enrichment'
 curl -X POST 'http://localhost:8081/api/marketing/users/sync'
 ```
+
+### Ask a question of an external database
+
+Point the Ask engine at any read-only-reachable Postgres/SQLite/MySQL database and ask in plain
+English. Connection details are per-request and fully isolated from AuraMath's own datasource; list
+any sensitive tables/columns in `skipTables`/`skipColumns` so they are invisible to the model and
+rejected at validation.
+
+```bash
+curl -X POST 'http://localhost:8081/api/ask' \
+     -H 'Content-Type: application/json' \
+     -d '{
+           "connection": {
+             "jdbcUrl": "jdbc:postgresql://localhost:5432/analytics",
+             "username": "readonly_user",
+             "password": "***",
+             "driver": "postgresql"
+           },
+           "question": "What is the average order value for orders placed last month?",
+           "skipTables": ["audit_log", "users_pii"],
+           "maxRows": 500
+         }' | jq
+```
+
+A successful call returns the validated `sql` that ran, a `rowsPreview`, the `formulasApplied` with
+their computed values, and a natural-language `answer`. If the question can't be answered from the
+non-skipped schema (for example it targets a skipped table), the engine responds `400` with
+`clarificationNeeded: true` and a `clarificationQuestion` to refine — never a leak. First probe
+reachability with `POST /api/ask/test-connection` using the same `connection` block.
 
 ---
 
