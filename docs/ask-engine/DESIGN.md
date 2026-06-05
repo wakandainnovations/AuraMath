@@ -356,6 +356,83 @@ a query against a skipped table, `SELECT pg_read_file('/etc/passwd')`, and a com
 statement are each rejected with the expected reason; and a no-limit query comes back with a bounded
 `LIMIT`. It runs offline against an in-memory SQLite schema introspected through F2.
 
+## Query execution (F6)
+
+`nlq.sql.QueryExecutionService` is the only place a generated query actually runs. It takes the
+per-request, read-only `java.sql.Connection` from F1 and the safe SQL from F5 and returns a typed
+`QueryResult` — or throws a typed, sanitized `QueryExecutionException`.
+
+`execute(connection, sql, SkipList, DatabaseSchema)` is the contract. The caller owns and closes the
+connection (it is short-lived).
+
+### Execution contract
+
+1. **Defense-in-depth re-validation.** Before touching the connection the service re-runs the SQL
+   through `SqlSafetyGuard.validate(sql, skipList, schema)` — the *same* trust boundary F5 applies —
+   and executes exactly the normalized, row-capped string the guard returns. What runs is what was
+   just re-validated, not whatever the caller passed in. A failure raises
+   `QueryExecutionException(UNSAFE_SQL)`.
+2. **Read-only assertion.** It then confirms `connection.isReadOnly()`; a connection that does not
+   report read-only is refused with `QueryExecutionException(NOT_READ_ONLY)`. The service never flips
+   the flag itself — F1 opens the connection read-only and this is a belt-and-suspenders check.
+3. **Bounded statement.** The query runs through a `PreparedStatement` with
+   `setQueryTimeout(aura.ask.query-timeout-seconds)`, `setMaxRows(aura.ask.max-rows)`, and a
+   streaming `setFetchSize(min(maxRows, 1000))` hint so large results are not buffered whole.
+
+### Result model
+
+`QueryResult` is immutable and carries:
+
+- **`columns`** — ordered `QueryResult.Column` (select-list order): the column label (alias-aware),
+  the `java.sql.Types` `sqlType` code, and the driver's native `typeName`.
+- **`rows`** — `List<Map<String,Object>>`, each row an ordered name→value map keyed by column label.
+- **`rowCount`** — number of rows returned (`= rows.size()`).
+- **`truncated`** — `true` when the result filled the `maxRows` cap (see below).
+- **`executionMillis`** — wall-clock time to execute and read the result set.
+
+### Type mapping
+
+JDBC values are mapped to JSON-friendly Java types as the result set is read:
+
+| JDBC value | Mapped to |
+|------------|-----------|
+| `NULL` | `null` |
+| `String`, `Boolean`, integral/floating `Number` | passed through |
+| `BigDecimal` | preserved (Gson serializes it losslessly as a number) |
+| `java.sql.Timestamp` | ISO-8601 local date-time string (`toLocalDateTime().toString()`) |
+| `java.sql.Date` / `java.sql.Time` | ISO local date / time string |
+| `byte[]` / `Blob` | Base64 string |
+| `Clob` | its character content as a `String` |
+| anything else (Postgres `jsonb`/arrays/`UUID`, enums, …) | stable `toString()` form |
+
+Temporal values use the `toLocalX()` forms deliberately, to render a clean ISO string without
+timezone-shift surprises across drivers.
+
+### Truncation and timeout
+
+- **Truncation.** `setMaxRows(maxRows)` caps the driver, and F5 has already injected a matching
+  `LIMIT maxRows`, so a result that *fills* the cap is the truncation signal: `truncated` is set when
+  `rowCount == maxRows`, meaning more rows may exist than were returned.
+- **Timeout.** `setQueryTimeout` bounds execution; when the driver cancels a query the resulting
+  `SQLException` is mapped to `QueryExecutionException(TIMEOUT)`. (Postgres/MySQL cancel CPU-bound
+  queries this way; SQLite's query timeout only governs lock contention, so a CPU-bound SQLite query
+  is not cut off in-process — a driver limitation, not an engine one.)
+
+### Error sanitization
+
+Any driver `SQLException` is wrapped in a `QueryExecutionException` whose message is **sanitized** —
+never the raw driver text (which can echo connection details), never a stack trace. The message
+carries only a category and, for non-timeout failures, the `SQLState`; the original exception is
+retained as the cause for server-side logging only. The typed `QueryExecutionException.Kind`
+(`NOT_READ_ONLY` / `UNSAFE_SQL` / `TIMEOUT` / `EXECUTION`) lets callers react without parsing text.
+
+`QueryExecutionServiceTest` covers the acceptance set against a file-backed SQLite database read over
+a separate read-only connection: a `SELECT` returns typed rows with correct column metadata, `NULL`
+round-trips as `null`, a result over `maxRows` sets `truncated=true` (and one under it does not), a
+writable connection is refused (`NOT_READ_ONLY`), a chained statement is refused at execution
+(`UNSAFE_SQL`), and a stubbed timed-out statement confirms the configured timeout is applied and
+mapped to `TIMEOUT`. It runs offline.
+
 ## Configuration
 
 Bound from prefix `aura.ask` (`nlq.config.AskEngineProperties`):
@@ -381,7 +458,7 @@ fails fast at startup).
 - [x] **F3** — `LlmClient` interface + Claude implementation (`nlq.llm`).
 - [x] **F4** — NL → SQL prompting (`nlq.sql`).
 - [x] **F5** — Read-only + skip-list SQL validation (`nlq.sql`).
-- [ ] **F6** — Bounded, timed query execution (`nlq.sql`).
+- [x] **F6** — Bounded, timed query execution (`nlq.sql`).
 - [ ] **F7** — Result-set mathematical post-processing (`nlq.math`).
 - [ ] **F8** — Natural-language answer composition.
 - [ ] **F9** — REST API + DTOs (`nlq.api`).
