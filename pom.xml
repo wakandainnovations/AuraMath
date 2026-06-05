@@ -99,6 +99,14 @@
         <artifactId>opencsv</artifactId>
         <version>5.7.1</version>
     </dependency>
+    <!-- JSqlParser — real SQL parser backing the F5 read-only safety guard: single-statement and
+         statement-type enforcement plus reliable table-reference extraction, instead of fragile
+         regex. Pure Java, no transitive dependencies. -->
+    <dependency>
+        <groupId>com.github.jsqlparser</groupId>
+        <artifactId>jsqlparser</artifactId>
+        <version>4.6</version>
+    </dependency>
   </dependencies>
 
   <build>

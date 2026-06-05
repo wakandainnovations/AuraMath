@@ -61,6 +61,301 @@ question + target connection + skip-list
 - **Pluggable LLM.** The model layer sits behind an `LlmClient` interface in `nlq.llm`; the Claude
   implementation is first. The active provider is selected via `aura.ask.llm-provider`.
 
+## Connection model (F1)
+
+Target connections are built **per request** by `nlq.connection.DynamicConnectionFactory` and are
+never derived from, nor allowed to fall back to, AuraMath's own `DataSourceConfig` datasource. The
+factory:
+
+- validates the JDBC URL (see whitelist/denylist below) and resolves the driver;
+- explicitly loads the driver class via `Class.forName` — one of the three supported drivers only;
+- applies a login timeout from `aura.ask.connection-timeout-seconds`
+  (`DriverManager.setLoginTimeout`);
+- opens a brand-new `java.sql.Connection` with **read-only intent** and leaves autocommit at the
+  driver default;
+- returns the live connection to the caller, who **owns and must close it** (it is `AutoCloseable`;
+  use try-with-resources). The factory keeps no pool and no reference — connections are short-lived.
+
+Read-only is applied in a driver-appropriate way: Postgres and MySQL accept `setReadOnly(true)` on
+the live connection; SQLite (Xerial) rejects that after connect, so the read-only **open mode** is
+baked into the connection properties before connecting. If a connection cannot be made read-only it
+is closed and the open fails — fail closed.
+
+### Supported drivers
+
+| Alias        | URL scheme prefix    | Driver class                  |
+|--------------|----------------------|-------------------------------|
+| `postgresql` | `jdbc:postgresql:`   | `org.postgresql.Driver`       |
+| `sqlite`     | `jdbc:sqlite:`       | `org.sqlite.JDBC`             |
+| `mysql`      | `jdbc:mysql:`        | `com.mysql.cj.jdbc.Driver`    |
+
+The request's `driver` field is optional; when omitted it is auto-detected from the URL scheme.
+When supplied it must agree with the scheme, or the request is rejected.
+
+### JDBC-URL whitelist / denylist
+
+`nlq.connection.JdbcUrlValidator` enforces two gates, both fail-closed:
+
+1. **Scheme whitelist** — the URL must start with one of the three prefixes above. Anything else
+   (`jdbc:h2:`, `jdbc:oracle:`, …) is rejected.
+2. **Parameter denylist** — the URL must not contain any of these case-insensitive substrings,
+   which enable local-file loading, custom socket factories, init statements, or gadget
+   deserialization on one or more drivers:
+   `allowLoadLocalInfile`, `socketFactory`, `init`, `autoDeserialize`, `allowUrlInLocalInfile`.
+
+### Connection-test endpoint
+
+`POST /api/ask/test-connection` (in `nlq.api.AskConnectionController`) opens a connection from a
+`ConnectionRequest`, runs a trivial `SELECT 1` probe, and returns
+`{connected, databaseProductName, databaseProductVersion, error}`. The password is accepted only in
+the request body and **never** appears in the response (the result type has no password field) or in
+any log. A rejected scheme/driver/denylisted parameter returns `400`; a reachable-but-failing
+connection returns `200` with `connected=false` and the error.
+
+## Schema model (F2)
+
+After a connection is open, `nlq.schema.SchemaIntrospector` walks `java.sql.DatabaseMetaData` to
+build an immutable `DatabaseSchema`. **Introspection reads metadata only — never any row data.**
+
+### Model
+
+- `DatabaseSchema` — the model-visible tables that survived filtering, plus the reported
+  `productName` and a coarse `dialect` hint (`postgresql` / `sqlite` / `mysql`).
+- `TableInfo` — `schema` (nullable for SQLite), `name`, ordered `ColumnInfo` list, primary-key
+  column names (in key order), and imported `ForeignKeyInfo` references.
+- `ColumnInfo` — `name`, `sqlType` (the `java.sql.Types` code), `typeName` (the driver's native
+  type name), and `nullable`.
+- `ForeignKeyInfo` — owning `column` → `referencedSchema.referencedTable.referencedColumn`.
+
+The metadata calls used are exactly `getTables` (`TABLE`/`VIEW`), `getColumns`, `getPrimaryKeys`,
+and `getImportedKeys`. No `SELECT` is ever issued during introspection.
+
+### System-schema exclusions
+
+Only application (user) tables and views are surfaced. The following are always excluded so the
+model never sees engine internals:
+
+- **Postgres** — `pg_catalog`, any `pg_*` schema (e.g. `pg_toast`), and `information_schema`.
+- **MySQL** — `mysql`, `sys`, `performance_schema`, and `information_schema`.
+- **SQLite** — internal `sqlite_*` tables (e.g. `sqlite_sequence`, `sqlite_master`).
+
+### Skip-list semantics
+
+`nlq.schema.SkipList` carries the **effective** skip-list, which is the **union** of:
+
+1. the server-side `aura.ask.default-skip-tables` (always applied), and
+2. the per-request `skipTables` / `skipColumns` (on the request model).
+
+Matching is **case-insensitive** and **schema-qualified-aware**:
+
+- A **table** entry is either a bare name (`users`, matching that table in *any* schema) or
+  schema-qualified (`public.users`, matching *only* that schema's table).
+- A **column** entry is either `table.column` or `schema.table.column`, with the same semantics.
+
+Skipped **tables** are omitted from `DatabaseSchema` entirely; skipped **columns** are removed from
+their table's column list (and from any primary/foreign key that referenced them). A table whose
+every column is skipped is dropped as well. Because filtering happens during introspection, skipped
+objects are structurally absent from the model and cannot reappear downstream.
+
+### Rendering
+
+`nlq.schema.SchemaRenderer` serializes a `DatabaseSchema` into a compact, token-efficient
+CREATE-TABLE-like listing (a `dialect` comment, then one `TABLE name ( … )` block per table with
+`PK` / `NOT NULL` markers and inline `FK -> ref` pointers). It emits **structure only, no data
+rows**, and operates on the already-filtered schema — so a skipped table or column can never appear
+in the rendered prompt. A unit test asserts a skipped table name is absent from the rendered output.
+
+## LLM layer (F3)
+
+The model layer sits behind a **provider-neutral** `nlq.llm.LlmClient` so the engine never depends
+on a specific vendor's SDK or types. Callers build an `LlmRequest`, call `complete`, and read an
+`LlmResponse`; the active implementation is selected in `nlq.config` from `aura.ask.llm-provider`.
+
+### Contract
+
+`LlmClient.complete(LlmRequest) -> LlmResponse` runs one single-turn completion.
+
+- **`LlmRequest`** (immutable; `LlmRequest.builder()`): `systemPrompt` (optional), `userPrompt`
+  (required), `jsonSchema` (optional, a JSON Schema object requesting structured output),
+  `structuredToolName` (defaults to `structured_output`), `maxTokens`, `temperature` (optional —
+  see below), and `modelId` (optional; the client applies its default when unset).
+- **`LlmResponse`** (immutable): `text` (concatenated text output; never null, may be empty),
+  `structuredJson` (a Gson `JsonObject`, non-null only for a structured request that succeeded),
+  `stopReason`, and `inputTokens` / `outputTokens` (`-1` when the provider does not report them).
+- **`LlmException`** (checked, typed): carries an `LlmException.Kind` —
+  `CONFIGURATION` / `RATE_LIMITED` / `TIMEOUT` / `HTTP_ERROR` / `BAD_RESPONSE` — plus an HTTP status
+  for the HTTP cases. Messages are deliberately terse and **never** contain the API key or prompt.
+
+The contract is provider-neutral by design: no Claude/OpenAI-specific type appears on the request or
+response, and structured output is requested with a generic JSON Schema rather than any provider's
+tool format.
+
+### Claude implementation
+
+`nlq.llm.ClaudeLlmClient` calls the Anthropic **Messages API** (`POST /v1/messages`) directly over
+`java.net.http.HttpClient`, serializing and deserializing with Gson — no Anthropic SDK is added.
+
+- **Credentials.** The API key is read once at construction from `secrets.txt` on the classpath
+  (key `anthropic.api.key`), the same loading pattern as `DataSourceConfig`. A missing key does
+  **not** fail construction — the bean still wires up — and the first `complete` call then fails with
+  a clear `CONFIGURATION` error. The key is never logged.
+- **Default model.** `claude-opus-4-8` for reasoning-heavy calls, overridable per request via
+  `LlmRequest.modelId`.
+- **Temperature.** Optional and omitted from the request unless explicitly set, because the default
+  model rejects sampling parameters. Set it only when targeting a model that accepts it.
+- **Structured output.** When a request carries a JSON Schema, the schema is sent as a single tool's
+  `input_schema` and `tool_choice` forces that tool, so the model must return a matching JSON object;
+  that object is surfaced on `LlmResponse.structuredJson`.
+- **Resilience.** Non-2xx responses, timeouts, and rate limits (429) raise a typed `LlmException`.
+  Retryable failures (429, 5xx, transport timeouts) are retried **once** with a bounded backoff that
+  honours a `Retry-After` header when present; other 4xx errors are not retried.
+- **Logging.** Prompt and schema contents are never logged at `INFO`; only coarse, non-sensitive
+  metadata (model id, retry notices at `DEBUG`) is emitted, and never the API key.
+
+### Adding another provider
+
+1. Implement `LlmClient` (e.g. `OpenAiLlmClient`) translating `LlmRequest`/`LlmResponse` to/from the
+   new vendor — keep all vendor types inside the implementation.
+2. Add a branch in `AskEngineConfiguration.llmClient(...)` for the new `aura.ask.llm-provider` value.
+3. No caller changes: the engine depends only on the `LlmClient` interface.
+
+A round-trip is covered by `ClaudeLlmClientTest`, which is skipped unless `ANTHROPIC_API_KEY` is set
+in the environment; the no-key configuration-error case always runs offline.
+
+## NL → SQL generation (F4)
+
+`nlq.sql.SqlGenerationService` turns a question + filtered schema into a **single drafted read-only
+query**. It renders the schema with `SchemaRenderer` (F2), prompts the model through the
+`LlmClient` (F3) in **structured-output mode**, and returns a `SqlGenerationResult`.
+
+`generate(question, DatabaseSchema)` is the contract. The schema's detected
+`DatabaseSchema.getDialect()` is passed through to the model so it uses dialect-correct syntax
+(`LIMIT` vs `FETCH FIRST`, identifier quoting, date functions).
+
+### Generation contract
+
+`SqlGenerationResult` is one of two shapes:
+
+- **A drafted query** — `sql` is a single `SELECT`/`WITH` statement, with `tablesUsed` (the tables
+  it reads), `assumptions` (interpretations the model made, e.g. which column means "signed up"),
+  and an optional `confidence` in `[0,1]`.
+- **A clarification** — `sql` is `null`, `clarificationNeeded` is `true`, and `clarificationQuestion`
+  carries a specific question to put back to the caller.
+
+**The result is a draft, not trusted output.** F4 does not execute anything and does not validate
+the SQL — read-only + skip-list validation is F5 and bounded execution is F6. The SQL here is still
+untrusted.
+
+### Structured output shape
+
+The model is asked (via the client's structured-output / tool-use mode) to return JSON matching this
+schema — required fields `sql`, `tablesUsed`, `assumptions`, `clarificationNeeded`; optional
+`confidence` and `clarificationQuestion`:
+
+```json
+{
+  "sql": "SELECT count(*) AS signups FROM users WHERE created_at >= ... LIMIT 100",
+  "tablesUsed": ["users"],
+  "assumptions": ["'signed up' maps to users.created_at"],
+  "confidence": 0.82,
+  "clarificationNeeded": false,
+  "clarificationQuestion": ""
+}
+```
+
+### System-prompt guarantees
+
+The system prompt (a resource template at `src/main/resources/nlq/sql_generation_system.txt`, with
+`${dialect}` / `${maxRows}` placeholders) instructs the model to:
+
+- **Read-only** — produce only a single query beginning with `SELECT`/`WITH`; never
+  `INSERT`/`UPDATE`/`DELETE`/`MERGE`, DDL, or DCL.
+- **Single statement** — never emit multiple statements or any SQL comments.
+- **Schema-bounded** — reference only tables/columns present in the rendered schema (which is
+  already skip-list-filtered in F2, so skipped objects are not even visible); use exact names, prefer
+  explicit column lists, and join only on the schema's `FK -> ...` relationships.
+- **Bounded** — always include a row limit `<=` the configured `aura.ask.max-rows`.
+- **Ask, don't guess** — if the question cannot be answered from the schema, set
+  `clarificationNeeded` and return a question instead of inventing SQL.
+
+### Clarification path and the table-subset pre-check
+
+Two routes lead to a clarification: the model sets `clarificationNeeded` itself, or the service's
+**cheap pre-check** finds that `tablesUsed` is *not* a subset of the schema's tables. In the latter
+case the drafted SQL is discarded and a clarification naming the unknown table(s) is returned, so the
+engine never hands downstream a query that references something the model invented. (A missing/empty
+`sql` is also treated as a clarification defensively.) This pre-check is a guard only — F5 still
+re-enforces read-only and skip-list constraints on whatever SQL does survive.
+
+`SqlGenerationServiceTest` covers the acceptance case (a small SQLite schema + "how many users
+signed up last month" → a single `SELECT … LIMIT` with `users` in `tablesUsed`), the unknown-table
+pre-check, a model-driven clarification, and a missing-structured-output error. It uses a capturing
+stub `LlmClient`, so it runs offline with no API key.
+
+## Security model (F5)
+
+The LLM is **untrusted**. Its drafted SQL is never executed directly: it must first pass
+`nlq.sql.SqlSafetyGuard.validate(sql, SkipList, DatabaseSchema)`, which either returns a normalized,
+row-capped, safe SQL string or throws a typed `UnsafeSqlException` carrying a precise
+`UnsafeSqlException.Reason`. **The validator — not the LLM, and not the F4 prompt — is the trust
+boundary.** The F4 generator's own table-subset pre-check is a convenience guard only; F5 re-derives
+every constraint from scratch and is the rule that execution (F6) depends on.
+
+Every rule **fails closed**: anything ambiguous, unparseable, or not provably a single read-only
+query is rejected. The guard is deliberate about ordering — the cheap string screens for comments,
+statement-chaining, and forbidden tokens run on the **raw** input first, because a real parser
+silently discards comments and we must *reject* smuggled input rather than sanitize it. It then
+parses with **JSqlParser** (a real SQL parser, not regex) to confirm the statement shape and to
+enumerate referenced tables reliably.
+
+Guard rules, in order:
+
+1. **Non-empty** — null/blank input is rejected (`EMPTY`).
+2. **No comments** — any `--`, `/*`, or `*/` is rejected (`COMMENT`). SQL comments are the classic
+   vehicle for smuggling a second statement or a forbidden token past a downstream parser, so they
+   are refused outright rather than stripped.
+3. **Single statement** — a single optional trailing `;` is tolerated; any interior `;` is rejected
+   (`MULTIPLE_STATEMENTS`). The subsequent parse also accepts only one statement, so chaining is
+   caught twice.
+4. **Read-only form** — after trimming, the statement must begin with `SELECT` or `WITH`
+   (`NOT_READ_ONLY`).
+5. **No write/branch keywords** — a word-boundary scan rejects any top-level DML/DDL/DCL keyword:
+   `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `UPSERT`, `CREATE`, `ALTER`, `DROP`, `TRUNCATE`, `GRANT`,
+   `REVOKE`, `CALL`, `EXEC`, `EXECUTE`, `COPY`, `ATTACH`, `DETACH`, `PRAGMA`, `VACUUM`, `REINDEX`,
+   and the write-form `INTO` (which also covers `SELECT … INTO OUTFILE/DUMPFILE`) (`FORBIDDEN_KEYWORD`).
+6. **No exfil/side-effect functions** — a case-insensitive substring screen rejects known
+   file/network helpers per dialect: Postgres `pg_read_file`, `pg_read_binary_file`, `pg_ls_dir`,
+   `pg_stat_file`, large-object `lo_import`/`lo_export`/`lo_get`/`lo_put`, `dblink`; MySQL
+   `load_file`; and `outfile`/`dumpfile` targets (`FORBIDDEN_FUNCTION`). `COPY … TO/FROM`, SQLite
+   `ATTACH`, and `PRAGMA` are already covered by rule 5.
+7. **Parses to a single SELECT** — JSqlParser must parse the statement; anything it cannot parse is
+   rejected (`UNPARSEABLE`), and a parsed statement that is not a `Select` is rejected
+   (`NOT_A_QUERY`).
+8. **Schema- and skip-list-bounded tables** — every table found by JSqlParser's `TablesNamesFinder`
+   must be present in the (already skip-filtered) `DatabaseSchema` (`UNKNOWN_TABLE`) and must not be
+   on the effective `SkipList` (`SKIPPED_TABLE`). Because skipped tables were removed from the schema
+   during introspection (F2), a reference to one already surfaces as an unknown table; the explicit
+   skip-list check is defense in depth. CTE names introduced by a `WITH` clause are recognized as
+   valid references so legitimate CTE queries are not rejected.
+9. **No skipped columns** — as a conservative backstop, a query that names any skipped column's leaf
+   identifier is rejected (`SKIPPED_COLUMN`).
+10. **Row cap** — the validated query is bounded by `aura.ask.max-rows`: a missing limit is injected,
+    and an existing limit *larger* than the cap is lowered to it; a smaller explicit limit is left
+    untouched, and a non-constant limit (parameter/expression) is replaced with the hard cap. The
+    guard returns JSqlParser's re-rendered statement, so the executed SQL is exactly what was
+    validated.
+
+**Known limitations (intentional, fail-closed).** The string-level screens (rules 2, 5, 6) are
+conservative: a forbidden token or comment marker that appears *inside a string literal* will also
+be rejected, and the skipped-column screen (rule 9) over-rejects when an allowed table shares a
+column name with a skipped one. For an LLM-facing security boundary, over-rejection is the correct
+failure direction — a rejected benign query is recoverable; an executed malicious one is not.
+
+`SqlSafetyGuardTest` covers the acceptance set: a benign `SELECT` passes; `SELECT …; DROP TABLE x`,
+a query against a skipped table, `SELECT pg_read_file('/etc/passwd')`, and a commented-out chained
+statement are each rejected with the expected reason; and a no-limit query comes back with a bounded
+`LIMIT`. It runs offline against an in-memory SQLite schema introspected through F2.
+
 ## Configuration
 
 Bound from prefix `aura.ask` (`nlq.config.AskEngineProperties`):
@@ -74,16 +369,18 @@ Bound from prefix `aura.ask` (`nlq.config.AskEngineProperties`):
 | `aura.ask.default-skip-tables` | _(empty)_ | Tables always excluded, on top of per-request skips. |
 | `aura.ask.llm-provider` | `claude` | Selected `LlmClient` provider. |
 
-The LLM API key is read from `secrets.txt` (`anthropic.api.key=`) and is never committed.
+The LLM API key is read from `secrets.txt` (`anthropic.api.key=`) and is never committed. The active
+provider is chosen by `aura.ask.llm-provider` (only `claude` is implemented today; any other value
+fails fast at startup).
 
 ## Feature checklist
 
 - [x] **F0** — Module scaffold, dependencies & config (this document, packages, properties).
-- [ ] **F1** — Per-request isolated target connections (`nlq.connection`).
-- [ ] **F2** — Schema introspection with skip-list filtering (`nlq.schema`).
-- [ ] **F3** — `LlmClient` interface + Claude implementation (`nlq.llm`).
-- [ ] **F4** — NL → SQL prompting (`nlq.sql`).
-- [ ] **F5** — Read-only + skip-list SQL validation (`nlq.sql`).
+- [x] **F1** — Per-request isolated target connections + `POST /api/ask/test-connection` (`nlq.connection`, `nlq.api`).
+- [x] **F2** — Schema introspection with skip-list filtering (`nlq.schema`).
+- [x] **F3** — `LlmClient` interface + Claude implementation (`nlq.llm`).
+- [x] **F4** — NL → SQL prompting (`nlq.sql`).
+- [x] **F5** — Read-only + skip-list SQL validation (`nlq.sql`).
 - [ ] **F6** — Bounded, timed query execution (`nlq.sql`).
 - [ ] **F7** — Result-set mathematical post-processing (`nlq.math`).
 - [ ] **F8** — Natural-language answer composition.

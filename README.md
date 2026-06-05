@@ -80,10 +80,19 @@ live in `src/main/resources/secrets.txt` (classpath-loaded by `DataSourceConfig`
 db.url=jdbc:postgresql://<host>:<port>/<db>
 db.user=<user>
 db.password=<password>
+
+# Ask Engine (com.lit.fire.flame.nlq) — LLM credentials. Optional; only needed once the
+# Ask engine makes model calls. Never commit a real key.
+anthropic.api.key=<your-anthropic-api-key>
 ```
 
 Defaults if `secrets.txt` is absent: `jdbc:postgresql://localhost:5432/aura`, user `postgres`,
 empty password. **Do not commit real secrets.**
+
+The Ask engine reads `anthropic.api.key` from the same `secrets.txt`. It is optional: the engine
+wires up without it, and the first LLM call fails with a clear configuration error if it is missing.
+The active LLM provider is selected with the `aura.ask.llm-provider` property (default `claude`; only
+`claude` is implemented today, and any other value fails fast at startup).
 
 Scheduled jobs (enabled via `@EnableScheduling` on `AuraMathApplication`):
 - `AuthorCategoryController.scheduledResync()` — re-runs `/api/marketing/users/sync` every
@@ -722,9 +731,100 @@ A natural-language → database + mathematician engine lives under `com.lit.fire
 question in plain English and a per-request target database connection, it introspects the schema,
 drafts SQL with a pluggable LLM (Claude first), validates and executes it **read-only**, and
 composes an answer. Target connections are fully isolated from AuraMath's own datasource, and
-requests may skip tables/columns. The engine is currently scaffolding only (F0) and exposes **no
-endpoints yet** — see [`docs/ask-engine/DESIGN.md`](docs/ask-engine/DESIGN.md) for the pipeline,
-guarantees, and the F0–F11 roadmap.
+requests may skip tables/columns. See [`docs/ask-engine/DESIGN.md`](docs/ask-engine/DESIGN.md) for
+the pipeline, guarantees, and the F0–F11 roadmap.
+
+The connection layer (F1) is in place. Supported target drivers: PostgreSQL (`jdbc:postgresql:`),
+SQLite (`jdbc:sqlite:`), and MySQL (`jdbc:mysql:`); every connection is opened **read-only** and is
+fully isolated from AuraMath's own datasource.
+
+Schema introspection (F2) is in place too: the engine reads structure only (tables, columns, types,
+keys — never row data), excludes system schemas, and renders a compact schema for the model. A
+request may carry `skipTables` and `skipColumns` lists (unioned with the server-side
+`aura.ask.default-skip-tables`); matching is case-insensitive and schema-qualified-aware
+(`users` or `public.users`; `table.column` or `schema.table.column`). **Skipped tables and columns
+are invisible to the model** — they are removed from the introspected schema before it is rendered
+and are re-enforced again at validation/execution.
+
+The LLM layer (F3) is in place: a provider-neutral `nlq.llm.LlmClient` (request/response/typed
+exception) with a first `ClaudeLlmClient` that calls the Anthropic Messages API directly over
+`java.net.http.HttpClient` + Gson (no SDK). The API key comes from `secrets.txt` (`anthropic.api.key`,
+see [Configuration](#configuration)), the default model is `claude-opus-4-8`, structured output is
+requested with a JSON Schema (returned as a parsed JSON object), and the provider is chosen by
+`aura.ask.llm-provider`. To add another provider, implement `LlmClient` and add a branch in
+`AskEngineConfiguration` — callers are untouched.
+
+NL → SQL generation (F4) is in place: `nlq.sql.SqlGenerationService` drafts a single read-only
+`SELECT`/`WITH` query from the question and the (skip-list-filtered) schema, using the detected SQL
+dialect for dialect-correct syntax and always bounding the result with a `LIMIT` ≤ `aura.ask.max-rows`.
+**The engine asks for clarification rather than guessing** when a question can't be answered from the
+non-skipped schema — it returns a specific question instead of inventing SQL, and it also re-asks if
+the drafted query references a table that isn't in the provided schema. The drafted SQL is still not
+trusted at this point.
+
+The SQL safety guard (F5) is in place: `nlq.sql.SqlSafetyGuard.validate(...)` is the **trust
+boundary** between the model and the database — the LLM is untrusted, and no query reaches execution
+without passing it. It is deterministic and **fails closed**, returning a normalized, row-capped SQL
+string or throwing a typed `UnsafeSqlException`. For integrators, the read-only guarantees it
+enforces are:
+
+- **Single read-only statement.** Exactly one statement, beginning with `SELECT`/`WITH`; any
+  interior `;` (statement chaining) is rejected, as is any DML/DDL/DCL keyword
+  (`INSERT`/`UPDATE`/`DELETE`/`MERGE`/`CREATE`/`ALTER`/`DROP`/`TRUNCATE`/`GRANT`/`REVOKE`/`CALL`/
+  `EXEC`/`COPY`/`ATTACH`/`PRAGMA`/`VACUUM`/write-form `INTO`, …).
+- **No smuggling.** SQL comments (`--`, `/* */`) are refused outright, and the query is parsed by a
+  real SQL parser (JSqlParser) rather than trusted by pattern-matching alone.
+- **No data exfiltration.** Dialect-specific file/network helpers are blocked
+  (`pg_read_file`, `lo_import`/`lo_export`, `dblink`, MySQL `LOAD_FILE`, `INTO OUTFILE/DUMPFILE`,
+  SQLite `ATTACH`).
+- **Skip-list re-enforced.** Every referenced table must exist in the (already skip-filtered) schema
+  and must not be skip-listed; skipped columns are rejected too — so skipped objects can neither be
+  seen nor touched.
+- **Bounded results.** A missing `LIMIT` is injected and an over-large one is lowered to
+  `aura.ask.max-rows` (a smaller explicit limit is preserved).
+
+Bounded execution (F6) runs only what this guard returns.
+
+| Endpoint                          | Purpose                                                              |
+|-----------------------------------|----------------------------------------------------------------------|
+| `POST /api/ask/test-connection`   | Open a read-only connection to a target DB and probe it (`SELECT 1`).|
+
+**`POST /api/ask/test-connection`** — attempts an isolated, read-only connection to the supplied
+target database and runs a trivial probe. The `driver` field is optional (auto-detected from the URL
+scheme). The password is never echoed back in the response or logs.
+
+Request:
+
+```json
+{
+  "jdbcUrl": "jdbc:postgresql://localhost:5432/analytics",
+  "username": "readonly_user",
+  "password": "***",
+  "driver": "postgresql"
+}
+```
+
+Response (success):
+
+```json
+{
+  "connected": true,
+  "databaseProductName": "PostgreSQL",
+  "databaseProductVersion": "14.10",
+  "error": null
+}
+```
+
+Response (rejected URL — e.g. `jdbc:h2:mem:test`, returns `400`):
+
+```json
+{
+  "connected": false,
+  "databaseProductName": null,
+  "databaseProductVersion": null,
+  "error": "Unsupported JDBC URL scheme. Allowed: jdbc:postgresql:, jdbc:sqlite:, jdbc:mysql:"
+}
+```
 
 ---
 
