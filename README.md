@@ -23,6 +23,7 @@ of REST endpoints that can be consumed by an ad-buying or campaign-planning serv
    - [Genre Marketing (`/api/marketing/genre`)](#5-genre-marketing-api)
    - [Political Marketing (`/api/marketing/party`)](#5a-political-marketing-api)
    - [Celebrity Marketing (`/api/marketing/celebrity`)](#5b-celebrity-marketing-api)
+   - [Entity Report (`/api/marketing/entity-report`)](#5c-entity-report-api)
    - [Viral Seeds & Aspect Drivers (`/api/marketing`)](#6-viral-seeds--aspect-drivers)
    - [Top Spreaders (`/api/marketing/top-50-spreaders`)](#7-top-spreaders)
    - [Lookalike Discovery (`/api/marketing/find-lookalikes`)](#8-lookalike-discovery)
@@ -568,6 +569,135 @@ Same shape as `/party/{party}/channel-strategy` with `party` replaced by
 
 ---
 
+### 5c. Entity Report API
+
+The entity-scoped counterpart to the [User Report API](#3-user-report-api). Where the
+user report audits a single author, this audits an **entity** — a `managed_entities`
+row (celebrity, party, genre, …) — by aggregating every post that matches **any** of the
+entity's tracked keywords (`entity_keywords`, case-insensitive) across all platforms, then
+running the same Hawkes audit over the combined timeline. Read-only: unlike the user report
+it writes no category labels.
+
+The entity is identified by `managed_entities.id`; use any listing endpoint
+(`/api/marketing/celebrity`, `/party`, `/genre`) to discover valid ids and their keywords.
+
+**Two endpoints return the identical payload:**
+
+| Endpoint                                      | Intended use                                                        |
+|-----------------------------------------------|---------------------------------------------------------------------|
+| `GET /api/marketing/entity-report/{entityId}` | Shareable report — e.g. to show a prospect why the product is worth it. |
+| `GET /api/marketing/entity/{entityId}/report` | In-app view a signed-in user opens for any entity of their choice.  |
+
+Both are public, consistent with the rest of `/api/marketing`.
+
+Sections in the response:
+
+| Section                    | What it tells the marketer                                             |
+|----------------------------|-----------------------------------------------------------------------|
+| `entityProfile`            | Tracked keywords, active platforms, total posts, distinct audience size, first/last seen, observation window, virality tier. |
+| `conversationProfile`      | Branching ratio (α/β), distinct burst events, peak hours (top 3, in IST), busiest day-of-week, longest burst summary. |
+| `topicIntelligence`        | Per-keyword breakdown (sorted by mentions): tone distribution, dominant tone, average sentiment, average excitation spike, excitation profile. |
+| `audienceSentiment`        | Overall tone breakdown, dominant tone, net sentiment (−1…1) and label.|
+| `channelStrategy`          | Per-platform post counts and share of conversation, led-by headline.  |
+| `topAdvocates`             | Top 10 voices in the conversation, ranked by Hawkes α, with platform handles. |
+| `marketingRecommendations` | Primary channel, best engagement window, campaign type, addressable audience, content strategy, plain-English actionable advice. |
+| `redFlags`                 | Risk list (severity: LOW / MEDIUM / HIGH).                            |
+| `opportunityFlags`         | Specific openings (e.g. `High-Velocity Topic`, `Keyword Anchor Window`). |
+
+**Unknown entity id (200):**
+
+```json
+{ "entityId": "99999", "message": "No entity found for this id" }
+```
+
+**Entity with no scored history (200):**
+
+```json
+{ "entityId": "42", "name": "Some Movie", "trackedKeywords": ["..."],
+  "message": "No scored post history found for this entity — cannot generate a report" }
+```
+
+**Sample populated response (200) (abridged):**
+
+```json
+{
+  "generatedAt": "2026-06-06T18:30:11 IST",
+  "entityProfile": {
+    "entityId": "21",
+    "name": "Madhavan",
+    "type": "CELEBRITY",
+    "trackedKeywords": ["Maddy", "Madhavan", "RMadhavan", "maddy", "madhavan", "rmadhavan"],
+    "activePlatforms": ["youtube", "x"],
+    "totalPosts": 1490,
+    "audienceSize": 2336,
+    "firstSeen": "2024-05-13T21:20:58 IST",
+    "lastSeen":  "2026-05-04T19:13:16 IST",
+    "observationSpanDays": 720.9,
+    "averagePostsPerDay": 2.1,
+    "viralityTier": "Active Conversation",
+    "viralityTierExplained": "Branching ratio 0.39 — an active but measured conversation. ..."
+  },
+  "conversationProfile": {
+    "branchingRatio": 0.3948,
+    "amplificationExplained": "Each post about this entity triggers ~0.39 organic follow-up posts on average ...",
+    "distinctBurstEvents": 53,
+    "peakActivityWindows": ["22:00–23:00 IST (115 posts)", "20:00–21:00 IST (110 posts)"],
+    "mostActiveDayOfWeek": "SUNDAY (248 posts)",
+    "longestBurst": {
+      "keyword": "Madhavan", "startTime": "2026-04-12T17:05:30 IST",
+      "durationMinutes": 34.2, "postCount": 13, "peakExcitationSpike": 0.189,
+      "readableDescription": "13 posts about 'Madhavan' in 34.2 minutes — peak excitation 0.19"
+    }
+  },
+  "topicIntelligence": [
+    { "keyword": "Madhavan", "totalMentions": 719, "burstsTriggered": 29,
+      "contentCategory": "media.celebrity", "dominantTone": "neutral",
+      "averageSentimentScore": 70.8, "averageExcitationSpike": 0.01,
+      "excitationProfile": "LOW — mentions are scattered ... Tone: neutral." }
+  ],
+  "audienceSentiment": {
+    "toneBreakdown": { "negative": 37, "neutral": 958, "positive": 495 },
+    "dominantTone": "neutral", "netSentiment": 0.31, "sentimentLabel": "Predominantly Positive"
+  },
+  "channelStrategy": {
+    "topChannel": "YouTube",
+    "headline": "Conversation is led by YouTube — focus campaign spend there first.",
+    "channels": [
+      { "platform": "YouTube", "postCount": 1325, "share": 0.889 },
+      { "platform": "X (Twitter)", "postCount": 165, "share": 0.111 }
+    ]
+  },
+  "topAdvocates": [
+    { "global_user_id": "@BijiBiji-l6o", "tribe_label": "Tribe_4",
+      "hawkes_alpha": 1.0, "post_count": 3, "total_engagement": 0, "platform_handles": { "...": "..." } }
+  ],
+  "marketingRecommendations": {
+    "primaryChannel": "YouTube",
+    "bestTimeToEngage": "22:00–23:00 IST — peak conversation window",
+    "campaignType": "Targeted Engagement Campaign — ...",
+    "amplificationPotential": "LOW-MEDIUM — moderate spread; best paired with paid amplification",
+    "estimatedReachMultiplier": "~0.4x per seeded post (branching ratio 0.39)",
+    "addressableAudience": "2336 distinct authors are already talking about this entity",
+    "contentTriggers": ["Madhavan"],
+    "contentStrategy": "Conversation about 'Madhavan' is informational. ...",
+    "actionableAdvice": "1. TIMING: ... 2. PLATFORM: ... 3. TONE: ... 4. TRIGGER: ..."
+  },
+  "redFlags":         [ { "flag": "Negative Sentiment Majority", "severity": "HIGH", "detail": "..." } ],
+  "opportunityFlags": [ { "opportunity": "Keyword Anchor Window", "detail": "..." } ]
+}
+```
+
+**Virality tier mapping (branching ratio α/β):**
+
+| Range       | Tier                  |
+|-------------|-----------------------|
+| `≥ 0.8`     | `Viral Topic`         |
+| `0.6 – 0.8` | `Trending`            |
+| `0.3 – 0.6` | `Active Conversation` |
+| `< 0.3`     | `Niche`               |
+
+---
+
 ### 6. Viral Seeds & Aspect Drivers
 
 **`GET /api/marketing/viral-seeds?keyword=<kw>`**
@@ -1053,6 +1183,18 @@ curl 'http://localhost:8081/api/marketing/user-report/janedoe' | jq
 
 The call also writes `janedoe` into `author_categories` for later filtering through
 `/api/marketing/users`.
+
+### Generate a shareable intelligence report for an entity
+
+```bash
+# discover an entity id and its keywords
+curl 'http://localhost:8081/api/marketing/celebrity' | jq
+# full report aggregated across all of the entity's keywords (id 21 = Madhavan)
+curl 'http://localhost:8081/api/marketing/entity-report/21' | jq
+```
+
+`/api/marketing/entity/21/report` returns the identical payload — use the `entity-report`
+URL for a prospect-facing share and the `entity/{id}/report` URL for the in-app view.
 
 ### Find lookalikes given a known seed
 
