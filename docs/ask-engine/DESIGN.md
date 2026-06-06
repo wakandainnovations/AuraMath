@@ -54,10 +54,12 @@ question + target connection + skip-list
 - **Isolation.** Target database connections are supplied per-request and constructed in
   `nlq.connection`, fully separate from AuraMath's own `DataSourceConfig` datasource. The engine
   never queries the application's own database on a caller's behalf.
-- **Skip-list.** A request may name tables/columns to skip. These are excluded from the schema the
-  model sees (step 2) **and** re-enforced at validation/execution (steps 4–5), so the model can
-  neither see nor touch them. `aura.ask.default-skip-tables` is always applied on top of the
-  per-request list.
+- **Skip-list & masking.** A request may name tables/columns to skip; the server adds its own
+  defaults, masked columns, and auto-skip name patterns. **Skipped** objects are excluded from the
+  schema the model sees (step 2) **and** re-enforced at validation/execution (steps 4–5) and dropped
+  from output (step 8); **masked** columns stay visible for aggregation but their raw values are
+  never projected (rejected at step 4) or returned (redacted at step 8). See
+  [Sensitive-data hardening (F9)](#sensitive-data-hardening-f9) for the full model and precedence.
 - **Pluggable LLM.** The model layer sits behind an `LlmClient` interface in `nlq.llm`; the Claude
   implementation is first. The active provider is selected via `aura.ask.llm-provider`.
 
@@ -339,7 +341,14 @@ Guard rules, in order:
    valid references so legitimate CTE queries are not rejected.
 9. **No skipped columns** — as a conservative backstop, a query that names any skipped column's leaf
    identifier is rejected (`SKIPPED_COLUMN`).
-10. **Row cap** — the validated query is bounded by `aura.ask.max-rows`: a missing limit is injected,
+10. **No raw masked columns (F9)** — a masked column may appear in the SELECT projection **only**
+    inside a value-combining aggregate (`count`, `sum`, `avg`, `stddev`, `variance`, `corr`, …); a
+    bare reference, a scalar expression, or a value-*revealing* aggregate (`min`, `max`,
+    `string_agg`/`group_concat`/`array_agg`, `median`, `percentile_*`, `first`/`last`/`mode`) is
+    rejected (`MASKED_COLUMN`), as is a star projection (`*` / `t.*`) over any table that owns a masked
+    column. References in `WHERE`/`GROUP BY`/`HAVING` are allowed (they surface no value); the result
+    redactor is the final backstop on output.
+11. **Row cap** — the validated query is bounded by `aura.ask.max-rows`: a missing limit is injected,
     and an existing limit *larger* than the cap is lowered to it; a smaller explicit limit is left
     untouched, and a non-constant limit (parameter/expression) is replaced with the hard cap. The
     guard returns JSqlParser's re-rendered statement, so the executed SQL is exactly what was
@@ -563,6 +572,80 @@ rows preview, a Java-computed `mean`, and an NL answer), the skipped-table clari
 the skipped table never appears in the schema shown to the model), and the `maxRows` override
 truncating the result — all offline over file-backed SQLite with a capturing stub `LlmClient`.
 
+## Sensitive-data hardening (F9)
+
+F9 strengthens the sensitive-data controls beyond simple table-skipping into three rule kinds — all
+carried by one immutable `nlq.schema.SkipList` built once per request and re-checked at every layer.
+
+### The three rule kinds
+
+- **Skipped tables / columns** — *invisible* objects. Removed from the introspected schema (F2), so
+  the model never sees them; re-enforced at validation (F5: `UNKNOWN_TABLE` / `SKIPPED_TABLE` /
+  `SKIPPED_COLUMN`); and, belt-and-suspenders, dropped from result rows by the redactor (see below).
+- **Masked columns** — columns that MAY be *aggregated* (e.g. `count(email)`) but whose **raw values
+  must never leave the database**. They stay visible in the rendered schema (marked `MASKED`) so the
+  model can aggregate over them; F5 rejects any raw projection (rule 10, `MASKED_COLUMN`); and the
+  redactor masks any masked value that still reaches a result.
+- **Auto-skip name patterns** — case-insensitive, full-match regexes applied to bare table and column
+  names. A match is treated exactly like an explicit skip. They are **on by default** and configurable;
+  the defaults cover the common secret-bearing fragments:
+
+  ```
+  .*(password|passwd|pwd).*      .*secret.*      .*(^|_)ssn(_|$).*      .*token.*
+  .*api[_-]?key.*      .*private[_-]?key.*      .*(credit[_-]?card|card[_-]?number).*
+  ```
+
+  So a column named `password_hash`, `api_key`, or `secret_token` is auto-skipped — absent from the
+  schema, the SQL, and the output — **even with no explicit request skip**. Toggle the whole feature
+  with `aura.ask.auto-skip.enabled=false`; replace `aura.ask.auto-skip.patterns` to change the rules.
+
+### Sources and precedence
+
+The effective policy is the **union** of all of these, gathered in this order (later sources never
+*un*-skip an earlier one — union, not override):
+
+1. **Per-request** — `skipTables` / `skipColumns` on the request and on the connection block.
+2. **Server-side** — `aura.ask.default-skip-tables`, `aura.ask.default-skip-columns`, and
+   `aura.ask.masked-columns`.
+3. **Auto-skip patterns** — `aura.ask.auto-skip.patterns` (when enabled).
+
+**Skip beats mask.** A column that matches both a skip rule (explicit *or* an auto-skip pattern) and a
+mask rule is *skipped* — removed entirely — never merely masked. Matching is case-insensitive and
+schema-qualified-aware, exactly as for the F2 skip-list (`table.column` or `schema.table.column`).
+
+### Value redaction (`nlq.sql.ResultRedactor`)
+
+After F6 execution and **before** the mathematician (F7) or the response sees anything, every row
+passes through the redactor, which re-applies the policy at the value level:
+
+- a result column whose leaf name matches a **masked** column has its values **partial-masked** (first
+  and last character kept, the middle replaced with `***`; a very short value is fully starred);
+- a result column whose leaf name matches a **skipped** column is **dropped entirely** — columns and
+  every row cell.
+
+The skipped-column drop matters because `SELECT *` is expanded *by the database* to its real columns,
+so a skipped column can re-appear in the result even though it was absent from the schema the model saw
+and from the SQL text the guard screened. Redaction never changes the row *count* — only the columns
+and the values. F7 therefore computes its statistics over the already-redacted rows, and only redacted
+rows ever appear in `rowsPreview`.
+
+### Operator visibility
+
+`SchemaIntrospector` logs, at **DEBUG**, every object the policy removes or masks — by **name only,
+never any row value** (introspection reads no rows at all) — e.g.
+`Ask skip: column 'accounts.password_hash' excluded from schema` and
+`Ask mask: column 'accounts.email' kept for aggregation, raw values redacted`. The redactor likewise
+logs, at DEBUG, which result columns it dropped or masked. This lets operators verify the policy
+without exposing any sensitive value.
+
+### Acceptance
+
+- A `password_hash` column is auto-skipped by the default patterns and never appears in the schema,
+  the SQL, or the output — with no explicit request skip (`SensitiveDataHardeningTest`).
+- An `email` column configured as masked can be `count`-ed (`SqlSafetyGuardTest`,
+  `AskOrchestratorTest`) but a raw projection of it is rejected (`MASKED_COLUMN`) and any masked value
+  that reaches a result is masked (`ResultRedactorTest`).
+
 ## Configuration
 
 Bound from prefix `aura.ask` (`nlq.config.AskEngineProperties`):
@@ -574,6 +657,10 @@ Bound from prefix `aura.ask` (`nlq.config.AskEngineProperties`):
 | `aura.ask.query-timeout-seconds` | `30` | Per-query execution timeout. |
 | `aura.ask.connection-timeout-seconds` | `10` | Target connection establishment timeout. |
 | `aura.ask.default-skip-tables` | _(empty)_ | Tables always excluded, on top of per-request skips. |
+| `aura.ask.default-skip-columns` | _(empty)_ | Columns always excluded, on top of per-request skips. (F9) |
+| `aura.ask.masked-columns` | _(empty)_ | Columns aggregatable but never returned raw; values redacted. (F9) |
+| `aura.ask.auto-skip.enabled` | `true` | Toggle for pattern-based auto-skipping of secret-named objects. (F9) |
+| `aura.ask.auto-skip.patterns` | _(see above)_ | Case-insensitive, full-match name regexes auto-skipped. (F9) |
 | `aura.ask.llm-provider` | `claude` | Selected `LlmClient` provider. |
 
 The LLM API key is read from `secrets.txt` (`anthropic.api.key=`) and is never committed. The active
@@ -591,6 +678,6 @@ fails fast at startup).
 - [x] **F6** — Bounded, timed query execution (`nlq.sql`).
 - [x] **F7** — Mathematician layer: plan-then-deterministically-evaluate + answer synthesis (`nlq.math`).
 - [x] **F8** — Orchestrator (`AskOrchestrator`) + `POST /api/ask` endpoint and DTOs (`AskRequest`/`AskResponse`/`AskErrorResponse`), wiring F1–F7 end to end (`nlq.api`).
-- [ ] **F9** — REST API hardening: request validation, rate limiting, auth.
+- [x] **F9** — Sensitive-data hardening: skipped/masked columns, auto-skip name patterns, and output redaction (`nlq.schema`, `nlq.sql`).
 - [ ] **F10** — Full end-to-end integration tests against Postgres/MySQL targets.
 - [ ] **F11** — Hardening, observability, and docs.

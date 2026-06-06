@@ -4,13 +4,20 @@ import com.lit.fire.flame.nlq.config.AskEngineProperties;
 import com.lit.fire.flame.nlq.schema.DatabaseSchema;
 import com.lit.fire.flame.nlq.schema.SkipList;
 import com.lit.fire.flame.nlq.schema.TableInfo;
+import net.sf.jsqlparser.expression.ExpressionVisitorAdapter;
+import net.sf.jsqlparser.expression.Function;
 import net.sf.jsqlparser.expression.LongValue;
 import net.sf.jsqlparser.parser.CCJSqlParserUtil;
+import net.sf.jsqlparser.schema.Column;
 import net.sf.jsqlparser.statement.Statement;
+import net.sf.jsqlparser.statement.select.AllColumns;
+import net.sf.jsqlparser.statement.select.AllTableColumns;
 import net.sf.jsqlparser.statement.select.Limit;
 import net.sf.jsqlparser.statement.select.PlainSelect;
 import net.sf.jsqlparser.statement.select.Select;
 import net.sf.jsqlparser.statement.select.SelectBody;
+import net.sf.jsqlparser.statement.select.SelectExpressionItem;
+import net.sf.jsqlparser.statement.select.SelectItem;
 import net.sf.jsqlparser.statement.select.SetOperationList;
 import net.sf.jsqlparser.statement.select.WithItem;
 import net.sf.jsqlparser.util.TablesNamesFinder;
@@ -18,6 +25,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -49,6 +57,9 @@ import java.util.regex.Pattern;
  *   <li>Parses, via JSqlParser, into a single {@code SELECT} statement.</li>
  *   <li>Every referenced table is present in the (already skip-filtered) schema and not on the
  *       effective skip-list; no referenced identifier matches a skipped column.</li>
+ *   <li>No masked column (F9) is projected as a raw value — it is allowed only inside a
+ *       value-combining aggregate ({@code count}/{@code sum}/{@code avg}/…), and a star projection over
+ *       a table that owns a masked column is rejected.</li>
  *   <li>A row cap is enforced: a missing limit is injected, and an existing limit larger than
  *       {@link AskEngineProperties#getMaxRows()} is lowered to it (a smaller one is left alone).</li>
  * </ol>
@@ -74,6 +85,19 @@ public class SqlSafetyGuard {
             "lo_import", "lo_export", "lo_get", "lo_put",
             "dblink", "load_file", "outfile", "dumpfile"
     };
+
+    /**
+     * Aggregates that <b>combine</b> their inputs into a derived figure and therefore never echo a
+     * single stored value — the only functions a masked column may appear inside (F9). Deliberately
+     * excludes value-revealing aggregates ({@code min}, {@code max}, {@code string_agg},
+     * {@code array_agg}, {@code group_concat}, {@code json_agg}, {@code median}, {@code percentile_*},
+     * {@code first}/{@code last}/{@code mode}), which would surface a raw masked value.
+     */
+    private static final Set<String> NON_REVEALING_AGGREGATES = new HashSet<>(Arrays.asList(
+            "count", "sum", "total", "avg", "mean", "average",
+            "stddev", "std", "stddev_pop", "stddev_samp",
+            "variance", "var", "var_pop", "var_samp",
+            "corr", "covar_pop", "covar_samp"));
 
     private final AskEngineProperties properties;
 
@@ -151,7 +175,11 @@ public class SqlSafetyGuard {
         enforceTableReferences(select, skipList, schema);
         enforceNoSkippedColumns(core, skipList);
 
-        // (rule 9) Bound the result set and re-render the validated statement.
+        // (rule 9, F9) No masked column may be projected as a raw value — only inside a value-combining
+        // aggregate. A star projection over a table with a masked column is rejected too.
+        enforceNoRawMaskedColumns(select, skipList);
+
+        // (rule 10) Bound the result set and re-render the validated statement.
         applyRowCap(select, properties.getMaxRows());
         return select.toString();
     }
@@ -252,6 +280,127 @@ public class SqlSafetyGuard {
             if (token.matcher(core).find()) {
                 throw new UnsafeSqlException(UnsafeSqlException.Reason.SKIPPED_COLUMN,
                         "query references skipped column: " + entry);
+            }
+        }
+    }
+
+    /**
+     * Reject any raw projection of a masked column (F9). A masked column stays in the schema so the
+     * model can aggregate it, but its raw values must never leave the database. This walks the SELECT
+     * projection of the top-level query (and each leg of a set operation) and rejects when:
+     *
+     * <ul>
+     *   <li>a masked column appears outside a {@link #NON_REVEALING_AGGREGATES value-combining
+     *       aggregate} (a bare reference, inside a scalar expression, or inside a value-revealing
+     *       aggregate such as {@code min}/{@code max}/{@code string_agg}); or</li>
+     *   <li>the projection contains a star ({@code *} or {@code t.*}) while any referenced table owns a
+     *       masked column — the star would expand to the raw column at the database.</li>
+     * </ul>
+     *
+     * <p>References to masked columns in {@code WHERE}/{@code GROUP BY}/{@code HAVING} are not rejected
+     * here (they do not surface a value), and the result redactor is a final backstop on output.
+     */
+    private static void enforceNoRawMaskedColumns(Select select, SkipList skipList)
+            throws UnsafeSqlException {
+        if (!skipList.hasMaskedColumns()) {
+            return;
+        }
+        // A star projection surfaces raw columns, so it is unsafe if any table the query references
+        // owns a masked column. Compute that once from the whole statement (the parser enumerates
+        // tables only off a Statement/Expression, not a bare PlainSelect).
+        boolean starUnsafe = anyReferencedTableHasMaskedColumn(select, skipList);
+
+        SelectBody body = select.getSelectBody();
+        if (body instanceof PlainSelect) {
+            enforceNoRawMaskedColumns((PlainSelect) body, skipList, starUnsafe);
+        } else if (body instanceof SetOperationList) {
+            for (SelectBody leg : ((SetOperationList) body).getSelects()) {
+                if (leg instanceof PlainSelect) {
+                    enforceNoRawMaskedColumns((PlainSelect) leg, skipList, starUnsafe);
+                }
+            }
+        }
+    }
+
+    private static void enforceNoRawMaskedColumns(PlainSelect plain, SkipList skipList,
+                                                  boolean starUnsafe) throws UnsafeSqlException {
+        List<SelectItem> items = plain.getSelectItems();
+        if (items == null) {
+            return;
+        }
+        for (SelectItem item : items) {
+            if (item instanceof AllColumns || item instanceof AllTableColumns) {
+                if (starUnsafe) {
+                    throw new UnsafeSqlException(UnsafeSqlException.Reason.MASKED_COLUMN,
+                            "a star projection (*) may expose masked column values; list explicit "
+                                    + "columns and use masked columns only inside an aggregate such as count");
+                }
+                continue;
+            }
+            if (item instanceof SelectExpressionItem) {
+                MaskedColumnFinder finder = new MaskedColumnFinder(skipList);
+                ((SelectExpressionItem) item).getExpression().accept(finder);
+                if (finder.found != null) {
+                    throw new UnsafeSqlException(UnsafeSqlException.Reason.MASKED_COLUMN,
+                            "masked column may not be projected as a raw value (only inside an "
+                                    + "aggregate such as count): " + finder.found);
+                }
+            }
+        }
+    }
+
+    /** Whether any table the query references owns a masked column ({@code *}/{@code t.*} would surface it). */
+    private static boolean anyReferencedTableHasMaskedColumn(Select select, SkipList skipList) {
+        List<String> referenced;
+        try {
+            referenced = new TablesNamesFinder().getTableList(select);
+        } catch (Exception e) {
+            // Cannot prove a star is safe — fail closed.
+            return true;
+        }
+        if (referenced.isEmpty()) {
+            return true;
+        }
+        for (String raw : referenced) {
+            String name = unquote(raw).toLowerCase(Locale.ROOT);
+            int dot = name.lastIndexOf('.');
+            String leaf = (dot < 0) ? name : name.substring(dot + 1);
+            if (skipList.tableHasMaskedColumn(leaf)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Expression visitor that flags a masked column reference unless it sits directly inside a
+     * value-combining aggregate. When such an aggregate is reached its arguments are not descended
+     * into (the masked column there is permitted); every other node is traversed normally so a masked
+     * column in a scalar expression or a value-revealing aggregate is caught.
+     */
+    private static final class MaskedColumnFinder extends ExpressionVisitorAdapter {
+        private final SkipList skipList;
+        private String found;
+
+        MaskedColumnFinder(SkipList skipList) {
+            this.skipList = skipList;
+        }
+
+        @Override
+        public void visit(Function function) {
+            String name = (function.getName() == null)
+                    ? "" : function.getName().toLowerCase(Locale.ROOT);
+            if (NON_REVEALING_AGGREGATES.contains(name)) {
+                // Masked columns are allowed here; do not descend into the aggregate's arguments.
+                return;
+            }
+            super.visit(function); // scalar / value-revealing function: keep checking its arguments
+        }
+
+        @Override
+        public void visit(Column column) {
+            if (found == null && skipList.isMaskedColumnLeaf(unquote(column.getColumnName()))) {
+                found = column.toString();
             }
         }
     }

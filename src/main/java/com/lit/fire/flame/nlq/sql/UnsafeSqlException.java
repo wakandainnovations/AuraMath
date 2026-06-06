@@ -33,7 +33,9 @@ public class UnsafeSqlException extends Exception {
         /** References a table that is on the effective skip-list. */
         SKIPPED_TABLE,
         /** References a column that is on the effective skip-list. */
-        SKIPPED_COLUMN
+        SKIPPED_COLUMN,
+        /** Projects the raw value of a masked column (allowed only inside a value-combining aggregate). */
+        MASKED_COLUMN
     }
 
     private final Reason reason;

@@ -12,6 +12,7 @@ import com.lit.fire.flame.nlq.math.AnswerSynthesisService;
 import com.lit.fire.flame.nlq.schema.SchemaIntrospector;
 import com.lit.fire.flame.nlq.schema.SchemaRenderer;
 import com.lit.fire.flame.nlq.sql.QueryExecutionService;
+import com.lit.fire.flame.nlq.sql.ResultRedactor;
 import com.lit.fire.flame.nlq.sql.SqlGenerationService;
 import com.lit.fire.flame.nlq.sql.SqlSafetyGuard;
 import org.junit.jupiter.api.AfterEach;
@@ -116,6 +117,7 @@ class AskOrchestratorTest {
                 new SqlGenerationService(renderer, llm, properties),
                 guard,
                 new QueryExecutionService(guard, properties),
+                new ResultRedactor(),
                 new AnswerSynthesisService(llm),
                 properties);
     }
@@ -151,6 +153,13 @@ class AskOrchestratorTest {
         JsonObject plan = new JsonObject();
         plan.addProperty("lookupOnly", false);
         plan.add("operations", ops);
+        return plan;
+    }
+
+    private JsonObject lookupPlan() {
+        JsonObject plan = new JsonObject();
+        plan.addProperty("lookupOnly", true);
+        plan.add("operations", new JsonArray());
         return plan;
     }
 
@@ -224,6 +233,47 @@ class AskOrchestratorTest {
         assertTrue(generationPrompt.contains("TABLE users"), "visible table should be in the schema");
         assertFalse(generationPrompt.contains("TABLE secrets"),
                 "the skipped table must not appear in the schema shown to the model");
+    }
+
+    // --- F9: a masked column can be counted, but its raw values can never be projected ----------
+
+    @Test
+    void maskedColumnCanBeCountedButRawValuesAreNeverReturned() throws Exception {
+        // The model aggregates the masked 'email' column — allowed — and the answer comes back with
+        // no raw email anywhere in the response.
+        RoutingLlmClient llm = new RoutingLlmClient(
+                sqlResult("SELECT count(email) AS user_count FROM users", "users"),
+                lookupPlan(),
+                answerText("There are 5 users."));
+        AskEngineProperties props = new AskEngineProperties();
+        props.setMaskedColumns(List.of("users.email"));
+
+        AskResponse response = orchestrator(llm, props).ask(request("how many users are there"));
+
+        assertFalse(response.isClarificationNeeded());
+        assertNotNull(response.getSql());
+        assertTrue(response.getSql().toLowerCase(java.util.Locale.ROOT).contains("count(email)"),
+                "the count over the masked column should have been allowed: " + response.getSql());
+        assertEquals(1, response.getRowCount());
+        assertFalse(response.getRowsPreview().toString().contains("@example.com"),
+                "no raw masked email value may appear in the response");
+    }
+
+    @Test
+    void rawProjectionOfMaskedColumnIsRejected() {
+        // If the model tries to select the masked column's raw values, the guard rejects it (→ 422).
+        RoutingLlmClient llm = new RoutingLlmClient(
+                sqlResult("SELECT id, email FROM users", "users"),
+                lookupPlan(),
+                answerText("unused"));
+        AskEngineProperties props = new AskEngineProperties();
+        props.setMaskedColumns(List.of("users.email"));
+
+        com.lit.fire.flame.nlq.sql.UnsafeSqlException e =
+                org.junit.jupiter.api.Assertions.assertThrows(
+                        com.lit.fire.flame.nlq.sql.UnsafeSqlException.class,
+                        () -> orchestrator(llm, props).ask(request("list every user email")));
+        assertEquals(com.lit.fire.flame.nlq.sql.UnsafeSqlException.Reason.MASKED_COLUMN, e.getReason());
     }
 
     // --- the per-request maxRows override is clamped and honoured at execution ------------------

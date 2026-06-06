@@ -11,6 +11,7 @@ import com.lit.fire.flame.nlq.schema.SkipList;
 import com.lit.fire.flame.nlq.sql.QueryExecutionException;
 import com.lit.fire.flame.nlq.sql.QueryExecutionService;
 import com.lit.fire.flame.nlq.sql.QueryResult;
+import com.lit.fire.flame.nlq.sql.ResultRedactor;
 import com.lit.fire.flame.nlq.sql.SqlGenerationResult;
 import com.lit.fire.flame.nlq.sql.SqlGenerationService;
 import com.lit.fire.flame.nlq.sql.SqlSafetyGuard;
@@ -56,6 +57,7 @@ public class AskOrchestrator {
     private final SqlGenerationService sqlGenerationService;
     private final SqlSafetyGuard safetyGuard;
     private final QueryExecutionService executionService;
+    private final ResultRedactor resultRedactor;
     private final AnswerSynthesisService answerSynthesisService;
     private final AskEngineProperties properties;
 
@@ -64,6 +66,7 @@ public class AskOrchestrator {
                            SqlGenerationService sqlGenerationService,
                            SqlSafetyGuard safetyGuard,
                            QueryExecutionService executionService,
+                           ResultRedactor resultRedactor,
                            AnswerSynthesisService answerSynthesisService,
                            AskEngineProperties properties) {
         this.connectionFactory = connectionFactory;
@@ -71,6 +74,7 @@ public class AskOrchestrator {
         this.sqlGenerationService = sqlGenerationService;
         this.safetyGuard = safetyGuard;
         this.executionService = executionService;
+        this.resultRedactor = resultRedactor;
         this.answerSynthesisService = answerSynthesisService;
         this.properties = properties;
     }
@@ -141,25 +145,33 @@ public class AskOrchestrator {
             QueryResult execution = components.executor.execute(conn, safeSql, skipList, schema);
             timings.put("executeMillis", millisSince(t));
 
-            // (F7) Synthesize the final answer, applying any statistics deterministically in Java.
+            // (F9) Redact the rows before anything downstream sees them: mask masked-column values and
+            // drop any skip-listed column that slipped through (e.g. via a database-expanded SELECT *).
             t = System.nanoTime();
-            AskAnswer answer = answerSynthesisService.answer(question, generation, execution, model);
+            QueryResult redacted = resultRedactor.redact(execution, skipList);
+            timings.put("redactMillis", millisSince(t));
+
+            // (F7) Synthesize the final answer over the REDACTED rows, applying any statistics in Java.
+            t = System.nanoTime();
+            AskAnswer answer = answerSynthesisService.answer(question, generation, redacted, model);
             timings.put("synthesizeMillis", millisSince(t));
 
             timings.put("totalMillis", millisSince(startNanos));
             log.debug("Ask answered: {} row(s), {} formula(s), truncated={}, total={}ms",
-                    execution.getRowCount(), answer.getFormulasApplied().size(),
-                    execution.isTruncated(), timings.get("totalMillis"));
+                    redacted.getRowCount(), answer.getFormulasApplied().size(),
+                    redacted.isTruncated(), timings.get("totalMillis"));
             return AskResponse.answered(answer, safeSql, generation.getTablesUsed(),
-                    execution.isTruncated(), execution.getRowCount(), timings);
+                    redacted.isTruncated(), redacted.getRowCount(), timings);
         } finally {
             closeQuietly(conn);
         }
     }
 
     /**
-     * The effective skip-list: the union of the server default tables, the connection's own
-     * skip lists, and the request's. Re-enforced downstream at validation and execution.
+     * The effective sensitive-data policy (F9): the union of the server-side
+     * {@code default-skip-tables}/{@code default-skip-columns}, the connection's and request's skip
+     * lists, the server-side {@code masked-columns}, and the configurable auto-skip name patterns.
+     * Re-enforced downstream at introspection, validation, execution, and output redaction.
      */
     private SkipList effectiveSkipList(AskRequest request) {
         ConnectionRequest connection = request.getConnection();
@@ -169,7 +181,15 @@ public class AskOrchestrator {
         List<String> columns = new ArrayList<>();
         addAll(columns, connection.getSkipColumns());
         addAll(columns, request.getSkipColumns());
-        return SkipList.from(properties.getDefaultSkipTables(), tables, columns);
+        AskEngineProperties.AutoSkip autoSkip = properties.getAutoSkip();
+        return SkipList.builder()
+                .addSkipTables(properties.getDefaultSkipTables())
+                .addSkipTables(tables)
+                .addSkipColumns(properties.getDefaultSkipColumns())
+                .addSkipColumns(columns)
+                .addMaskedColumns(properties.getMaskedColumns())
+                .autoSkipPatterns(autoSkip.getPatterns(), autoSkip.isEnabled())
+                .build();
     }
 
     /**
@@ -199,6 +219,9 @@ public class AskOrchestrator {
         copy.setQueryTimeoutSeconds(properties.getQueryTimeoutSeconds());
         copy.setConnectionTimeoutSeconds(properties.getConnectionTimeoutSeconds());
         copy.setDefaultSkipTables(properties.getDefaultSkipTables());
+        copy.setDefaultSkipColumns(properties.getDefaultSkipColumns());
+        copy.setMaskedColumns(properties.getMaskedColumns());
+        copy.setAutoSkip(properties.getAutoSkip());
         copy.setLlmProvider(properties.getLlmProvider());
         return copy;
     }

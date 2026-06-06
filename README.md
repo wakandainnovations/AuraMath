@@ -813,6 +813,27 @@ and per-stage timings. A question that can't be answered from the non-skipped sc
 targeting a skipped table) returns a **clarification**, never a leak. Errors are mapped to clean,
 sanitized HTTP statuses (no credentials, driver text, or prompts ever leak).
 
+Sensitive-data hardening (F9) layers three controls over the basic table-skipping, all enforced at
+every stage (schema, SQL validation, execution, and output):
+
+- **Skipped tables/columns** — invisible: removed from the schema and rejected at validation. The
+  per-request `skipTables`/`skipColumns` are unioned with the server-side `aura.ask.default-skip-tables`
+  and `aura.ask.default-skip-columns`.
+- **Masked columns** (`aura.ask.masked-columns`) — may be **aggregated** (e.g. `count(email)`) but
+  their **raw values are never returned**: a raw projection (or a `SELECT *` over a table that owns
+  one) is rejected, and any masked value that still reaches a result is **partial-masked** before the
+  response (and before the mathematician sees it).
+- **Auto-skip name patterns** (`aura.ask.auto-skip.*`) — columns/tables whose name matches a
+  configurable, case-insensitive regex (defaults cover `password`/`secret`/`ssn`/`token`/`api_key`/
+  `private_key`/`card_number`) are auto-skipped **even with no explicit request** — so a
+  `password_hash` column never appears in the schema, SQL, or output. On by default; disable with
+  `aura.ask.auto-skip.enabled=false`. The introspector logs (DEBUG, names only — never values) which
+  objects it skipped or masked so operators can verify.
+
+See [Operational Notes](#operational-notes) for the config keys and
+[`docs/ask-engine/DESIGN.md`](docs/ask-engine/DESIGN.md) for the full skip/mask/redact model and
+precedence.
+
 | Endpoint                          | Purpose                                                              |
 |-----------------------------------|----------------------------------------------------------------------|
 | `POST /api/ask/test-connection`   | Open a read-only connection to a target DB and probe it (`SELECT 1`).|
@@ -1104,4 +1125,28 @@ Per-endpoint contracts:
 - **MOI quirks.** `views_count` only exists on `x_posts`. Reddit/Instagram contribute zero
   to MOI by design (no impressions column in schema). YouTube is excluded entirely. See
   the `dataSourceNotes` block in `/test/process-user/{author}` for the canonical mapping.
+- **Ask engine sensitive-data controls (F9).** The Ask engine (`/api/ask`) reads its sensitive-data
+  policy from `aura.ask` (prefix; `nlq.config.AskEngineProperties`). Defaults are safe and empty for
+  the explicit lists, with auto-skip patterns **on**:
+
+  | Key | Default | Meaning |
+  |-----|---------|---------|
+  | `aura.ask.default-skip-tables` | _(empty)_ | Tables always hidden + rejected, on top of per-request `skipTables`. |
+  | `aura.ask.default-skip-columns` | _(empty)_ | Columns always hidden + rejected, on top of per-request `skipColumns`. Entries are `table.column` or `schema.table.column` (case-insensitive). |
+  | `aura.ask.masked-columns` | _(empty)_ | Columns aggregatable (e.g. `count`) but never returned raw; matched raw values are partial-masked in the response. Same entry format as skip-columns. |
+  | `aura.ask.auto-skip.enabled` | `true` | Master toggle for pattern-based auto-skipping. Set `false` to turn it off. |
+  | `aura.ask.auto-skip.patterns` | `.*(password\|passwd\|pwd).*`, `.*secret.*`, `.*(^\|_)ssn(_\|$).*`, `.*token.*`, `.*api[_-]?key.*`, `.*private[_-]?key.*`, `.*(credit[_-]?card\|card[_-]?number).*` | Case-insensitive, full-match name regexes; a matching bare table/column name is auto-skipped. Replace the list to customise. |
+
+  Precedence is a **union** (per-request → server defaults → auto-skip patterns), and **skip beats
+  mask** (a column matching both a skip rule and a mask rule is removed entirely). Skipped/masked
+  objects are logged at DEBUG by **name only** (never any row value) so operators can audit the policy.
+  Example `application.properties`:
+
+  ```properties
+  aura.ask.default-skip-tables=audit_log,public.users_pii
+  aura.ask.default-skip-columns=orders.internal_notes
+  aura.ask.masked-columns=users.email,users.phone
+  aura.ask.auto-skip.enabled=true
+  # aura.ask.auto-skip.patterns=.*secret.*,.*token.*   # override to customise; comment out to keep defaults
+  ```
 

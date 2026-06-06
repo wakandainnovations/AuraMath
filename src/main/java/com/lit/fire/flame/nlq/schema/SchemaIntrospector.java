@@ -1,5 +1,7 @@
 package com.lit.fire.flame.nlq.schema;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import java.sql.Connection;
@@ -29,6 +31,8 @@ import java.util.TreeMap;
 @Component
 public class SchemaIntrospector {
 
+    private static final Logger log = LoggerFactory.getLogger(SchemaIntrospector.class);
+
     /** Schema names that are always system/internal and never surfaced to the model. */
     private static final Set<String> SYSTEM_SCHEMAS = Set.of(
             "pg_catalog", "information_schema", "mysql", "sys", "performance_schema");
@@ -55,6 +59,8 @@ public class SchemaIntrospector {
                     continue;
                 }
                 if (skipList.isTableSkipped(schema, table)) {
+                    // Log the object NAME only (never any row value) so operators can verify the policy.
+                    log.debug("Ask skip: table '{}' excluded from schema", qualify(schema, table));
                     continue;
                 }
                 List<ColumnInfo> columns = readColumns(meta, schema, table, skipList);
@@ -77,12 +83,21 @@ public class SchemaIntrospector {
             while (rs.next()) {
                 String column = rs.getString("COLUMN_NAME");
                 if (skipList.isColumnSkipped(schema, table, column)) {
+                    log.debug("Ask skip: column '{}.{}' excluded from schema",
+                            qualify(schema, table), column);
                     continue;
                 }
                 int sqlType = rs.getInt("DATA_TYPE");
                 String typeName = rs.getString("TYPE_NAME");
                 boolean nullable = rs.getInt("NULLABLE") != DatabaseMetaData.columnNoNulls;
-                columns.add(new ColumnInfo(column, sqlType, typeName, nullable));
+                // Masked columns stay visible (so they can be aggregated) but are flagged so the
+                // renderer marks them and the guard rejects raw projection of them.
+                boolean masked = skipList.isColumnMasked(schema, table, column);
+                if (masked) {
+                    log.debug("Ask mask: column '{}.{}' kept for aggregation, raw values redacted",
+                            qualify(schema, table), column);
+                }
+                columns.add(new ColumnInfo(column, sqlType, typeName, nullable, masked));
             }
         }
         return columns;
@@ -125,6 +140,11 @@ public class SchemaIntrospector {
             }
         }
         return new ArrayList<>(ordered.values());
+    }
+
+    /** {@code schema.table} for logging when a schema is present, else the bare table name. */
+    private static String qualify(String schema, String table) {
+        return (schema == null || schema.isEmpty()) ? table : schema + "." + table;
     }
 
     /** Exclude system schemas and SQLite's internal {@code sqlite_*} tables. */

@@ -8,8 +8,9 @@ import java.util.StringJoiner;
  * Serializes a {@link DatabaseSchema} into a compact, token-efficient text form for an LLM prompt.
  *
  * <p>The output is a terse CREATE-TABLE-like listing — one table per block — with column types,
- * {@code PK}/{@code NOT NULL} markers, and inline {@code FK -> ref} pointers. It is the exact text
- * later features hand to the model.
+ * {@code PK}/{@code NOT NULL}/{@code MASKED} markers, and inline {@code FK -> ref} pointers. It is the
+ * exact text later features hand to the model. A {@code MASKED} column (F9) stays listed so the model
+ * can aggregate over it, but the prompt instructs the model never to select its raw values.
  *
  * <p>It is rendered from an already skip-list-filtered schema, so skipped tables and columns are
  * structurally absent and <b>cannot</b> appear here. The renderer emits no row data — structure
@@ -46,6 +47,10 @@ public class SchemaRenderer {
             }
             if (!column.isNullable()) {
                 line.append(" NOT NULL");
+            }
+            if (column.isMasked()) {
+                // The model may aggregate this column (e.g. count) but must not select its raw values.
+                line.append(" MASKED");
             }
             for (ForeignKeyInfo fk : table.getForeignKeys()) {
                 if (fk.getColumn().equals(column.getName())) {

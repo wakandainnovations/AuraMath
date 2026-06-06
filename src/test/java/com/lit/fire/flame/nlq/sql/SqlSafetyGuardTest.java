@@ -144,6 +144,46 @@ class SqlSafetyGuardTest {
     }
 
     @Test
+    void maskedColumnRawProjectionIsRejected() throws Exception {
+        SkipList masked = SkipList.builder()
+                .addMaskedColumns(Collections.singletonList("users.email")).build();
+        DatabaseSchema schema = schema(masked);
+        UnsafeSqlException e = assertThrows(UnsafeSqlException.class,
+                () -> guard.validate("SELECT email FROM users LIMIT 5", masked, schema));
+        assertEquals(UnsafeSqlException.Reason.MASKED_COLUMN, e.getReason());
+    }
+
+    @Test
+    void maskedColumnInsideCountPasses() throws Exception {
+        SkipList masked = SkipList.builder()
+                .addMaskedColumns(Collections.singletonList("users.email")).build();
+        DatabaseSchema schema = schema(masked);
+        String safe = guard.validate("SELECT count(email) AS c FROM users LIMIT 5", masked, schema);
+        assertTrue(safe.toLowerCase(Locale.ROOT).contains("count"), safe);
+    }
+
+    @Test
+    void maskedColumnInsideValueRevealingAggregateIsRejected() throws Exception {
+        // min() returns an actual stored value, so a masked column inside it would leak — reject.
+        SkipList masked = SkipList.builder()
+                .addMaskedColumns(Collections.singletonList("users.email")).build();
+        DatabaseSchema schema = schema(masked);
+        UnsafeSqlException e = assertThrows(UnsafeSqlException.class,
+                () -> guard.validate("SELECT min(email) FROM users LIMIT 5", masked, schema));
+        assertEquals(UnsafeSqlException.Reason.MASKED_COLUMN, e.getReason());
+    }
+
+    @Test
+    void starProjectionOverTableWithMaskedColumnIsRejected() throws Exception {
+        SkipList masked = SkipList.builder()
+                .addMaskedColumns(Collections.singletonList("users.email")).build();
+        DatabaseSchema schema = schema(masked);
+        UnsafeSqlException e = assertThrows(UnsafeSqlException.class,
+                () -> guard.validate("SELECT * FROM users LIMIT 5", masked, schema));
+        assertEquals(UnsafeSqlException.Reason.MASKED_COLUMN, e.getReason());
+    }
+
+    @Test
     void cteQueryOverKnownTablesPasses() throws Exception {
         DatabaseSchema schema = schema(SkipList.empty());
         String safe = guard.validate(
