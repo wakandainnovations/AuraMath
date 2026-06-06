@@ -1,5 +1,9 @@
 package com.lit.fire.flame.nlq.api;
 
+import com.lit.fire.flame.nlq.audit.AskAuditLogger;
+import com.lit.fire.flame.nlq.audit.AskAuditRecord;
+import com.lit.fire.flame.nlq.audit.AskMetrics;
+import com.lit.fire.flame.nlq.audit.LlmUsageRecorder;
 import com.lit.fire.flame.nlq.config.AskEngineProperties;
 import com.lit.fire.flame.nlq.connection.ConnectionRequest;
 import com.lit.fire.flame.nlq.connection.DynamicConnectionFactory;
@@ -23,11 +27,13 @@ import org.springframework.stereotype.Service;
 
 import java.sql.Connection;
 import java.sql.SQLException;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 /**
  * Feature F8 — the end-to-end orchestrator that runs one Ask through the F1–F7 pipeline:
@@ -46,6 +52,11 @@ import java.util.Map;
  * <p><b>No secrets leak.</b> Nothing here logs or echoes the connection's credentials; failures are
  * raised as the pipeline's own typed, sanitized exceptions and a clarification short-circuit returns
  * a question rather than touching the database.
+ *
+ * <p><b>Audit &amp; observability (F10).</b> Every request — answered, clarified, or failed — produces
+ * exactly one credential-free {@link AskAuditRecord} (assembled as the pipeline runs and emitted by
+ * {@link AskAuditLogger}) tagged with the caller's {@code requestId}, bumps the {@link AskMetrics}
+ * counters, and reports the LLM token usage gathered by the {@link LlmUsageRecorder}.
  */
 @Service
 public class AskOrchestrator {
@@ -60,6 +71,9 @@ public class AskOrchestrator {
     private final ResultRedactor resultRedactor;
     private final AnswerSynthesisService answerSynthesisService;
     private final AskEngineProperties properties;
+    private final AskAuditLogger auditLogger;
+    private final AskMetrics metrics;
+    private final LlmUsageRecorder usageRecorder;
 
     public AskOrchestrator(DynamicConnectionFactory connectionFactory,
                            SchemaIntrospector introspector,
@@ -68,7 +82,10 @@ public class AskOrchestrator {
                            QueryExecutionService executionService,
                            ResultRedactor resultRedactor,
                            AnswerSynthesisService answerSynthesisService,
-                           AskEngineProperties properties) {
+                           AskEngineProperties properties,
+                           AskAuditLogger auditLogger,
+                           AskMetrics metrics,
+                           LlmUsageRecorder usageRecorder) {
         this.connectionFactory = connectionFactory;
         this.introspector = introspector;
         this.sqlGenerationService = sqlGenerationService;
@@ -77,12 +94,27 @@ public class AskOrchestrator {
         this.resultRedactor = resultRedactor;
         this.answerSynthesisService = answerSynthesisService;
         this.properties = properties;
+        this.auditLogger = auditLogger;
+        this.metrics = metrics;
+        this.usageRecorder = usageRecorder;
+    }
+
+    /**
+     * Run the full pipeline for one request under a freshly minted correlation id. Convenience
+     * overload for programmatic callers; the REST layer mints the id and uses
+     * {@link #ask(AskRequest, String)} so it can echo the same id on errors.
+     */
+    public AskResponse ask(AskRequest request)
+            throws SQLException, LlmException, UnsafeSqlException, QueryExecutionException {
+        return ask(request, UUID.randomUUID().toString());
     }
 
     /**
      * Run the full pipeline for one request and return either an answered or a clarification
-     * {@link AskResponse}.
+     * {@link AskResponse}, recording exactly one {@link AskAuditRecord} (tagged {@code requestId}) and
+     * bumping the {@link AskMetrics} counters for every outcome — answer, clarification, or failure.
      *
+     * @param requestId the caller-supplied correlation id, echoed on the response and the audit line
      * @throws IllegalArgumentException if the request is malformed (missing connection/question) or
      *                                  the connection details fail validation (mapped to {@code 400})
      * @throws LlmException             if a model call fails (mapped to {@code 502}/{@code 504})
@@ -90,29 +122,40 @@ public class AskOrchestrator {
      * @throws QueryExecutionException  if execution fails or times out (mapped to {@code 502}/{@code 504})
      * @throws SQLException             if the target connection cannot be opened (mapped to {@code 502}/{@code 504})
      */
-    public AskResponse ask(AskRequest request)
+    public AskResponse ask(AskRequest request, String requestId)
             throws SQLException, LlmException, UnsafeSqlException, QueryExecutionException {
-        if (request == null) {
-            throw new IllegalArgumentException("request body is required");
-        }
-        ConnectionRequest connection = request.getConnection();
-        if (connection == null) {
-            throw new IllegalArgumentException("connection is required");
-        }
-        String question = request.getQuestion();
-        if (question == null || question.trim().isEmpty()) {
-            throw new IllegalArgumentException("question is required");
-        }
+        metrics.incrementRequests();
+        usageRecorder.start();
 
-        SkipList skipList = effectiveSkipList(request);
-        ExecutionComponents components = componentsFor(request.getMaxRows());
-        String model = blankToNull(request.getModel());
-
+        AskAuditRecord.Builder audit = AskAuditRecord.builder()
+                .requestId(requestId)
+                .timestamp(Instant.now());
         Map<String, Long> timings = new LinkedHashMap<>();
         long startNanos = System.nanoTime();
 
         Connection conn = null;
         try {
+            if (request == null) {
+                throw new IllegalArgumentException("request body is required");
+            }
+            ConnectionRequest connection = request.getConnection();
+            if (connection == null) {
+                throw new IllegalArgumentException("connection is required");
+            }
+            String question = request.getQuestion();
+            if (question == null || question.trim().isEmpty()) {
+                throw new IllegalArgumentException("question is required");
+            }
+            audit.question(question.trim())
+                    .databaseHost(AskAuditLogger.targetHost(connection.getJdbcUrl()));
+
+            SkipList skipList = effectiveSkipList(request);
+            audit.skippedTables(new ArrayList<>(skipList.skippedTables()))
+                    .skippedColumns(new ArrayList<>(skipList.skippedColumns()))
+                    .maskedColumns(new ArrayList<>(skipList.maskedColumns()));
+            ExecutionComponents components = componentsFor(request.getMaxRows());
+            String model = blankToNull(request.getModel());
+
             long t = System.nanoTime();
             conn = connectionFactory.open(connection);
             timings.put("connectMillis", millisSince(t));
@@ -121,17 +164,21 @@ public class AskOrchestrator {
             t = System.nanoTime();
             DatabaseSchema schema = introspector.introspect(conn, skipList);
             timings.put("introspectMillis", millisSince(t));
+            audit.databaseProduct(schema.getProductName());
 
             // (F4) Draft a single read-only query from the question + skip-filtered schema.
             t = System.nanoTime();
             SqlGenerationResult generation = sqlGenerationService.generate(question, schema, model);
             timings.put("generateMillis", millisSince(t));
+            audit.tablesUsed(generation.getTablesUsed());
 
             if (generation.isClarificationNeeded()) {
                 timings.put("totalMillis", millisSince(startNanos));
                 log.debug("Ask returned a clarification after generation ({} table(s) visible)",
                         schema.getTables().size());
-                return AskResponse.clarification(
+                metrics.incrementClarifications();
+                recordAudit(audit, AskAuditRecord.Outcome.CLARIFICATION, "clarification", timings);
+                return AskResponse.clarification(requestId,
                         generation.getClarificationQuestion(), generation.getTablesUsed(), timings);
             }
 
@@ -139,6 +186,7 @@ public class AskOrchestrator {
             t = System.nanoTime();
             String safeSql = components.guard.validate(generation.getSql(), skipList, schema);
             timings.put("validateMillis", millisSince(t));
+            audit.generatedSql(safeSql);
 
             // (F6) Execute exactly the validated SQL, read-only and bounded.
             t = System.nanoTime();
@@ -150,6 +198,7 @@ public class AskOrchestrator {
             t = System.nanoTime();
             QueryResult redacted = resultRedactor.redact(execution, skipList);
             timings.put("redactMillis", millisSince(t));
+            audit.rowCount(redacted.getRowCount()).truncated(redacted.isTruncated());
 
             // (F7) Synthesize the final answer over the REDACTED rows, applying any statistics in Java.
             t = System.nanoTime();
@@ -160,11 +209,70 @@ public class AskOrchestrator {
             log.debug("Ask answered: {} row(s), {} formula(s), truncated={}, total={}ms",
                     redacted.getRowCount(), answer.getFormulasApplied().size(),
                     redacted.isTruncated(), timings.get("totalMillis"));
-            return AskResponse.answered(answer, safeSql, generation.getTablesUsed(),
+            metrics.incrementAnswers();
+            recordAudit(audit, AskAuditRecord.Outcome.ANSWERED, null, timings);
+            return AskResponse.answered(requestId, answer, safeSql, generation.getTablesUsed(),
                     redacted.isTruncated(), redacted.getRowCount(), timings);
+        } catch (Exception e) {
+            // One audit line and the right counters for the failure, then rethrow the typed exception
+            // unchanged so the controller maps it to a sanitized HTTP status. The reason recorded here
+            // is a sanitized category, never the raw driver/credential text.
+            timings.putIfAbsent("totalMillis", millisSince(startNanos));
+            classifyFailure(e);
+            metrics.incrementErrors();
+            recordAudit(audit, AskAuditRecord.Outcome.ERROR, sanitizedReason(e), timings);
+            throw e;
         } finally {
+            usageRecorder.clear();
             closeQuietly(conn);
         }
+    }
+
+    /** Stamp the token usage and timings onto the record and hand it to the audit logger. */
+    private void recordAudit(AskAuditRecord.Builder audit, AskAuditRecord.Outcome outcome,
+                             String reason, Map<String, Long> timings) {
+        LlmUsageRecorder.Usage usage = usageRecorder.snapshot();
+        audit.outcome(outcome)
+                .reason(reason)
+                .timingMillis(timings)
+                .llmUsage(usage.getCalls(), usage.getInputTokens(), usage.getOutputTokens());
+        auditLogger.record(audit.build());
+    }
+
+    /** Bump the specific failure counter (where the cause is known) for an error outcome. */
+    private void classifyFailure(Exception e) {
+        if (e instanceof UnsafeSqlException) {
+            metrics.incrementUnsafeSqlRejections();
+        } else if (e instanceof QueryExecutionException) {
+            QueryExecutionException.Kind kind = ((QueryExecutionException) e).getKind();
+            if (kind == QueryExecutionException.Kind.TIMEOUT) {
+                metrics.incrementExecutionTimeouts();
+            } else if (kind == QueryExecutionException.Kind.UNSAFE_SQL) {
+                metrics.incrementUnsafeSqlRejections();
+            }
+        } else if (e instanceof LlmException) {
+            metrics.incrementLlmFailures();
+        }
+    }
+
+    /** A short, sanitized failure category for the audit line — never raw driver/credential text. */
+    private static String sanitizedReason(Exception e) {
+        if (e instanceof UnsafeSqlException) {
+            return "unsafe_sql:" + ((UnsafeSqlException) e).getReason();
+        }
+        if (e instanceof QueryExecutionException) {
+            return "execution:" + ((QueryExecutionException) e).getKind();
+        }
+        if (e instanceof LlmException) {
+            return "llm:" + ((LlmException) e).getKind();
+        }
+        if (e instanceof SQLException) {
+            return "connect_failed";
+        }
+        if (e instanceof IllegalArgumentException) {
+            return "bad_request:" + e.getMessage();
+        }
+        return "internal_error";
     }
 
     /**
@@ -222,6 +330,7 @@ public class AskOrchestrator {
         copy.setDefaultSkipColumns(properties.getDefaultSkipColumns());
         copy.setMaskedColumns(properties.getMaskedColumns());
         copy.setAutoSkip(properties.getAutoSkip());
+        copy.setAudit(properties.getAudit());
         copy.setLlmProvider(properties.getLlmProvider());
         return copy;
     }

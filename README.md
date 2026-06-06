@@ -834,10 +834,24 @@ See [Operational Notes](#operational-notes) for the config keys and
 [`docs/ask-engine/DESIGN.md`](docs/ask-engine/DESIGN.md) for the full skip/mask/redact model and
 precedence.
 
+Audit logging & observability (F10) make every Ask traceable without leaking anything. The
+orchestrator emits exactly one **credential-free** structured (JSON) audit line per request — answered,
+clarification, or error — carrying a `requestId`, the target DB host/product (host only, never the URL,
+username, or password), the question, the generated SQL, tables used, row count/truncation, per-stage
+latency, LLM token usage, the sanitized outcome/reason, and which objects were skipped/masked. **No
+password, API key, or masked row value is ever logged.** The same `requestId` is echoed back on every
+response (the answer **and** error bodies), so an operator can correlate what the caller saw with the
+log. Auditing is **log-only by default**; set `aura.ask.audit.persist=true` to also persist each record
+to a table in AuraMath's **own** database (via the app `JdbcTemplate`, never the target connection — the
+table is not auto-created; DDL in [Operational Notes](#operational-notes)). Lightweight in-memory
+counters (requests, answers, clarifications, errors, unsafe-SQL rejections, execution timeouts, LLM
+failures) are exposed at `GET /api/ask/admin/metrics` — no Actuator dependency.
+
 | Endpoint                          | Purpose                                                              |
 |-----------------------------------|----------------------------------------------------------------------|
 | `POST /api/ask/test-connection`   | Open a read-only connection to a target DB and probe it (`SELECT 1`).|
 | `POST /api/ask`                   | Answer a natural-language question against a target DB, read-only.   |
+| `GET /api/ask/admin/metrics`      | Operational counters for the Ask engine (counts only). (F10)        |
 
 **`POST /api/ask/test-connection`** — attempts an isolated, read-only connection to the supplied
 target database and runs a trivial probe. The `driver` field is optional (auto-detected from the URL
@@ -905,6 +919,7 @@ Response (success, `200`):
 
 ```json
 {
+  "requestId": "a1b2c3d4-5e6f-7890-abcd-ef0123456789",
   "clarificationNeeded": false,
   "clarificationQuestion": null,
   "answer": "The average order value for orders placed last month was $42.17 across 1,284 orders.",
@@ -939,6 +954,7 @@ Response (clarification — e.g. the question targets a skipped table, returns `
 
 ```json
 {
+  "requestId": "b2c3d4e5-6f70-8901-bcde-f01234567890",
   "clarificationNeeded": true,
   "clarificationQuestion": "Which table holds the data you mean? The question could not be answered from the available schema.",
   "answer": null,
@@ -966,7 +982,9 @@ HTTP status codes:
 | `504` | The LLM call or the query timed out. | `{ "error": "…" }` |
 | `503` | The engine is disabled (`aura.ask.enabled=false`). | `{ "error": "the Ask engine is disabled" }` |
 
-All error bodies are **sanitized** — never the password, raw driver text, prompt, or a stack trace.
+All error bodies are **sanitized** — never the password, raw driver text, prompt, or a stack trace —
+and carry the same `requestId` as the audit log (`{ "error": "…", "requestId": "…" }`) so a failure can
+be correlated server-side.
 
 ---
 
@@ -1149,4 +1167,58 @@ Per-endpoint contracts:
   aura.ask.auto-skip.enabled=true
   # aura.ask.auto-skip.patterns=.*secret.*,.*token.*   # override to customise; comment out to keep defaults
   ```
+
+- **Ask engine audit & observability (F10).** The Ask engine writes one structured (JSON) audit line
+  per `/api/ask` request via SLF4J, on logger `com.lit.fire.flame.nlq.audit.AskAuditLogger` at `INFO`.
+  Each line is **credential- and row-value-free** and carries the same `requestId` echoed to the client
+  (on the answer and on error bodies). Fields: `requestId`, `timestamp`, `outcome`
+  (`ANSWERED`/`CLARIFICATION`/`ERROR`), `reason` (sanitized category), `databaseProduct`, `databaseHost`
+  (**host[:port] only** — never the URL/username/password), `question`, `generatedSql`, `tablesUsed`,
+  `rowCount`, `truncated`, `timingMillis` (per stage), `llm` (`calls`/`inputTokens`/`outputTokens`), and
+  `policy` (`skippedTables`/`skippedColumns`/`maskedColumns`, names only). Example:
+
+  ```json
+  {"event":"ask.request","requestId":"a1b2…","outcome":"ANSWERED","databaseHost":"db.internal:5432",
+   "question":"average order value last month","generatedSql":"SELECT avg(amount) … LIMIT 500",
+   "tablesUsed":["orders"],"rowCount":1,"truncated":false,"llm":{"calls":3,"inputTokens":1820,"outputTokens":240},
+   "policy":{"skippedTables":["audit_log"],"skippedColumns":[],"maskedColumns":["users.email"]}}
+  ```
+
+  | Key | Default | Meaning |
+  |-----|---------|---------|
+  | `aura.ask.audit.persist` | `false` | When `true`, also persist each record to AuraMath's **own** DB (via the app `JdbcTemplate`, never the target connection). Log-only when `false`. |
+  | `aura.ask.audit.table` | `ask_audit_log` | Target table for persisted records. **Not auto-created** — create it yourself. |
+
+  Persistence is **opt-in** and writes to a table you create (the engine never runs DDL against an
+  arbitrary database). Suggested DDL (PostgreSQL):
+
+  ```sql
+  CREATE TABLE ask_audit_log (
+      id                BIGSERIAL PRIMARY KEY,
+      request_id        VARCHAR(64)  NOT NULL,
+      created_at        TIMESTAMP    NOT NULL,
+      outcome           VARCHAR(16)  NOT NULL,
+      reason            VARCHAR(256),
+      db_product        VARCHAR(128),
+      db_host           VARCHAR(256),
+      question          TEXT,
+      generated_sql     TEXT,
+      tables_used       TEXT,
+      row_count         INTEGER,
+      truncated         BOOLEAN,
+      total_millis      BIGINT,
+      llm_calls         INTEGER,
+      llm_input_tokens  INTEGER,
+      llm_output_tokens INTEGER,
+      skipped_tables    TEXT,
+      skipped_columns   TEXT,
+      masked_columns    TEXT
+  );
+  CREATE INDEX ix_ask_audit_request_id ON ask_audit_log (request_id);
+  ```
+
+  **Metrics.** `GET /api/ask/admin/metrics` returns process-wide counters (counts only, monotonic since
+  boot): `requests`, `answers`, `clarifications`, `errors`, `unsafeSqlRejections`, `executionTimeouts`,
+  `llmFailures`. No Spring Boot Actuator / Micrometer dependency is added; the per-request detail lives
+  in the audit log above.
 

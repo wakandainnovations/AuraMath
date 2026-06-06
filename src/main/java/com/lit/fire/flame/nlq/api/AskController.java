@@ -15,6 +15,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 import java.sql.SQLException;
 import java.util.Locale;
+import java.util.UUID;
 
 /**
  * REST entry point for the Ask engine's end-to-end endpoint (F8): {@code POST /api/ask}.
@@ -34,6 +35,10 @@ import java.util.Locale;
  *
  * <p>Every error body is <b>sanitized</b> — no credentials, raw driver text, prompts, or stack
  * traces — and the password supplied in the request body is never echoed or logged.
+ *
+ * <p>For F10, the controller mints the per-request correlation id and passes it to the orchestrator
+ * (which records it on the audit line); it is echoed back on both the {@link AskResponse} and the
+ * {@link AskErrorResponse}, so a caller's id always matches a server-side audit record.
  */
 @RestController
 @RequestMapping("/api/ask")
@@ -56,11 +61,14 @@ public class AskController {
      */
     @PostMapping
     public ResponseEntity<?> ask(@RequestBody AskRequest request) {
+        // Mint the correlation id up front so it is echoed on every outcome — answer, clarification,
+        // or error — and matches the id the orchestrator records on the audit line.
+        String requestId = UUID.randomUUID().toString();
         if (!properties.isEnabled()) {
-            return error(HttpStatus.SERVICE_UNAVAILABLE, "the Ask engine is disabled");
+            return error(HttpStatus.SERVICE_UNAVAILABLE, "the Ask engine is disabled", requestId);
         }
         try {
-            AskResponse response = orchestrator.ask(request);
+            AskResponse response = orchestrator.ask(request, requestId);
             if (response.isClarificationNeeded()) {
                 // A clarification is a well-formed "please refine" — surfaced as 400 with the body.
                 return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(response);
@@ -68,15 +76,16 @@ public class AskController {
             return ResponseEntity.ok(response);
         } catch (IllegalArgumentException e) {
             // Bad request / rejected connection details. The message is safe (no credentials).
-            return error(HttpStatus.BAD_REQUEST, e.getMessage());
+            return error(HttpStatus.BAD_REQUEST, e.getMessage(), requestId);
         } catch (UnsafeSqlException e) {
             // The model produced a query the safety guard refuses to run.
             return error(HttpStatus.UNPROCESSABLE_ENTITY,
-                    "the generated query was rejected by the safety guard (" + e.getReason() + ")");
+                    "the generated query was rejected by the safety guard (" + e.getReason() + ")",
+                    requestId);
         } catch (LlmException e) {
             HttpStatus status = (e.getKind() == LlmException.Kind.TIMEOUT)
                     ? HttpStatus.GATEWAY_TIMEOUT : HttpStatus.BAD_GATEWAY;
-            return error(status, "the language model call failed (" + e.getKind() + ")");
+            return error(status, "the language model call failed (" + e.getKind() + ")", requestId);
         } catch (QueryExecutionException e) {
             HttpStatus status;
             switch (e.getKind()) {
@@ -90,19 +99,20 @@ public class AskController {
                     status = HttpStatus.BAD_GATEWAY;
             }
             // QueryExecutionException messages are already sanitized.
-            return error(status, e.getMessage());
+            return error(status, e.getMessage(), requestId);
         } catch (SQLException e) {
             HttpStatus status = looksLikeTimeout(e) ? HttpStatus.GATEWAY_TIMEOUT : HttpStatus.BAD_GATEWAY;
             // Never surface the raw driver message — it can echo connection details.
-            return error(status, "could not establish a connection to the target database");
+            return error(status, "could not establish a connection to the target database", requestId);
         } catch (RuntimeException e) {
-            log.warn("Ask request failed unexpectedly", e);
-            return error(HttpStatus.INTERNAL_SERVER_ERROR, "the request could not be completed");
+            log.warn("Ask request {} failed unexpectedly", requestId, e);
+            return error(HttpStatus.INTERNAL_SERVER_ERROR, "the request could not be completed", requestId);
         }
     }
 
-    private static ResponseEntity<AskErrorResponse> error(HttpStatus status, String message) {
-        return ResponseEntity.status(status).body(new AskErrorResponse(message));
+    private static ResponseEntity<AskErrorResponse> error(HttpStatus status, String message,
+                                                          String requestId) {
+        return ResponseEntity.status(status).body(new AskErrorResponse(message, requestId));
     }
 
     private static boolean looksLikeTimeout(SQLException e) {

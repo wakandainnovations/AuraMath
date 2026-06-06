@@ -48,6 +48,9 @@ public class AskEngineProperties {
     /** Auto-skip-by-name-pattern settings (F9). */
     private AutoSkip autoSkip = new AutoSkip();
 
+    /** Audit logging &amp; observability settings (F10). */
+    private Audit audit = new Audit();
+
     /** Selected LLM provider behind the {@code LlmClient} interface (e.g. "claude"). */
     private String llmProvider = "claude";
 
@@ -115,6 +118,14 @@ public class AskEngineProperties {
         this.autoSkip = autoSkip;
     }
 
+    public Audit getAudit() {
+        return audit;
+    }
+
+    public void setAudit(Audit audit) {
+        this.audit = audit;
+    }
+
     public String getLlmProvider() {
         return llmProvider;
     }
@@ -162,6 +173,41 @@ public class AskEngineProperties {
 
         public void setPatterns(List<String> patterns) {
             this.patterns = patterns;
+        }
+    }
+
+    /**
+     * Audit logging &amp; observability configuration (bound from {@code aura.ask.audit}). The Ask
+     * engine always writes a structured (JSON) audit line per request via SLF4J; this block controls
+     * the <em>optional</em> persistence of the same record to a table in AuraMath's own database.
+     *
+     * <p>Persistence is <b>off by default</b>. When {@link #isPersist() persist} is {@code true}, each
+     * audit record is also written (via AuraMath's own {@code JdbcTemplate}/{@code DataSourceConfig} —
+     * never the per-request target connection) to {@link #getTable() table}. The table is <b>not</b>
+     * auto-created against arbitrary databases — provide its DDL yourself (see the design doc).
+     */
+    public static class Audit {
+
+        /** Also persist each audit record to {@link #getTable()} in AuraMath's own database. */
+        private boolean persist = false;
+
+        /** Target table for persisted audit records (in AuraMath's own database). */
+        private String table = "ask_audit_log";
+
+        public boolean isPersist() {
+            return persist;
+        }
+
+        public void setPersist(boolean persist) {
+            this.persist = persist;
+        }
+
+        public String getTable() {
+            return table;
+        }
+
+        public void setTable(String table) {
+            this.table = table;
         }
     }
 }

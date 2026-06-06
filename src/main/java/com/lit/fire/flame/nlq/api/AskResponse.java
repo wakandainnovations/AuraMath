@@ -29,10 +29,15 @@ import java.util.Map;
  * </ul>
  *
  * <p>It deliberately carries <b>no credentials</b> — the connection's password never appears here.
- * Build one with {@link #answered} or {@link #clarification}; all collection accessors are
- * unmodifiable and never {@code null}.
+ * Every response also carries the {@link #getRequestId() requestId} (F10) that the audit log records,
+ * so an operator can correlate what the caller saw with the server-side trace. Build one with
+ * {@link #answered} or {@link #clarification}; all collection accessors are unmodifiable and never
+ * {@code null}.
  */
 public final class AskResponse {
+
+    /** Correlation id, echoed from the audit log so the caller and operators can match a request. */
+    private final String requestId;
 
     private final boolean clarificationNeeded;
     private final String clarificationQuestion;
@@ -50,11 +55,12 @@ public final class AskResponse {
     /** Per-stage wall-clock timings in milliseconds (connect, introspect, generate, …, total). */
     private final Map<String, Long> timingMillis;
 
-    private AskResponse(boolean clarificationNeeded, String clarificationQuestion, String answer,
-                        String sql, List<String> tablesUsed, List<AppliedFormula> formulasApplied,
-                        Map<String, Double> computedValues, List<String> assumptions,
-                        List<Map<String, Object>> rowsPreview, int rowCount, boolean truncated,
-                        Map<String, Long> timingMillis) {
+    private AskResponse(String requestId, boolean clarificationNeeded, String clarificationQuestion,
+                        String answer, String sql, List<String> tablesUsed,
+                        List<AppliedFormula> formulasApplied, Map<String, Double> computedValues,
+                        List<String> assumptions, List<Map<String, Object>> rowsPreview, int rowCount,
+                        boolean truncated, Map<String, Long> timingMillis) {
+        this.requestId = requestId;
         this.clarificationNeeded = clarificationNeeded;
         this.clarificationQuestion = clarificationQuestion;
         this.answer = answer;
@@ -78,9 +84,10 @@ public final class AskResponse {
      * <b>executed</b> SQL (the validated, row-capped query F5/F6 actually ran — not the raw draft),
      * the tables the query read, the truncation flag, the row count, and the per-stage timings.
      */
-    public static AskResponse answered(AskAnswer answer, String executedSql, List<String> tablesUsed,
-                                       boolean truncated, int rowCount, Map<String, Long> timingMillis) {
-        return new AskResponse(false, null,
+    public static AskResponse answered(String requestId, AskAnswer answer, String executedSql,
+                                       List<String> tablesUsed, boolean truncated, int rowCount,
+                                       Map<String, Long> timingMillis) {
+        return new AskResponse(requestId, false, null,
                 answer.getAnswer(), executedSql, tablesUsed, answer.getFormulasApplied(),
                 answer.getComputedValues(), answer.getAssumptions(), answer.getRowsPreview(),
                 rowCount, truncated, timingMillis);
@@ -90,10 +97,15 @@ public final class AskResponse {
      * Build a clarification response: no SQL was generated or executed, so only the question to put
      * back to the caller (and the tables the model reported considering) are carried.
      */
-    public static AskResponse clarification(String clarificationQuestion, List<String> tablesUsed,
-                                            Map<String, Long> timingMillis) {
-        return new AskResponse(true, clarificationQuestion,
+    public static AskResponse clarification(String requestId, String clarificationQuestion,
+                                            List<String> tablesUsed, Map<String, Long> timingMillis) {
+        return new AskResponse(requestId, true, clarificationQuestion,
                 null, null, tablesUsed, null, null, null, null, 0, false, timingMillis);
+    }
+
+    /** The correlation id shared with the audit log; never {@code null}. */
+    public String getRequestId() {
+        return requestId;
     }
 
     /** Whether the engine is asking the caller to refine the question instead of answering. */

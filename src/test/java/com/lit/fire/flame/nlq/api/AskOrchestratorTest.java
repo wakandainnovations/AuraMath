@@ -2,6 +2,9 @@ package com.lit.fire.flame.nlq.api;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
+import com.lit.fire.flame.nlq.audit.AskAuditLogger;
+import com.lit.fire.flame.nlq.audit.AskMetrics;
+import com.lit.fire.flame.nlq.audit.LlmUsageRecorder;
 import com.lit.fire.flame.nlq.config.AskEngineProperties;
 import com.lit.fire.flame.nlq.connection.ConnectionRequest;
 import com.lit.fire.flame.nlq.connection.DynamicConnectionFactory;
@@ -111,6 +114,8 @@ class AskOrchestratorTest {
     private AskOrchestrator orchestrator(LlmClient llm, AskEngineProperties properties) {
         SchemaRenderer renderer = new SchemaRenderer();
         SqlSafetyGuard guard = new SqlSafetyGuard(properties);
+        // F10 audit deps: a log-only audit logger (no JdbcTemplate → no persistence), fresh metrics,
+        // and an unwrapped token recorder (the stub LLM is not the RecordingLlmClient, so tokens stay 0).
         return new AskOrchestrator(
                 new DynamicConnectionFactory(properties),
                 new SchemaIntrospector(),
@@ -119,7 +124,10 @@ class AskOrchestratorTest {
                 new QueryExecutionService(guard, properties),
                 new ResultRedactor(),
                 new AnswerSynthesisService(llm),
-                properties);
+                properties,
+                new AskAuditLogger(properties, null),
+                new AskMetrics(),
+                new LlmUsageRecorder());
     }
 
     private AskRequest request(String question) {
@@ -201,6 +209,45 @@ class AskOrchestratorTest {
         assertTrue(response.getTimingMillis().containsKey("connectMillis"));
         assertTrue(response.getTimingMillis().containsKey("executeMillis"));
         assertTrue(response.getTimingMillis().containsKey("totalMillis"));
+
+        // F10: the response carries a correlation id for the audit line.
+        assertNotNull(response.getRequestId());
+    }
+
+    // --- F10: the caller's request id is echoed and the metrics counters are bumped ---------------
+
+    @Test
+    void requestIdIsEchoedAndMetricsAreCounted() throws Exception {
+        RoutingLlmClient llm = new RoutingLlmClient(
+                sqlResult("SELECT score FROM users", "users"),
+                meanPlan("score"),
+                answerText("The average score is 30."));
+        AskEngineProperties properties = new AskEngineProperties();
+        SchemaRenderer renderer = new SchemaRenderer();
+        SqlSafetyGuard guard = new SqlSafetyGuard(properties);
+        AskMetrics metrics = new AskMetrics();
+        AskOrchestrator orchestrator = new AskOrchestrator(
+                new DynamicConnectionFactory(properties),
+                new SchemaIntrospector(),
+                new SqlGenerationService(renderer, llm, properties),
+                guard,
+                new QueryExecutionService(guard, properties),
+                new ResultRedactor(),
+                new AnswerSynthesisService(llm),
+                properties,
+                new AskAuditLogger(properties, null),
+                metrics,
+                new LlmUsageRecorder());
+
+        AskResponse response = orchestrator.ask(request("what is the average score"), "req-12345");
+
+        // The exact id the caller passed is echoed back for correlation with the audit log.
+        assertEquals("req-12345", response.getRequestId());
+        // An answered request bumps the request and answer counters, and nothing else.
+        assertEquals(1, metrics.snapshot().getRequests());
+        assertEquals(1, metrics.snapshot().getAnswers());
+        assertEquals(0, metrics.snapshot().getClarifications());
+        assertEquals(0, metrics.snapshot().getErrors());
     }
 
     // --- acceptance: a skipped table yields a clarification, and never reaches the model -------

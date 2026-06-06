@@ -646,6 +646,119 @@ without exposing any sensitive value.
   `AskOrchestratorTest`) but a raw projection of it is rejected (`MASKED_COLUMN`) and any masked value
   that reaches a result is masked (`ResultRedactorTest`).
 
+## Observability & audit (F10)
+
+Every Ask is auditable and the engine surfaces lightweight operational metrics, all under
+`nlq.audit`. The goal is that an operator can answer *"what did this request do?"* from one structured
+log line — **without** any credential or row value ever being written.
+
+### One record per request
+
+`nlq.api.AskOrchestrator` assembles exactly one `nlq.audit.AskAuditRecord` as the pipeline runs and
+hands it to `nlq.audit.AskAuditLogger`, for **every** outcome — answered, clarification, or failure.
+The record carries:
+
+| Field | Meaning |
+|-------|---------|
+| `requestId` | Correlation id (minted by `AskController`), echoed to the client on the answer **and** on error responses. |
+| `timestamp` | When the request was received (ISO-8601). |
+| `outcome` | `ANSWERED` / `CLARIFICATION` / `ERROR`. |
+| `reason` | Sanitized: `clarification`, or a failure category (`unsafe_sql:<Reason>`, `execution:<Kind>`, `llm:<Kind>`, `connect_failed`, `bad_request:<msg>`, `internal_error`) — never raw driver/credential text. |
+| `databaseProduct` | Target DB product name (e.g. `PostgreSQL`); `null` if introspection was never reached. |
+| `databaseHost` | Target DB `host[:port]` **only**, parsed from the JDBC URL with any `user:pass@` userinfo stripped; `null` for a host-less URL (e.g. SQLite). **Never** the URL, username, or password. |
+| `question` | The natural-language question. |
+| `generatedSql` | The validated, row-capped SQL that ran; `null` for a clarification or a pre-execution failure. |
+| `tablesUsed` | Names of the tables the query read. |
+| `rowCount` / `truncated` | Result size and whether the row cap was hit; `rowCount` is `-1` when no query ran. |
+| `timingMillis` | The same per-stage latencies returned to the client (`connect`/`introspect`/`generate`/`validate`/`execute`/`redact`/`synthesize`/`total`). |
+| `llm` | Token usage for the request: `calls`, `inputTokens`, `outputTokens`. |
+| `policy` | The effective `skippedTables`, `skippedColumns`, and `maskedColumns` (names only). |
+
+The log line is emitted as compact JSON at `INFO` on logger `com.lit.fire.flame.nlq.audit.AskAuditLogger`
+with an `"event":"ask.request"` discriminator, e.g.:
+
+```json
+{"event":"ask.request","requestId":"a1b2…","timestamp":"2026-06-06T01:30:40Z","outcome":"ANSWERED",
+ "databaseProduct":"PostgreSQL","databaseHost":"db.internal:5432","question":"average order value last month",
+ "generatedSql":"SELECT avg(amount) … LIMIT 500","tablesUsed":["orders"],"rowCount":1,"truncated":false,
+ "timingMillis":{"connectMillis":31,"…":0,"totalMillis":2194},"llm":{"calls":3,"inputTokens":1820,"outputTokens":240},
+ "policy":{"skippedTables":["audit_log"],"skippedColumns":[],"maskedColumns":["users.email"]}}
+```
+
+### Token usage
+
+Token counts are gathered **without** changing the provider-neutral `LlmClient` contract: the
+configured client is wrapped in a `nlq.audit.RecordingLlmClient` (wired in `AskEngineConfiguration`)
+that meters each completion into a request-scoped, thread-local `nlq.audit.LlmUsageRecorder`. The
+orchestrator starts the tally before the pipeline and clears it in a `finally`. Counts a provider
+reports as `-1` (unknown) are not added, so an unmetered provider reports `0` tokens (but a non-zero
+`calls`).
+
+### Redaction rules
+
+Redaction is **structural** — the record is built to be safe, so the logger just serializes it:
+
+- **No credentials.** Only `databaseHost` (host[:port]) is recorded; the JDBC URL, username, and
+  password never appear. `AskAuditLogger.targetHost` strips any `user:pass@` userinfo defensively.
+- **No row values.** The record summarizes results by `rowCount`/`truncated` and by table/column
+  **names** only — never a cell. In particular a **masked** column's raw value is never logged
+  (consistent with F9; `generatedSql` may contain `count(email)`, which is a name, not a value).
+- **No API keys or prompts.** The token recorder reads only the numeric counts already on
+  `LlmResponse`; prompt/completion text is never touched (the `LlmClient` already never logs them).
+- **Sanitized failure reasons.** Error outcomes record a category, never the raw driver `SQLException`
+  text (which can echo connection details).
+
+### Optional persistence
+
+By default the engine is **log-only**. Set `aura.ask.audit.persist=true` to also write each record to
+a table in **AuraMath's own database** — via the application `JdbcTemplate` from `DataSourceConfig`,
+**never** the per-request target connection. The table is **not** auto-created (we never run DDL
+against an arbitrary database); create it yourself. The default table name is `ask_audit_log`
+(`aura.ask.audit.table`). Suggested DDL (PostgreSQL):
+
+```sql
+CREATE TABLE ask_audit_log (
+    id                BIGSERIAL PRIMARY KEY,
+    request_id        VARCHAR(64)  NOT NULL,
+    created_at        TIMESTAMP    NOT NULL,
+    outcome           VARCHAR(16)  NOT NULL,
+    reason            VARCHAR(256),
+    db_product        VARCHAR(128),
+    db_host           VARCHAR(256),
+    question          TEXT,
+    generated_sql     TEXT,
+    tables_used       TEXT,
+    row_count         INTEGER,
+    truncated         BOOLEAN,
+    total_millis      BIGINT,
+    llm_calls         INTEGER,
+    llm_input_tokens  INTEGER,
+    llm_output_tokens INTEGER,
+    skipped_tables    TEXT,
+    skipped_columns   TEXT,
+    masked_columns    TEXT
+);
+CREATE INDEX ix_ask_audit_request_id ON ask_audit_log (request_id);
+```
+
+A persistence failure is swallowed with a warning (request id + exception class only) so auditing
+never breaks the request it records.
+
+### Metrics
+
+Rather than add Spring Boot Actuator / Micrometer, `nlq.audit.AskMetrics` keeps process-wide,
+in-memory counters bumped by the orchestrator and exposes them at **`GET /api/ask/admin/metrics`**
+(`nlq.api.AskMetricsController`) as counts only: `requests`, `answers`, `clarifications`, `errors`,
+`unsafeSqlRejections`, `executionTimeouts`, and `llmFailures`. Counts are monotonic since process
+start and reset on restart.
+
+### Acceptance
+
+A successful request and a rejected one (e.g. a `MASKED_COLUMN` rejection) each emit a complete,
+credential-free audit line whose `requestId` matches the id echoed to the client (on `AskResponse` and
+`AskErrorResponse` respectively); no masked value ever appears in the log
+(`AskOrchestratorTest` exercises both paths and asserts the id echo and the metric counters).
+
 ## Configuration
 
 Bound from prefix `aura.ask` (`nlq.config.AskEngineProperties`):
@@ -661,6 +774,8 @@ Bound from prefix `aura.ask` (`nlq.config.AskEngineProperties`):
 | `aura.ask.masked-columns` | _(empty)_ | Columns aggregatable but never returned raw; values redacted. (F9) |
 | `aura.ask.auto-skip.enabled` | `true` | Toggle for pattern-based auto-skipping of secret-named objects. (F9) |
 | `aura.ask.auto-skip.patterns` | _(see above)_ | Case-insensitive, full-match name regexes auto-skipped. (F9) |
+| `aura.ask.audit.persist` | `false` | Also persist each audit record to AuraMath's own DB (log-only when `false`). (F10) |
+| `aura.ask.audit.table` | `ask_audit_log` | Target table for persisted audit records (not auto-created). (F10) |
 | `aura.ask.llm-provider` | `claude` | Selected `LlmClient` provider. |
 
 The LLM API key is read from `secrets.txt` (`anthropic.api.key=`) and is never committed. The active
@@ -679,5 +794,5 @@ fails fast at startup).
 - [x] **F7** — Mathematician layer: plan-then-deterministically-evaluate + answer synthesis (`nlq.math`).
 - [x] **F8** — Orchestrator (`AskOrchestrator`) + `POST /api/ask` endpoint and DTOs (`AskRequest`/`AskResponse`/`AskErrorResponse`), wiring F1–F7 end to end (`nlq.api`).
 - [x] **F9** — Sensitive-data hardening: skipped/masked columns, auto-skip name patterns, and output redaction (`nlq.schema`, `nlq.sql`).
-- [ ] **F10** — Full end-to-end integration tests against Postgres/MySQL targets.
-- [ ] **F11** — Hardening, observability, and docs.
+- [x] **F10** — Audit logging & observability: per-request credential-free audit record + structured log line, optional persistence, request-id correlation, and metrics (`nlq.audit`, `nlq.api`).
+- [ ] **F11** — Full end-to-end integration tests against Postgres/MySQL targets + remaining hardening.
