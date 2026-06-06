@@ -6,6 +6,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -239,6 +240,103 @@ public class EntityMarketingService {
         body.put("headline",   headline);
         body.put("channels",   channels);
         return body;
+    }
+
+    // -------------------------------------------------------------------------
+    // Multi-keyword variants — an entity spans several keywords, so the entity
+    // intelligence report aggregates across its full keyword set rather than a
+    // single keyword string. These mirror the single-keyword methods above but
+    // match the post's keyword against any value in the supplied list.
+    // -------------------------------------------------------------------------
+
+    /** Audience size for an entity: distinct authors across all platforms and keywords. */
+    public long audienceSize(List<String> keywords) {
+        if (keywords == null || keywords.isEmpty()) return 0L;
+        String in = placeholders(keywords.size());
+        String sql =
+                "SELECT COUNT(DISTINCT author) FROM (" +
+                "  SELECT author FROM x_posts          WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' " +
+                "  UNION " +
+                "  SELECT author FROM youtube_comments WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' " +
+                "  UNION " +
+                "  SELECT author FROM reddit_posts     WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' " +
+                "  UNION " +
+                "  SELECT author FROM instagram_posts  WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' " +
+                ") combined";
+        Object[] args = repeatLowered(keywords, 4);
+        Long n = jdbc.queryForObject(sql, Long.class, args);
+        return n == null ? 0L : n;
+    }
+
+    /** Top-N advocates for an entity ranked by Hawkes alpha, across its keyword set. */
+    public List<Map<String, Object>> topSpreaders(List<String> keywords, int limit) {
+        if (keywords == null || keywords.isEmpty()) return List.of();
+        List<Map<String, Object>> rows = aggregateByKeywords(keywords);
+        rows.sort((a, b) -> Double.compare(toDouble(b.get("influence_rank")),
+                                           toDouble(a.get("influence_rank"))));
+
+        int take = Math.min(limit, rows.size());
+        List<Map<String, Object>> out = new ArrayList<>(take);
+        for (int i = 0; i < take; i++) {
+            Map<String, Object> row = rows.get(i);
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("global_user_id",      row.get("global_user_id"));
+            entry.put("tribe_label",         row.get("tribe_label"));
+            entry.put("platform_handles",    JsonbUtil.asTree(row.get("platform_handles"), gson));
+            entry.put("peak_activity_times", JsonbUtil.asTree(row.get("peak_activity_times"), gson));
+            entry.put("hawkes_alpha",        toDouble(row.get("influence_rank")));
+            entry.put("post_count",          toLong(row.get("post_count")));
+            entry.put("total_engagement",    toLong(row.get("total_engagement")));
+            entry.put("moi_score",           toDouble(row.get("moi_score")));
+            out.add(entry);
+        }
+        return out;
+    }
+
+    /** Per-user activity aggregated across an entity's full keyword set. */
+    private List<Map<String, Object>> aggregateByKeywords(List<String> keywords) {
+        String in = placeholders(keywords.size());
+        String sql =
+                "WITH per_post AS (" +
+                "  SELECT author AS global_user_id, COALESCE(views_count, 0)::bigint AS engagement " +
+                "  FROM x_posts          WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' " +
+                "  UNION ALL " +
+                "  SELECT author, COALESCE(likes_count, 0)::bigint " +
+                "  FROM youtube_comments WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' " +
+                "  UNION ALL " +
+                "  SELECT author, COALESCE(num_comments, 0)::bigint " +
+                "  FROM reddit_posts     WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' " +
+                "  UNION ALL " +
+                "  SELECT author, COALESCE(like_count, 0)::bigint " +
+                "  FROM instagram_posts  WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' " +
+                "), per_user AS (" +
+                "  SELECT global_user_id, COUNT(*) AS post_count, SUM(engagement) AS total_engagement " +
+                "  FROM per_post GROUP BY global_user_id " +
+                ") " +
+                "SELECT m.global_user_id, m.platform_handles, m.tribe_label, m.influence_rank, " +
+                "       m.peak_activity_times, m.moi_score, pu.post_count, pu.total_engagement " +
+                "FROM per_user pu " +
+                "JOIN marketing_target_profiles m ON m.global_user_id = pu.global_user_id";
+        return jdbc.queryForList(sql, repeatLowered(keywords, 4));
+    }
+
+    /** Comma-separated list of {@code n} bind placeholders, e.g. "?, ?, ?". */
+    private static String placeholders(int n) {
+        return String.join(", ", Collections.nCopies(n, "?"));
+    }
+
+    /**
+     * Lower-cases each keyword and repeats the whole list {@code times} over —
+     * one repetition per UNION branch — so the flattened array lines up with
+     * the {@code LOWER(keyword) IN (...)} placeholders in source order.
+     */
+    private static Object[] repeatLowered(List<String> keywords, int times) {
+        Object[] args = new Object[keywords.size() * times];
+        int idx = 0;
+        for (int t = 0; t < times; t++)
+            for (String k : keywords)
+                args[idx++] = k == null ? null : k.toLowerCase();
+        return args;
     }
 
     /** Audience size for a keyword: distinct authors across all platforms. */

@@ -91,8 +91,22 @@ public class HawkesAuditService {
     // -------------------------------------------------------------------------
 
     public AuditResult compute(String author) {
-        List<Map<String, Object>> rows = fetchRows(author);
-        if (rows.isEmpty()) return new AuditResult(author, Collections.emptyList(), 0.0, 0.0);
+        return computeFromRows(author, fetchRows(author));
+    }
+
+    /**
+     * Runs the same MLE estimation, excitation-spike and burst computation as
+     * {@link #compute(String)} but over a caller-supplied row set, so callers
+     * that scope events by something other than a single author (e.g. an
+     * entity's keyword set) can reuse the Hawkes math without duplicating it.
+     *
+     * Each row must expose the same columns produced by {@link #fetchRows}:
+     * {@code id, content, event_time, keyword, sentiment_category,
+     * sentiment_score, platform}. Rows are expected to be ordered by
+     * {@code event_time ascending}.
+     */
+    public AuditResult computeFromRows(String label, List<Map<String, Object>> rows) {
+        if (rows.isEmpty()) return new AuditResult(label, Collections.emptyList(), 0.0, 0.0);
 
         List<AuditEntry> entries = new ArrayList<>(rows.size());
         for (Map<String, Object> r : rows) {
@@ -127,7 +141,7 @@ public class HawkesAuditService {
             entries.get(i).burstSize       = bursts[i];
         }
 
-        return new AuditResult(author, entries, hp[0], hp[1]);
+        return new AuditResult(label, entries, hp[0], hp[1]);
     }
 
     // -------------------------------------------------------------------------
