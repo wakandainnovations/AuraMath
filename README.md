@@ -766,6 +766,33 @@ Sentiment sourcing:
 `impactScore` shrinks toward 0 for low-volume aspects (formula: `avg * n / (n + 3)`),
 so a 4-post outlier can't outrank a 200-post consensus.
 
+**`GET /api/marketing/aspect-drivers?entityId={id}`**
+
+Entity-scoped variant. Instead of a single keyword, it resolves the entity's tracked
+keyword set (`managed_entities` → `entity_keywords`) and aggregates aspect drivers across
+**all** of them — so you can ask "how is entity 29 perceived?" without first knowing which
+keywords it tracks. Keywords are matched exactly (case-insensitive), the same scoping the
+F11 [entity report](#5c-entity-report-api) uses.
+
+The payload is identical to the keyword variant, with the entity identity prepended in place
+of `keyword`:
+
+```json
+{
+  "entityId": "29",
+  "name": "Madhavan",
+  "type": "CELEBRITY",
+  "trackedKeywords": ["Maddy", "Madhavan", "RMadhavan", "maddy", "madhavan", "rmadhavan"],
+  "totalPostsAnalyzed": { "x": 412, "youtube": 318, "reddit": 211, "instagram": 99, "total": 1040 },
+  "strengths":  [ ... ],
+  "weaknesses": [ ... ],
+  "byPlatform": { ... }
+}
+```
+
+Returns `404` if no entity has that id. An entity that exists but has no matching precomputed
+posts returns zero counts with empty strengths/weaknesses.
+
 ---
 
 ### 7. Top Spreaders

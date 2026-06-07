@@ -3,6 +3,8 @@ package com.lit.fire.flame;
 import com.google.gson.Gson;
 import com.google.gson.reflect.TypeToken;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -43,6 +45,9 @@ public class ViralSeedController {
 
     @Autowired
     private SeedScoreCalibrator seedScoreCalibrator;
+
+    @Autowired
+    private EntityIntelService entityIntel;
 
     private final Gson gson = new Gson();
 
@@ -210,28 +215,91 @@ public class ViralSeedController {
      */
     @GetMapping("/aspect-drivers/{keyword}")
     public Map<String, Object> getAspectDrivers(@PathVariable String keyword) {
-        String kw = "%" + keyword + "%";
+        // Substring match — one user-supplied keyword fans out to every precomputed
+        // keyword whose text contains it.
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("keyword", keyword);
+        response.putAll(aspectDrivers("keyword ILIKE ?", new Object[]{ "%" + keyword + "%" }));
+        return response;
+    }
 
-        // Post counts per platform — summed across every precomputed keyword the substring matches.
+    /**
+     * Entity-scoped variant of {@code /aspect-drivers}. Resolves the entity's tracked
+     * keyword set (managed_entities → entity_keywords) and aggregates aspect drivers
+     * across every one of them, so callers can ask "how is entity 29 perceived?"
+     * without first having to know which keywords it tracks.
+     *
+     * Unlike the keyword path variant — which substring-matches a single term — this
+     * matches the precomputed rows against the entity's exact keywords (case-insensitively),
+     * mirroring how {@link EntityIntelService} scopes the F11 entity report.
+     *
+     * Example: GET /api/marketing/aspect-drivers?entityId=29
+     * Returns 404 if no such entity exists; an existing entity with no matching
+     * precomputed posts returns zero counts and empty strengths/weaknesses.
+     */
+    @GetMapping("/aspect-drivers")
+    public ResponseEntity<Map<String, Object>> getAspectDriversForEntity(@RequestParam("entityId") String entityId) {
+        EntityIntelService.EntityProfile entity = entityIntel.lookup(entityId);
+        if (entity == null) {
+            Map<String, Object> notFound = new LinkedHashMap<>();
+            notFound.put("entityId", entityId);
+            notFound.put("message", "No entity found for this id");
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(notFound);
+        }
+
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("entityId",        entityId);
+        response.put("name",            entity.name);
+        response.put("type",            entity.type);
+        response.put("trackedKeywords", entity.keywords);
+
+        if (entity.keywords == null || entity.keywords.isEmpty()) {
+            // Entity exists but tracks no keywords — return the zero-valued shape rather than
+            // building an invalid `IN ()` predicate.
+            response.putAll(aspectDrivers("FALSE", new Object[]{}));
+            return ResponseEntity.ok(response);
+        }
+
+        String in = String.join(", ", Collections.nCopies(entity.keywords.size(), "?"));
+        Object[] args = entity.keywords.stream()
+                .map(k -> k == null ? null : k.toLowerCase())
+                .toArray();
+        response.putAll(aspectDrivers("LOWER(keyword) IN (" + in + ")", args));
+        return ResponseEntity.ok(response);
+    }
+
+    // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+    /**
+     * Core aspect-drivers aggregation shared by the keyword and entity variants.
+     *
+     * {@code keywordPredicate} is a SQL boolean over the precomputed tables' {@code keyword}
+     * column (e.g. {@code "keyword ILIKE ?"} or {@code "LOWER(keyword) IN (?, ?)"}); the same
+     * predicate and {@code args} are applied to both precomputed tables. Returns the
+     * {@code totalPostsAnalyzed} counts plus the overall and per-platform strengths/weaknesses;
+     * callers prepend their own identity fields (keyword, or entity id/name/keywords).
+     */
+    private Map<String, Object> aspectDrivers(String keywordPredicate, Object[] args) {
+        // Post counts per platform — summed across every precomputed keyword the predicate matches.
         Map<String, Integer> postCounts = new HashMap<>();
         jdbcTemplate.query(
                 "SELECT platform, SUM(post_count) AS c FROM aspect_drivers_post_counts " +
-                "WHERE keyword ILIKE ? GROUP BY platform",
-                rs -> { postCounts.put(rs.getString("platform"), rs.getInt("c")); }, kw);
+                "WHERE " + keywordPredicate + " GROUP BY platform",
+                rs -> { postCounts.put(rs.getString("platform"), rs.getInt("c")); }, args);
 
         // Aspect aggregates per platform: aspect → [sentiment_sum, mention_count].
-        // SUM() merges the per-keyword rows for every keyword matching the substring.
+        // SUM() merges the per-keyword rows for every keyword the predicate matches.
         Map<String, Map<String, double[]>> byPlatformAgg = new HashMap<>();
         jdbcTemplate.query(
                 "SELECT platform, aspect, SUM(sentiment_sum) AS s, SUM(mention_count) AS n " +
-                "FROM aspect_drivers_agg WHERE keyword ILIKE ? GROUP BY platform, aspect",
+                "FROM aspect_drivers_agg WHERE " + keywordPredicate + " GROUP BY platform, aspect",
                 rs -> {
                     double[] acc = byPlatformAgg
                             .computeIfAbsent(rs.getString("platform"), k -> new HashMap<>())
                             .computeIfAbsent(rs.getString("aspect"), k -> new double[2]);
                     acc[0] += rs.getDouble("s");
                     acc[1] += rs.getInt("n");
-                }, kw);
+                }, args);
 
         // Overall view: merge every platform's aspect aggregates by summing sums and counts.
         Map<String, double[]> overallAspects = new HashMap<>();
@@ -245,7 +313,6 @@ public class ViralSeedController {
 
         // ── Assemble response ─────────────────────────────────────────────────────
         Map<String, Object> response = new LinkedHashMap<>();
-        response.put("keyword", keyword);
 
         int xCount  = postCounts.getOrDefault("x", 0);
         int ytCount = postCounts.getOrDefault("youtube", 0);
@@ -274,8 +341,6 @@ public class ViralSeedController {
 
         return response;
     }
-
-    // ─── Helpers ─────────────────────────────────────────────────────────────────
 
     /**
      * Aggregates a precomputed aspect map into Strengths and Weaknesses lists.
