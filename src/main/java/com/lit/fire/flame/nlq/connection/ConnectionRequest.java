@@ -17,6 +17,14 @@ import java.util.List;
  */
 public class ConnectionRequest {
 
+    /**
+     * Optional logical label for this database (e.g. {@code orders}, {@code billing}). Used to tag the
+     * database in a federated (multi-database) Ask so the model and the response can refer to each
+     * source by name. The {@code DatasourceRegistry} sets it from the {@code ask.db.<name>} section; for
+     * an ad-hoc per-request connection it may be {@code null}, in which case a default is assigned.
+     */
+    private String name;
+
     /** JDBC URL of the target database. Required. Must pass {@link JdbcUrlValidator}. */
     private String jdbcUrl;
 
@@ -54,6 +62,14 @@ public class ConnectionRequest {
         this.username = username;
         this.password = password;
         this.driver = driver;
+    }
+
+    public String getName() {
+        return name;
+    }
+
+    public void setName(String name) {
+        this.name = name;
     }
 
     public String getJdbcUrl() {

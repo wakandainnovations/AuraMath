@@ -889,8 +889,10 @@ A natural-language → database + mathematician engine lives under `com.lit.fire
 question in plain English and a per-request target database connection, it introspects the schema,
 drafts SQL with a pluggable LLM (Claude first), validates and executes it **read-only**, and
 composes an answer. Target connections are fully isolated from AuraMath's own datasource, and
-requests may skip tables/columns. See [`docs/ask-engine/DESIGN.md`](docs/ask-engine/DESIGN.md) for
-the pipeline, guarantees, and the F0–F11 roadmap.
+requests may skip tables/columns. It can also answer across **several** registered databases at once
+(F12), caches their schemas hourly (F13), and falls back to the LLM for formulas not yet in code (F14) —
+all below. See [`docs/ask-engine/DESIGN.md`](docs/ask-engine/DESIGN.md) for the pipeline, guarantees,
+and the F0–F14 roadmap.
 
 The connection layer (F1) is in place. Supported target drivers: PostgreSQL (`jdbc:postgresql:`),
 SQLite (`jdbc:sqlite:`), and MySQL (`jdbc:mysql:`); every connection is opened **read-only** and is
@@ -1004,10 +1006,55 @@ table is not auto-created; DDL in [Operational Notes](#operational-notes)). Ligh
 counters (requests, answers, clarifications, errors, unsafe-SQL rejections, execution timeouts, LLM
 failures) are exposed at `GET /api/ask/admin/metrics` — no Actuator dependency.
 
+Multi-database registry & cross-database answering (F12) let AuraMath answer one question across
+**several** databases. Instead of carrying credentials in every request, the host machine running
+AuraMath holds a `~/config.secrets` file (path = `aura.ask.secrets-path`); at startup
+`nlq.connection.DatasourceRegistry` loads each `ask.db.<name>.*` group into a named, read-only target
+(see [`scripts/config.secrets.example`](scripts/config.secrets.example)). An Ask request is then
+**credential-free** — it sends only a `question`, optionally a `databases` subset (omit for *all*
+registered databases). When more than one database is resolved, the orchestrator opens and introspects
+each, asks the model for **one read-only sub-query per database** (separate JDBC connections cannot be
+JOINed), validates/executes/redacts each against its own database, and the mathematician layer (F7)
+**collates the labeled result sets into a single answer** — computing per-database figures
+deterministically in Java. The response then carries a `subQueries` array (the per-database SQL, tables,
+and row counts) instead of a single `sql`. Backwards compatible: a request that still supplies its own
+`connection` (or a `connections` list) bypasses the registry, and a single resolved database uses the
+original single-DB pipeline unchanged. Fan-out is capped by `aura.ask.max-databases` (default 5).
+
+> **Security trade-off.** By design (opt-in), the registry holds target credentials in the server's
+> memory — a deliberate relaxation of the "credentials only ever per-request" stance, so questions can
+> be asked without shipping credentials each time. Connections are still opened **read-only**, the file
+> should be `chmod 600`, and credentials are never logged or returned (`GET /api/ask/databases` exposes
+> only name, driver, and host).
+
+Hourly schema cache (F13) avoids introspecting every target on every question. A scheduled job
+(`nlq.schema.SchemaRefreshJob`, default hourly via `aura.ask.schema-cache.refresh-interval-ms`)
+introspects each registered database and stores its full structured schema as JSON in a table
+(`ask_schema_cache`, auto-created) in AuraMath's **own** Postgres; the Ask path then answers from the
+cache (`nlq.schema.SchemaCacheService`), filtering it for any per-request skips. It is fail-soft: a
+cache miss or any cache error falls back to live introspection, so the engine still works before the
+first refresh. Execution connections are opened **lazily** — only for the databases a question actually
+queries.
+
+LLM-computed math fallback + formula-gap logging (F14). The mathematician layer (F7) computes catalog
+formulas deterministically in Java. When a question needs a formula **not** in the catalog, instead of
+skipping it the engine asks the LLM to compute that one value from the retrieved rows
+(`nlq.math.LlmComputeService`) and uses it in the answer — the only place the model does arithmetic, and
+only for uncatalogued formulas. Every such use is recorded by `nlq.audit.FormulaGapLogger` (a structured
+log line and, by default, a row in `ask_formula_gap` in AuraMath's own DB) so the formula can be
+implemented in code in a later release. Records carry no credentials and no raw row values beyond the
+one computed figure.
+
+Missing-data clarifications (req #6). When a question can't be answered, the response's
+`clarificationQuestion` is now accompanied by a `missingData` list naming the specific data the
+schema(s) lack (e.g. "a refunds table or a refund-date column"), so callers learn exactly what is
+missing rather than only being re-asked.
+
 | Endpoint                          | Purpose                                                              |
 |-----------------------------------|----------------------------------------------------------------------|
+| `GET /api/ask/databases`          | List the registry's databases available to target (name/driver/host; no creds). (F12) |
 | `POST /api/ask/test-connection`   | Open a read-only connection to a target DB and probe it (`SELECT 1`).|
-| `POST /api/ask`                   | Answer a natural-language question against a target DB, read-only.   |
+| `POST /api/ask`                   | Answer a question against the registry (or an explicit target/targets), read-only; collates across databases. |
 | `GET /api/ask/admin/metrics`      | Operational counters for the Ask engine (counts only). (F10)        |
 
 **`POST /api/ask/test-connection`** — attempts an isolated, read-only connection to the supplied
@@ -1047,14 +1094,43 @@ Response (rejected URL — e.g. `jdbc:h2:mem:test`, returns `400`):
 }
 ```
 
-**`POST /api/ask`** — answer a natural-language `question` against the supplied target database, fully
+**`POST /api/ask`** — answer a natural-language `question` against one or more target databases, fully
 read-only. Runs the whole F1–F7 pipeline and returns the validated SQL that ran, a rows preview, the
 formulas applied, and a natural-language answer. Returns a **clarification** (HTTP `400`) when the
-question can't be answered from the non-skipped schema. The `password` is used only to open the
+question can't be answered from the non-skipped schema. Any `password` is used only to open the
 connection and never appears in the response or logs.
 
-Request (the `connection` object is the same `ConnectionRequest` as `test-connection`; `skipTables`,
-`skipColumns`, `model`, and `maxRows` are optional):
+**Targets are resolved in precedence order:** an explicit `connections` list (federated) → a single
+`connection` → the server-side registry. The registry path (recommended) carries **no credentials** —
+just a `question` and optionally a `databases` subset (omit for all registered databases):
+
+```json
+{ "question": "Compare total order revenue against the total amount we billed.",
+  "databases": ["orders", "billing"] }
+```
+
+When more than one database is resolved, the answer collates across them and the response carries a
+`subQueries` array (per-database SQL/tables/rows) and a `null` top-level `sql`; `tablesUsed` entries are
+prefixed `database.table` and `rowCount` is the total across databases. Example federated response body:
+
+```json
+{
+  "requestId": "f0e1d2c3-...",
+  "answer": "Order revenue was $1,284,000 across the orders DB; billed total was $1,190,500 in billing — a $93,500 gap.",
+  "sql": null,
+  "subQueries": [
+    { "database": "orders",  "sql": "SELECT amount FROM orders LIMIT 1000",  "tablesUsed": ["orders"],   "rowCount": 842, "truncated": false },
+    { "database": "billing", "sql": "SELECT total FROM invoices LIMIT 1000", "tablesUsed": ["invoices"], "rowCount": 611, "truncated": false }
+  ],
+  "tablesUsed": ["orders.orders", "billing.invoices"],
+  "computedValues": { "orders_revenue": 1284000.0, "billed_total": 1190500.0, "gap": 93500.0 },
+  "rowCount": 1453,
+  "truncated": false
+}
+```
+
+For an ad-hoc single database, supply a `connection` object (the same `ConnectionRequest` as
+`test-connection`; `skipTables`, `skipColumns`, `model`, and `maxRows` are optional):
 
 ```json
 {

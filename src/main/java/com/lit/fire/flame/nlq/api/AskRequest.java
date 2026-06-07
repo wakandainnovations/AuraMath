@@ -9,9 +9,15 @@ import java.util.List;
  * The request body for {@code POST /api/ask} — one end-to-end Ask: a natural-language question plus
  * the per-request target database to answer it against, and the tables/columns to keep invisible.
  *
- * <p>The {@link #getConnection() connection} carries the (always read-only, fully isolated) target
- * database details (F1). The {@link #getSkipTables() skipTables} / {@link #getSkipColumns()
- * skipColumns} here are <b>unioned</b> with any carried on the connection and with the server-side
+ * <p><b>Which databases.</b> The target databases are resolved in precedence order: an explicit
+ * {@link #getConnections() connections} list (federated), else a single {@link #getConnection()
+ * connection}, else the server-side registry loaded from {@code ~/config.secrets} — all of it, or the
+ * {@link #getDatabases() databases} subset. The registry path is credential-free: the request carries
+ * only a question. When more than one database is resolved, the engine answers each with its own safe
+ * query and collates the results into one answer.
+ *
+ * <p>The {@link #getSkipTables() skipTables} / {@link #getSkipColumns() skipColumns} here are
+ * <b>unioned</b> with any carried on each connection and with the server-side
  * {@code aura.ask.default-skip-tables}; the union is removed from the schema the model sees and
  * re-enforced at validation/execution, so skipped objects can be neither seen nor touched.
  *
@@ -21,8 +27,28 @@ import java.util.List;
  */
 public class AskRequest {
 
-    /** The target database to answer against. Required. Never AuraMath's own datasource. */
+    /**
+     * A single ad-hoc target database to answer against. Optional. When set (and {@link #connections}
+     * is empty) the engine answers against just this database — the original single-database behaviour.
+     * Never AuraMath's own datasource.
+     */
     private ConnectionRequest connection;
+
+    /**
+     * Multiple ad-hoc target databases to answer across, each with its own credentials and optional
+     * {@code name}. Optional; when non-empty it takes precedence over {@link #connection} and triggers
+     * the federated (cross-database) path. Most callers instead leave both connection fields empty and
+     * use the server-side registry via {@link #databases}.
+     */
+    private List<ConnectionRequest> connections = new ArrayList<>();
+
+    /**
+     * Names of server-registered databases (from {@code ~/config.secrets}) to answer against. Used only
+     * when no explicit {@link #connection}/{@link #connections} are supplied: an empty list means "all
+     * registered databases", a non-empty list selects that subset. This is the credential-free path —
+     * the request carries no connection details at all.
+     */
+    private List<String> databases = new ArrayList<>();
 
     /** The natural-language question. Required. */
     private String question;
@@ -48,6 +74,22 @@ public class AskRequest {
 
     public void setConnection(ConnectionRequest connection) {
         this.connection = connection;
+    }
+
+    public List<ConnectionRequest> getConnections() {
+        return connections;
+    }
+
+    public void setConnections(List<ConnectionRequest> connections) {
+        this.connections = (connections == null) ? new ArrayList<>() : connections;
+    }
+
+    public List<String> getDatabases() {
+        return databases;
+    }
+
+    public void setDatabases(List<String> databases) {
+        this.databases = (databases == null) ? new ArrayList<>() : databases;
     }
 
     public String getQuestion() {

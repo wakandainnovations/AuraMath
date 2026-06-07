@@ -42,6 +42,12 @@ public final class AskResponse {
     private final boolean clarificationNeeded;
     private final String clarificationQuestion;
 
+    /**
+     * When the engine cannot answer (clarification), the specific data the question needs but the
+     * schema(s) do not provide — e.g. "a refund-date column", "a costs table". Empty for an answer.
+     */
+    private final List<String> missingData;
+
     private final String answer;
     private final String sql;
     private final List<String> tablesUsed;
@@ -52,17 +58,25 @@ public final class AskResponse {
     private final int rowCount;
     private final boolean truncated;
 
+    /**
+     * For a federated (multi-database) answer, the per-database queries that ran (database, SQL, tables,
+     * row count). Empty for a single-database answer or a clarification — then the top-level
+     * {@link #getSql() sql}/{@link #getTablesUsed() tablesUsed} describe the one query, exactly as before.
+     */
+    private final List<SubQueryInfo> subQueries;
+
     /** Per-stage wall-clock timings in milliseconds (connect, introspect, generate, …, total). */
     private final Map<String, Long> timingMillis;
 
     private AskResponse(String requestId, boolean clarificationNeeded, String clarificationQuestion,
-                        String answer, String sql, List<String> tablesUsed,
+                        List<String> missingData, String answer, String sql, List<String> tablesUsed,
                         List<AppliedFormula> formulasApplied, Map<String, Double> computedValues,
                         List<String> assumptions, List<Map<String, Object>> rowsPreview, int rowCount,
-                        boolean truncated, Map<String, Long> timingMillis) {
+                        boolean truncated, List<SubQueryInfo> subQueries, Map<String, Long> timingMillis) {
         this.requestId = requestId;
         this.clarificationNeeded = clarificationNeeded;
         this.clarificationQuestion = clarificationQuestion;
+        this.missingData = copyList(missingData);
         this.answer = answer;
         this.sql = sql;
         this.tablesUsed = copyList(tablesUsed);
@@ -74,6 +88,7 @@ public final class AskResponse {
         this.rowsPreview = copyRows(rowsPreview);
         this.rowCount = rowCount;
         this.truncated = truncated;
+        this.subQueries = copyList(subQueries);
         this.timingMillis = (timingMillis == null)
                 ? Collections.emptyMap()
                 : Collections.unmodifiableMap(new LinkedHashMap<>(timingMillis));
@@ -87,20 +102,38 @@ public final class AskResponse {
     public static AskResponse answered(String requestId, AskAnswer answer, String executedSql,
                                        List<String> tablesUsed, boolean truncated, int rowCount,
                                        Map<String, Long> timingMillis) {
-        return new AskResponse(requestId, false, null,
+        return new AskResponse(requestId, false, null, null,
                 answer.getAnswer(), executedSql, tablesUsed, answer.getFormulasApplied(),
                 answer.getComputedValues(), answer.getAssumptions(), answer.getRowsPreview(),
-                rowCount, truncated, timingMillis);
+                rowCount, truncated, null, timingMillis);
+    }
+
+    /**
+     * Build a federated (multi-database) answer. The collated {@link AskAnswer} supplies the NL answer,
+     * formulas, computed values, assumptions, and combined rows preview; {@code subQueries} carries the
+     * per-database SQL that ran. The top-level {@link #getSql() sql} is {@code null} (there are several);
+     * {@code tablesUsed} is the {@code database.table} union and {@code rowCount} the total across DBs.
+     */
+    public static AskResponse answeredFederated(String requestId, AskAnswer answer,
+                                                List<SubQueryInfo> subQueries, List<String> tablesUsed,
+                                                boolean truncated, int rowCount,
+                                                Map<String, Long> timingMillis) {
+        return new AskResponse(requestId, false, null, null,
+                answer.getAnswer(), null, tablesUsed, answer.getFormulasApplied(),
+                answer.getComputedValues(), answer.getAssumptions(), answer.getRowsPreview(),
+                rowCount, truncated, subQueries, timingMillis);
     }
 
     /**
      * Build a clarification response: no SQL was generated or executed, so only the question to put
-     * back to the caller (and the tables the model reported considering) are carried.
+     * back to the caller, the tables the model reported considering, and the specific
+     * {@code missingData} the question needs but the schema(s) lack are carried.
      */
     public static AskResponse clarification(String requestId, String clarificationQuestion,
-                                            List<String> tablesUsed, Map<String, Long> timingMillis) {
-        return new AskResponse(requestId, true, clarificationQuestion,
-                null, null, tablesUsed, null, null, null, null, 0, false, timingMillis);
+                                            List<String> tablesUsed, List<String> missingData,
+                                            Map<String, Long> timingMillis) {
+        return new AskResponse(requestId, true, clarificationQuestion, missingData,
+                null, null, tablesUsed, null, null, null, null, 0, false, null, timingMillis);
     }
 
     /** The correlation id shared with the audit log; never {@code null}. */
@@ -116,6 +149,11 @@ public final class AskResponse {
     /** The question to put back to the caller when {@link #isClarificationNeeded()}; {@code null} otherwise. */
     public String getClarificationQuestion() {
         return clarificationQuestion;
+    }
+
+    /** The specific data the question needs but the schema(s) do not provide; never {@code null}. */
+    public List<String> getMissingData() {
+        return missingData;
     }
 
     /** The natural-language answer, or {@code null} for a clarification. */
@@ -161,6 +199,11 @@ public final class AskResponse {
     /** {@code true} when the result filled the row cap and more rows may exist. */
     public boolean isTruncated() {
         return truncated;
+    }
+
+    /** Per-database queries that ran for a federated answer; empty for single-DB answers; never {@code null}. */
+    public List<SubQueryInfo> getSubQueries() {
+        return subQueries;
     }
 
     /** Per-stage wall-clock timings in milliseconds; never {@code null}. */

@@ -7,11 +7,13 @@ import com.lit.fire.flame.nlq.audit.AskMetrics;
 import com.lit.fire.flame.nlq.audit.LlmUsageRecorder;
 import com.lit.fire.flame.nlq.config.AskEngineProperties;
 import com.lit.fire.flame.nlq.connection.ConnectionRequest;
+import com.lit.fire.flame.nlq.connection.DatasourceRegistry;
 import com.lit.fire.flame.nlq.connection.DynamicConnectionFactory;
 import com.lit.fire.flame.nlq.llm.LlmClient;
 import com.lit.fire.flame.nlq.llm.LlmRequest;
 import com.lit.fire.flame.nlq.llm.LlmResponse;
 import com.lit.fire.flame.nlq.math.AnswerSynthesisService;
+import com.lit.fire.flame.nlq.schema.SchemaCacheService;
 import com.lit.fire.flame.nlq.schema.SchemaIntrospector;
 import com.lit.fire.flame.nlq.schema.SchemaRenderer;
 import com.lit.fire.flame.nlq.sql.QueryExecutionService;
@@ -118,7 +120,9 @@ class AskOrchestratorTest {
         // and an unwrapped token recorder (the stub LLM is not the RecordingLlmClient, so tokens stay 0).
         return new AskOrchestrator(
                 new DynamicConnectionFactory(properties),
+                DatasourceRegistry.empty(),
                 new SchemaIntrospector(),
+                new SchemaCacheService(properties, null),
                 new SqlGenerationService(renderer, llm, properties),
                 guard,
                 new QueryExecutionService(guard, properties),
@@ -228,7 +232,9 @@ class AskOrchestratorTest {
         AskMetrics metrics = new AskMetrics();
         AskOrchestrator orchestrator = new AskOrchestrator(
                 new DynamicConnectionFactory(properties),
+                DatasourceRegistry.empty(),
                 new SchemaIntrospector(),
+                new SchemaCacheService(properties, null),
                 new SqlGenerationService(renderer, llm, properties),
                 guard,
                 new QueryExecutionService(guard, properties),
@@ -280,6 +286,29 @@ class AskOrchestratorTest {
         assertTrue(generationPrompt.contains("TABLE users"), "visible table should be in the schema");
         assertFalse(generationPrompt.contains("TABLE secrets"),
                 "the skipped table must not appear in the schema shown to the model");
+    }
+
+    // --- F-missing-data: a clarification reports the specific data that is missing ----------------
+
+    @Test
+    void clarificationCarriesMissingData() throws Exception {
+        JsonObject clarify = new JsonObject();
+        clarify.addProperty("sql", "");
+        clarify.add("tablesUsed", new JsonArray());
+        clarify.add("assumptions", new JsonArray());
+        clarify.addProperty("clarificationNeeded", true);
+        clarify.addProperty("clarificationQuestion", "What counts as a refund?");
+        JsonArray missing = new JsonArray();
+        missing.add("a refunds table or a refund-date column");
+        clarify.add("missingData", missing);
+
+        RoutingLlmClient llm = new RoutingLlmClient(clarify, meanPlan("score"), answerText("unused"));
+
+        AskResponse response = orchestrator(llm, new AskEngineProperties())
+                .ask(request("how many orders were refunded last month"));
+
+        assertTrue(response.isClarificationNeeded());
+        assertEquals(List.of("a refunds table or a refund-date column"), response.getMissingData());
     }
 
     // --- F9: a masked column can be counted, but its raw values can never be projected ----------

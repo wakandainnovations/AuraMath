@@ -51,8 +51,30 @@ public class AskEngineProperties {
     /** Audit logging &amp; observability settings (F10). */
     private Audit audit = new Audit();
 
+    /** Hourly schema-cache settings (F13). */
+    private SchemaCache schemaCache = new SchemaCache();
+
+    /** Formula-gap logging settings (F14) — captures LLM-computed formulas not yet in the code catalog. */
+    private FormulaGap formulaGap = new FormulaGap();
+
     /** Selected LLM provider behind the {@code LlmClient} interface (e.g. "claude"). */
     private String llmProvider = "claude";
+
+    /**
+     * Path to the host-side credential file the {@code DatasourceRegistry} loads at startup. It holds
+     * the named target databases the engine may answer against, as {@code ask.db.<name>.*} groups (so
+     * credentials never travel in a request or live in the repo). Defaults to {@code config.secrets}
+     * in the home directory of the user running AuraMath. A missing file simply means an empty
+     * registry — the per-request connection path still works.
+     */
+    private String secretsPath = System.getProperty("user.home") + "/config.secrets";
+
+    /**
+     * Upper bound on how many databases a single Ask may fan out to. Caps both the registry-driven
+     * federated path and an explicit multi-connection request, so one question cannot open an
+     * unbounded number of target connections.
+     */
+    private int maxDatabases = 5;
 
     public boolean isEnabled() {
         return enabled;
@@ -126,12 +148,44 @@ public class AskEngineProperties {
         this.audit = audit;
     }
 
+    public SchemaCache getSchemaCache() {
+        return schemaCache;
+    }
+
+    public void setSchemaCache(SchemaCache schemaCache) {
+        this.schemaCache = schemaCache;
+    }
+
+    public FormulaGap getFormulaGap() {
+        return formulaGap;
+    }
+
+    public void setFormulaGap(FormulaGap formulaGap) {
+        this.formulaGap = formulaGap;
+    }
+
     public String getLlmProvider() {
         return llmProvider;
     }
 
     public void setLlmProvider(String llmProvider) {
         this.llmProvider = llmProvider;
+    }
+
+    public String getSecretsPath() {
+        return secretsPath;
+    }
+
+    public void setSecretsPath(String secretsPath) {
+        this.secretsPath = secretsPath;
+    }
+
+    public int getMaxDatabases() {
+        return maxDatabases;
+    }
+
+    public void setMaxDatabases(int maxDatabases) {
+        this.maxDatabases = maxDatabases;
     }
 
     /**
@@ -193,6 +247,91 @@ public class AskEngineProperties {
 
         /** Target table for persisted audit records (in AuraMath's own database). */
         private String table = "ask_audit_log";
+
+        public boolean isPersist() {
+            return persist;
+        }
+
+        public void setPersist(boolean persist) {
+            this.persist = persist;
+        }
+
+        public String getTable() {
+            return table;
+        }
+
+        public void setTable(String table) {
+            this.table = table;
+        }
+    }
+
+    /**
+     * Hourly schema-cache configuration (bound from {@code aura.ask.schema-cache}) (F13). When enabled,
+     * a scheduled job introspects every registered database and stores its structured schema in a table
+     * in AuraMath's own database; the Ask path then answers from the cache instead of introspecting the
+     * target live on every request. The table is auto-created (it is AuraMath's own internal table).
+     */
+    public static class SchemaCache {
+
+        /** Master toggle for the schema cache + its refresh job. */
+        private boolean enabled = true;
+
+        /** Table (in AuraMath's own database) holding the cached per-database schemas. Auto-created. */
+        private String table = "ask_schema_cache";
+
+        /** How often the refresh job re-introspects every registered database, in milliseconds. */
+        private long refreshIntervalMs = 3_600_000L;
+
+        /** When a database is not yet cached, introspect it live for that request rather than failing. */
+        private boolean fallbackToLive = true;
+
+        public boolean isEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(boolean enabled) {
+            this.enabled = enabled;
+        }
+
+        public String getTable() {
+            return table;
+        }
+
+        public void setTable(String table) {
+            this.table = table;
+        }
+
+        public long getRefreshIntervalMs() {
+            return refreshIntervalMs;
+        }
+
+        public void setRefreshIntervalMs(long refreshIntervalMs) {
+            this.refreshIntervalMs = refreshIntervalMs;
+        }
+
+        public boolean isFallbackToLive() {
+            return fallbackToLive;
+        }
+
+        public void setFallbackToLive(boolean fallbackToLive) {
+            this.fallbackToLive = fallbackToLive;
+        }
+    }
+
+    /**
+     * Formula-gap logging configuration (bound from {@code aura.ask.formula-gap}) (F14). Whenever the
+     * mathematician layer has to ask the LLM to compute a formula that is not in the deterministic code
+     * catalog, a structured record is logged (always) and — when {@link #isPersist() persist} is true
+     * (the default) — written to a table in AuraMath's own database, so those formulas can be promoted
+     * into code in a later release. The table is auto-created.
+     */
+    public static class FormulaGap {
+
+        /** Also persist each formula-gap record to {@link #getTable()} in AuraMath's own database. */
+        private boolean persist = true;
+
+        /** Table (in AuraMath's own database) holding logged formula gaps. Auto-created. */
+        private String table = "ask_formula_gap";
 
         public boolean isPersist() {
             return persist;

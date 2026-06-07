@@ -4,6 +4,8 @@ import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import com.lit.fire.flame.nlq.audit.FormulaGapLogger;
+import com.lit.fire.flame.nlq.audit.FormulaGapRecord;
 import com.lit.fire.flame.nlq.llm.LlmClient;
 import com.lit.fire.flame.nlq.llm.LlmException;
 import com.lit.fire.flame.nlq.llm.LlmRequest;
@@ -60,13 +62,33 @@ public class AnswerSynthesisService {
 
     private final LlmClient llmClient;
     private final FormulaEvaluator evaluator;
+    private final LlmComputeService llmComputeService;
+    private final FormulaGapLogger formulaGapLogger;
     private final Gson gson = new Gson();
     private final String planPrompt;
     private final String narrativePrompt;
 
+    /**
+     * Convenience constructor with the LLM-compute fallback disabled — only the deterministic catalog is
+     * used (a formula outside it is skipped, as before). Used by tests and programmatic callers.
+     */
     public AnswerSynthesisService(LlmClient llmClient) {
+        this(llmClient, null, null);
+    }
+
+    /**
+     * @param llmComputeService fallback that computes uncatalogued formulas via the LLM (F14); when
+     *                          {@code null} the fallback is disabled
+     * @param formulaGapLogger  records each LLM-computed formula for later cataloging; may be {@code null}
+     */
+    @org.springframework.beans.factory.annotation.Autowired
+    public AnswerSynthesisService(LlmClient llmClient,
+                                  @org.springframework.lang.Nullable LlmComputeService llmComputeService,
+                                  @org.springframework.lang.Nullable FormulaGapLogger formulaGapLogger) {
         this.llmClient = llmClient;
         this.evaluator = new FormulaEvaluator();
+        this.llmComputeService = llmComputeService;
+        this.formulaGapLogger = formulaGapLogger;
         this.planPrompt = loadResource(PLAN_PROMPT_RESOURCE);
         this.narrativePrompt = loadResource(NARRATIVE_PROMPT_RESOURCE);
     }
@@ -83,18 +105,25 @@ public class AnswerSynthesisService {
      */
     public AskAnswer answer(String question, SqlGenerationResult generation, QueryResult execution)
             throws LlmException {
-        return answer(question, generation, execution, null);
+        return answer(question, generation, execution, null, null);
+    }
+
+    /** As {@link #answer(String, SqlGenerationResult, QueryResult)} with a model override and no requestId. */
+    public AskAnswer answer(String question, SqlGenerationResult generation, QueryResult execution,
+                            String modelId) throws LlmException {
+        return answer(question, generation, execution, modelId, null);
     }
 
     /**
      * As {@link #answer(String, SqlGenerationResult, QueryResult)}, but using {@code modelId} for the
-     * plan and narrative model calls when it is non-blank (otherwise the {@link LlmClient}'s default
-     * model is used).
+     * plan and narrative model calls when it is non-blank, and tagging any formula-gap record (F14) with
+     * {@code requestId}.
      *
-     * @param modelId optional model id override; {@code null}/blank falls back to the client default
+     * @param modelId   optional model id override; {@code null}/blank falls back to the client default
+     * @param requestId correlation id for formula-gap logging; may be {@code null}
      */
     public AskAnswer answer(String question, SqlGenerationResult generation, QueryResult execution,
-                            String modelId) throws LlmException {
+                            String modelId, String requestId) throws LlmException {
         if (question == null || question.trim().isEmpty()) {
             throw new IllegalArgumentException("question is required");
         }
@@ -133,21 +162,205 @@ public class AnswerSynthesisService {
                     .build();
         }
 
-        FormulaEvaluator.Result evaluated = evaluator.evaluate(plan, execution);
+        Computation comp = runPlan(plan, execution, preview, q, model, requestId);
         assumptions.addAll(plan.getNotes());
-        assumptions.addAll(evaluated.getIssues());
+        assumptions.addAll(comp.issues);
 
-        String narrative = requestNarrative(q, evaluated.getFormulasApplied(),
-                evaluated.getComputedValues(), preview, model);
+        String narrative = requestNarrative(q, comp.formulasApplied, comp.computedValues, preview, model);
 
         return AskAnswer.builder()
                 .answer(narrative)
-                .formulasApplied(evaluated.getFormulasApplied())
-                .computedValues(evaluated.getComputedValues())
+                .formulasApplied(comp.formulasApplied)
+                .computedValues(comp.computedValues)
                 .sql(sql)
                 .assumptions(assumptions)
                 .rowsPreview(preview)
                 .build();
+    }
+
+    /**
+     * Synthesize one answer that <b>collates across several databases</b> (the federated path). Each
+     * {@link LabeledResult} is one database's redacted rows; they are combined into a single view whose
+     * columns are namespaced {@code <database>.<column>} so the {@link FormulaEvaluator} computes
+     * per-database aggregates deterministically (a value missing for a row from another database is
+     * simply skipped), while the narrative is shown which database each row came from so the LLM can
+     * reason across them.
+     *
+     * <p>The result carries no single {@code sql} — the executed per-database queries are surfaced
+     * separately on the response. Mirrors {@link #answer} otherwise: a fully empty result set yields a
+     * factual "no data", and a pure-lookup plan answers straight from the rows.
+     *
+     * @param priorAssumptions assumptions gathered during federated SQL generation (may be {@code null})
+     * @param results          one labeled, already-redacted result set per database
+     * @param modelId          optional model id override; {@code null}/blank uses the client default
+     */
+    public AskAnswer answerFederated(String question, List<String> priorAssumptions,
+                                     List<LabeledResult> results, String modelId) throws LlmException {
+        return answerFederated(question, priorAssumptions, results, modelId, null);
+    }
+
+    /**
+     * As {@link #answerFederated(String, List, List, String)}, but tagging any formula-gap record (F14)
+     * with {@code requestId}.
+     */
+    public AskAnswer answerFederated(String question, List<String> priorAssumptions,
+                                     List<LabeledResult> results, String modelId, String requestId)
+            throws LlmException {
+        if (question == null || question.trim().isEmpty()) {
+            throw new IllegalArgumentException("question is required");
+        }
+        Objects.requireNonNull(results, "results");
+        String q = question.trim();
+        String model = blankToNull(modelId);
+
+        List<String> assumptions = new ArrayList<>();
+        if (priorAssumptions != null) {
+            assumptions.addAll(priorAssumptions);
+        }
+
+        QueryResult combined = combine(results);
+        List<Map<String, Object>> preview = preview(combined);
+
+        int totalRows = 0;
+        for (LabeledResult r : results) {
+            totalRows += r.getResult().getRowCount();
+        }
+
+        // Short-circuit 1 — no rows anywhere: a factual "no data", never a fabricated figure.
+        if (totalRows == 0) {
+            return AskAnswer.builder()
+                    .answer("No data: every database returned no rows, so there is nothing to compute.")
+                    .assumptions(assumptions)
+                    .rowsPreview(preview)
+                    .build();
+        }
+
+        ComputationPlan plan = requestPlan(q, combined, model);
+
+        // Short-circuit 2 — pure lookup (no math): answer straight from the labeled rows.
+        if (plan.isLookupOnly() || plan.getOperations().isEmpty()) {
+            assumptions.addAll(plan.getNotes());
+            String narrative = requestNarrative(q, new ArrayList<>(), new LinkedHashMap<>(), preview, model);
+            return AskAnswer.builder()
+                    .answer(narrative)
+                    .assumptions(assumptions)
+                    .rowsPreview(preview)
+                    .build();
+        }
+
+        Computation comp = runPlan(plan, combined, preview, q, model, requestId);
+        assumptions.addAll(plan.getNotes());
+        assumptions.addAll(comp.issues);
+
+        String narrative = requestNarrative(q, comp.formulasApplied, comp.computedValues, preview, model);
+
+        return AskAnswer.builder()
+                .answer(narrative)
+                .formulasApplied(comp.formulasApplied)
+                .computedValues(comp.computedValues)
+                .assumptions(assumptions)
+                .rowsPreview(preview)
+                .build();
+    }
+
+    /**
+     * Evaluate the plan deterministically (F7), then — when the LLM-compute fallback is wired (F14) —
+     * compute each operation whose formula is not in the code catalog via the LLM, merge its value, and
+     * log a formula gap. When the fallback is disabled the whole plan goes to the evaluator (uncatalogued
+     * formulas are skipped with a note, as before).
+     */
+    private Computation runPlan(ComputationPlan plan, QueryResult execution,
+                                List<Map<String, Object>> preview, String question, String model,
+                                String requestId) throws LlmException {
+        boolean fallback = (llmComputeService != null);
+
+        List<ComputationPlan.Operation> forEvaluator = new ArrayList<>();
+        List<ComputationPlan.Operation> forLlm = new ArrayList<>();
+        for (ComputationPlan.Operation op : plan.getOperations()) {
+            if (fallback && !FormulaEvaluator.isSupported(op.getFormula())) {
+                forLlm.add(op);
+            } else {
+                forEvaluator.add(op);
+            }
+        }
+
+        FormulaEvaluator.Result evaluated = evaluator.evaluate(
+                new ComputationPlan(plan.isLookupOnly(), forEvaluator, plan.getNotes()), execution);
+        Map<String, Double> computed = new LinkedHashMap<>(evaluated.getComputedValues());
+        List<AppliedFormula> applied = new ArrayList<>(evaluated.getFormulasApplied());
+        List<String> issues = new ArrayList<>(evaluated.getIssues());
+
+        for (ComputationPlan.Operation op : forLlm) {
+            String name = (op.getName() == null || op.getName().trim().isEmpty())
+                    ? op.getFormula() : op.getName().trim();
+            LlmComputeService.Computed result = llmComputeService.compute(question, op, preview, model);
+            if (result == null) {
+                issues.add("Could not compute '" + name + "': formula '" + op.getFormula()
+                        + "' is not in the code catalog and the model could not compute it from the data.");
+                continue;
+            }
+            computed.put(name, result.getValue());
+            Map<String, Object> inputs = new LinkedHashMap<>();
+            inputs.put("columns", op.getColumns());
+            inputs.put("source", "llm");
+            String expression = (result.getExpression() == null || result.getExpression().isBlank())
+                    ? op.getFormula() + "(" + String.join(", ", op.getColumns()) + ")"
+                    : result.getExpression();
+            applied.add(new AppliedFormula(name, expression, inputs, result.getValue()));
+            if (result.getExplanation() != null && !result.getExplanation().isBlank()) {
+                issues.add(name + ": computed by the model — " + result.getExplanation());
+            }
+            if (formulaGapLogger != null) {
+                formulaGapLogger.record(new FormulaGapRecord(requestId, question, op.getFormula(),
+                        op.getDescription(), expression, op.getColumns(), result.getValue()));
+            }
+        }
+        return new Computation(computed, applied, issues);
+    }
+
+    /** The merged outcome of the deterministic + LLM-fallback computation. */
+    private static final class Computation {
+        private final Map<String, Double> computedValues;
+        private final List<AppliedFormula> formulasApplied;
+        private final List<String> issues;
+
+        Computation(Map<String, Double> computedValues, List<AppliedFormula> formulasApplied,
+                    List<String> issues) {
+            this.computedValues = computedValues;
+            this.formulasApplied = formulasApplied;
+            this.issues = issues;
+        }
+    }
+
+    /**
+     * Fold the per-database result sets into one {@link QueryResult}: columns become
+     * {@code <database>.<column>} (the union across databases), and each row carries a {@code _database}
+     * label plus only its own database's namespaced cells. Because a row from one database has no key
+     * for another's columns, single-column statistics aggregate strictly within their database.
+     */
+    private QueryResult combine(List<LabeledResult> results) {
+        List<QueryResult.Column> columns = new ArrayList<>();
+        List<Map<String, Object>> rows = new ArrayList<>();
+        boolean truncated = false;
+        long executionMillis = 0L;
+        for (LabeledResult labeled : results) {
+            String db = labeled.getDatabase();
+            QueryResult r = labeled.getResult();
+            truncated = truncated || r.isTruncated();
+            executionMillis += r.getExecutionMillis();
+            for (QueryResult.Column c : r.getColumns()) {
+                columns.add(new QueryResult.Column(db + "." + c.getName(), c.getSqlType(), c.getTypeName()));
+            }
+            for (Map<String, Object> row : r.getRows()) {
+                Map<String, Object> out = new LinkedHashMap<>();
+                out.put("_database", db);
+                for (Map.Entry<String, Object> e : row.entrySet()) {
+                    out.put(db + "." + e.getKey(), e.getValue());
+                }
+                rows.add(out);
+            }
+        }
+        return new QueryResult(columns, rows, truncated, executionMillis);
     }
 
     // --- step 2a: ask for a computation plan -----------------------------------------------
@@ -422,6 +635,27 @@ public class AnswerSynthesisService {
             return new String(in.readAllBytes(), StandardCharsets.UTF_8);
         } catch (IOException e) {
             throw new IllegalStateException("failed to load prompt resource: " + path, e);
+        }
+    }
+
+    /** One database's redacted result set, tagged with its logical name, for {@link #answerFederated}. */
+    public static final class LabeledResult {
+        private final String database;
+        private final QueryResult result;
+
+        public LabeledResult(String database, QueryResult result) {
+            this.database = database;
+            this.result = result;
+        }
+
+        /** The logical database name this result came from; never {@code null}. */
+        public String getDatabase() {
+            return database;
+        }
+
+        /** The (already skip-list-redacted) rows from that database; never {@code null}. */
+        public QueryResult getResult() {
+            return result;
         }
     }
 }

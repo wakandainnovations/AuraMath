@@ -29,16 +29,18 @@ public final class SqlGenerationResult {
     private final Double confidence;
     private final boolean clarificationNeeded;
     private final String clarificationQuestion;
+    private final List<String> missingData;
 
     private SqlGenerationResult(String sql, List<String> tablesUsed, List<String> assumptions,
                                 Double confidence, boolean clarificationNeeded,
-                                String clarificationQuestion) {
+                                String clarificationQuestion, List<String> missingData) {
         this.sql = sql;
         this.tablesUsed = copy(tablesUsed);
         this.assumptions = copy(assumptions);
         this.confidence = confidence;
         this.clarificationNeeded = clarificationNeeded;
         this.clarificationQuestion = clarificationQuestion;
+        this.missingData = copy(missingData);
     }
 
     private static List<String> copy(List<String> in) {
@@ -50,19 +52,21 @@ public final class SqlGenerationResult {
     /** A drafted (still-unvalidated) read-only query and its supporting metadata. */
     public static SqlGenerationResult ofSql(String sql, List<String> tablesUsed,
                                             List<String> assumptions, Double confidence) {
-        return new SqlGenerationResult(sql, tablesUsed, assumptions, confidence, false, null);
+        return new SqlGenerationResult(sql, tablesUsed, assumptions, confidence, false, null, null);
     }
 
     /**
      * A clarification request: no SQL was produced because the question could not be answered from
-     * the schema (or referenced something not in it).
+     * the schema (or referenced something not in it). {@code missingData} names the specific data the
+     * question needs but the schema does not provide (may be empty).
      */
     public static SqlGenerationResult needingClarification(String clarificationQuestion,
                                                            List<String> tablesUsed,
                                                            List<String> assumptions,
-                                                           Double confidence) {
+                                                           Double confidence,
+                                                           List<String> missingData) {
         return new SqlGenerationResult(null, tablesUsed, assumptions, confidence, true,
-                clarificationQuestion);
+                clarificationQuestion, missingData);
     }
 
     /** The drafted query, or {@code null} when {@link #isClarificationNeeded()} is {@code true}. */
@@ -93,5 +97,10 @@ public final class SqlGenerationResult {
     /** The question to ask when {@link #isClarificationNeeded()} is {@code true}; {@code null} otherwise. */
     public String getClarificationQuestion() {
         return clarificationQuestion;
+    }
+
+    /** The specific data the question needs but the schema does not provide; never {@code null}. */
+    public List<String> getMissingData() {
+        return missingData;
     }
 }

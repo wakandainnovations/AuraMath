@@ -9,6 +9,7 @@ import com.lit.fire.flame.nlq.llm.LlmException;
 import com.lit.fire.flame.nlq.llm.LlmRequest;
 import com.lit.fire.flame.nlq.llm.LlmResponse;
 import com.lit.fire.flame.nlq.schema.DatabaseSchema;
+import com.lit.fire.flame.nlq.schema.NamedSchema;
 import com.lit.fire.flame.nlq.schema.SchemaRenderer;
 import com.lit.fire.flame.nlq.schema.TableInfo;
 import org.slf4j.Logger;
@@ -19,9 +20,11 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 
@@ -45,15 +48,22 @@ public class SqlGenerationService {
 
     /** Classpath location of the system-prompt template (placeholders {@code ${dialect}}, {@code ${maxRows}}). */
     private static final String SYSTEM_PROMPT_RESOURCE = "/nlq/sql_generation_system.txt";
+    /** Classpath location of the federated (multi-database) system-prompt template ({@code ${maxRows}}). */
+    private static final String FEDERATED_SYSTEM_PROMPT_RESOURCE = "/nlq/sql_generation_federated_system.txt";
     /** Output cap — a single SQL statement plus its small metadata comfortably fits. */
     private static final int MAX_OUTPUT_TOKENS = 2048;
+    /** Output cap for the federated plan — several sub-queries plus metadata. */
+    private static final int FEDERATED_MAX_OUTPUT_TOKENS = 4096;
     /** Name advertised for the structured-output tool. */
     private static final String TOOL_NAME = "emit_sql";
+    /** Name advertised for the federated structured-output tool. */
+    private static final String FEDERATED_TOOL_NAME = "emit_federated_sql";
 
     private final SchemaRenderer schemaRenderer;
     private final LlmClient llmClient;
     private final AskEngineProperties properties;
     private final String systemPromptTemplate;
+    private final String federatedSystemPromptTemplate;
 
     public SqlGenerationService(SchemaRenderer schemaRenderer, LlmClient llmClient,
                                 AskEngineProperties properties) {
@@ -61,6 +71,7 @@ public class SqlGenerationService {
         this.llmClient = llmClient;
         this.properties = properties;
         this.systemPromptTemplate = loadResource(SYSTEM_PROMPT_RESOURCE);
+        this.federatedSystemPromptTemplate = loadResource(FEDERATED_SYSTEM_PROMPT_RESOURCE);
     }
 
     /**
@@ -126,11 +137,157 @@ public class SqlGenerationService {
                 + "Question:\n" + question + "\n";
     }
 
+    /**
+     * Draft one read-only sub-query per database needed to answer {@code question} across several
+     * independent {@code schemas} (the federated, multi-database path). Because separate JDBC
+     * connections cannot be joined, the model emits at most one query per database; downstream layers
+     * validate (F5), execute (F6), and collate the results (F7).
+     *
+     * @param schemas the skip-list-filtered schemas, each tagged with its logical database name
+     * @param modelId optional model id override; {@code null}/blank falls back to the client default
+     * @return a federated plan of per-database sub-queries, or one flagged
+     *         {@link FederatedSqlPlan#isClarificationNeeded()}
+     * @throws LlmException if the model call fails or returns no structured output
+     */
+    public FederatedSqlPlan generateFederated(String question, List<NamedSchema> schemas, String modelId)
+            throws LlmException {
+        if (question == null || question.trim().isEmpty()) {
+            throw new IllegalArgumentException("question is required");
+        }
+        if (schemas == null || schemas.isEmpty()) {
+            throw new IllegalArgumentException("at least one schema is required");
+        }
+
+        int maxRows = properties.getMaxRows();
+        String systemPrompt = federatedSystemPromptTemplate.replace("${maxRows}", Integer.toString(maxRows));
+        String userPrompt = buildFederatedUserPrompt(question.trim(), schemas);
+
+        LlmRequest request = LlmRequest.builder()
+                .systemPrompt(systemPrompt)
+                .userPrompt(userPrompt)
+                .jsonSchema(buildFederatedSchema())
+                .structuredToolName(FEDERATED_TOOL_NAME)
+                .maxTokens(FEDERATED_MAX_OUTPUT_TOKENS)
+                .modelId(blankToNull(modelId))
+                .build();
+
+        log.debug("Generating federated SQL over {} database(s), maxRows={}", schemas.size(), maxRows);
+
+        LlmResponse response = llmClient.complete(request);
+        JsonObject json = response.getStructuredJson();
+        if (json == null) {
+            throw new LlmException(LlmException.Kind.BAD_RESPONSE,
+                    "model did not return structured federated SQL output");
+        }
+        return enforceFederated(parseFederated(json), schemas);
+    }
+
+    private String buildFederatedUserPrompt(String question, List<NamedSchema> schemas) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("There are ").append(schemas.size())
+                .append(" separate databases. They cannot be joined to each other.\n\n");
+        for (NamedSchema named : schemas) {
+            DatabaseSchema schema = named.getSchema();
+            String dialect = (schema.getDialect() == null || schema.getDialect().isEmpty())
+                    ? "sql" : schema.getDialect();
+            sb.append("=== database: ").append(named.getName())
+                    .append(" (dialect: ").append(dialect).append(") ===\n")
+                    .append(schemaRenderer.render(schema)).append('\n');
+        }
+        sb.append("Question:\n").append(question).append('\n');
+        return sb.toString();
+    }
+
+    /** Map the model's structured JSON into a {@link FederatedSqlPlan}, defending against omissions. */
+    private FederatedSqlPlan parseFederated(JsonObject json) {
+        boolean clarificationNeeded = getBool(json, "clarificationNeeded");
+        List<String> assumptions = getStringList(json, "assumptions");
+        List<String> missingData = getStringList(json, "missingData");
+        Double confidence = getDouble(json, "confidence");
+        String clarificationQuestion = getString(json, "clarificationQuestion");
+
+        List<SubQuery> queries = new ArrayList<>();
+        JsonElement queriesElement = json.get("queries");
+        if (queriesElement != null && queriesElement.isJsonArray()) {
+            for (JsonElement element : queriesElement.getAsJsonArray()) {
+                if (element == null || !element.isJsonObject()) {
+                    continue;
+                }
+                JsonObject q = element.getAsJsonObject();
+                String database = getString(q, "database");
+                String sql = getString(q, "sql");
+                if (database == null || database.trim().isEmpty()
+                        || sql == null || sql.trim().isEmpty()) {
+                    continue;
+                }
+                queries.add(new SubQuery(database.trim(), sql.trim(), getStringList(q, "tablesUsed")));
+            }
+        }
+
+        if (clarificationNeeded || queries.isEmpty()) {
+            String q = (clarificationQuestion == null || clarificationQuestion.trim().isEmpty())
+                    ? "The question could not be turned into queries from the available databases. "
+                            + "Please add detail or point at the relevant database(s)."
+                    : clarificationQuestion.trim();
+            return FederatedSqlPlan.needingClarification(q, assumptions, confidence, missingData);
+        }
+        return FederatedSqlPlan.ofQueries(queries, assumptions, confidence);
+    }
+
+    /**
+     * Pre-check (the federated analogue of {@link #enforceTableSubset}): every sub-query must target a
+     * known database and read only tables that exist in <em>that</em> database's schema. Any miss
+     * converts the whole plan to a clarification rather than handing back SQL referencing something the
+     * model invented. F5 still re-checks read-only and skip-list constraints per sub-query.
+     */
+    private FederatedSqlPlan enforceFederated(FederatedSqlPlan plan, List<NamedSchema> schemas) {
+        if (plan.isClarificationNeeded()) {
+            return plan;
+        }
+        Map<String, Set<String>> tablesByDb = new HashMap<>();
+        for (NamedSchema named : schemas) {
+            Set<String> known = new HashSet<>();
+            for (TableInfo table : named.getSchema().getTables()) {
+                known.add(table.getName().toLowerCase(Locale.ROOT));
+                known.add(table.qualifiedName().toLowerCase(Locale.ROOT));
+            }
+            tablesByDb.put(named.getName().toLowerCase(Locale.ROOT), known);
+        }
+
+        List<String> problems = new ArrayList<>();
+        for (SubQuery q : plan.getQueries()) {
+            Set<String> known = tablesByDb.get(q.getDatabase().toLowerCase(Locale.ROOT));
+            if (known == null) {
+                problems.add("unknown database '" + q.getDatabase() + "'");
+                continue;
+            }
+            for (String used : q.getTablesUsed()) {
+                if (used == null) {
+                    continue;
+                }
+                String normalized = used.trim().toLowerCase(Locale.ROOT);
+                if (!normalized.isEmpty() && !known.contains(normalized)) {
+                    problems.add("table '" + used.trim() + "' not in database '" + q.getDatabase() + "'");
+                }
+            }
+        }
+        if (problems.isEmpty()) {
+            return plan;
+        }
+        log.debug("Federated SQL referenced unknown database/table(s) {} — returning clarification", problems);
+        String question = "The drafted queries reference things not in the provided databases: "
+                + String.join("; ", problems)
+                + ". Please rephrase the question or specify which available database/table to use.";
+        return FederatedSqlPlan.needingClarification(question, plan.getAssumptions(),
+                plan.getConfidence(), plan.getMissingData());
+    }
+
     /** Map the model's structured JSON into a {@link SqlGenerationResult}, defending against omissions. */
     private SqlGenerationResult parse(JsonObject json) {
         boolean clarificationNeeded = getBool(json, "clarificationNeeded");
         List<String> tablesUsed = getStringList(json, "tablesUsed");
         List<String> assumptions = getStringList(json, "assumptions");
+        List<String> missingData = getStringList(json, "missingData");
         Double confidence = getDouble(json, "confidence");
         String sql = getString(json, "sql");
         String clarificationQuestion = getString(json, "clarificationQuestion");
@@ -141,7 +298,8 @@ public class SqlGenerationService {
                     ? "The question could not be turned into a SQL query from the available schema. "
                             + "Please add detail or point at the relevant tables."
                     : clarificationQuestion.trim();
-            return SqlGenerationResult.needingClarification(question, tablesUsed, assumptions, confidence);
+            return SqlGenerationResult.needingClarification(question, tablesUsed, assumptions,
+                    confidence, missingData);
         }
         return SqlGenerationResult.ofSql(sql.trim(), tablesUsed, assumptions, confidence);
     }
@@ -178,7 +336,8 @@ public class SqlGenerationService {
                 + String.join(", ", unknown)
                 + ". Please rephrase the question or specify which available table to use.";
         return SqlGenerationResult.needingClarification(
-                question, result.getTablesUsed(), result.getAssumptions(), result.getConfidence());
+                question, result.getTablesUsed(), result.getAssumptions(), result.getConfidence(),
+                result.getMissingData());
     }
 
     /** The JSON Schema the model must fill in via structured output. */
@@ -208,6 +367,9 @@ public class SqlGenerationService {
 
         properties.add("clarificationQuestion", stringProperty(
                 "A specific question to ask the user when clarificationNeeded is true; empty otherwise."));
+        properties.add("missingData", stringArrayProperty(
+                "When clarificationNeeded is true, the specific data the question needs but the schema "
+                        + "does not provide (e.g. 'a refund-date column', 'a costs table'); empty otherwise."));
 
         schema.add("properties", properties);
 
@@ -215,6 +377,61 @@ public class SqlGenerationService {
         required.add("sql");
         required.add("tablesUsed");
         required.add("assumptions");
+        required.add("clarificationNeeded");
+        schema.add("required", required);
+        return schema;
+    }
+
+    /** The JSON Schema the model must fill in for the federated (multi-database) path. */
+    private static JsonObject buildFederatedSchema() {
+        JsonObject query = new JsonObject();
+        query.addProperty("type", "object");
+        JsonObject queryProps = new JsonObject();
+        queryProps.add("database", stringProperty(
+                "The exact database name (from its '=== database: <name> ===' header) this query runs against."));
+        queryProps.add("sql", stringProperty(
+                "A single read-only SELECT or WITH query, valid for that database's dialect."));
+        queryProps.add("tablesUsed", stringArrayProperty(
+                "Tables (or schema.table) the query reads; every one must exist in that database's schema."));
+        query.add("properties", queryProps);
+        JsonArray queryRequired = new JsonArray();
+        queryRequired.add("database");
+        queryRequired.add("sql");
+        queryRequired.add("tablesUsed");
+        query.add("required", queryRequired);
+
+        JsonObject queries = new JsonObject();
+        queries.addProperty("type", "array");
+        queries.add("items", query);
+        queries.addProperty("description",
+                "One read-only query per database needed; empty when clarificationNeeded is true.");
+
+        JsonObject properties = new JsonObject();
+        properties.add("queries", queries);
+        properties.add("assumptions", stringArrayProperty(
+                "Interpretations made while answering, including how the databases' rows correspond."));
+
+        JsonObject confidence = new JsonObject();
+        confidence.addProperty("type", "number");
+        confidence.addProperty("description", "Confidence in the generated queries, from 0.0 to 1.0.");
+        properties.add("confidence", confidence);
+
+        JsonObject clarificationNeeded = new JsonObject();
+        clarificationNeeded.addProperty("type", "boolean");
+        clarificationNeeded.addProperty("description",
+                "True when the question cannot be answered from the databases; return a question instead.");
+        properties.add("clarificationNeeded", clarificationNeeded);
+        properties.add("clarificationQuestion", stringProperty(
+                "A specific question to ask the user when clarificationNeeded is true; empty otherwise."));
+        properties.add("missingData", stringArrayProperty(
+                "When clarificationNeeded is true, the specific data the question needs but the databases "
+                        + "do not provide; empty otherwise."));
+
+        JsonObject schema = new JsonObject();
+        schema.addProperty("type", "object");
+        schema.add("properties", properties);
+        JsonArray required = new JsonArray();
+        required.add("queries");
         required.add("clarificationNeeded");
         schema.add("required", required);
         return schema;

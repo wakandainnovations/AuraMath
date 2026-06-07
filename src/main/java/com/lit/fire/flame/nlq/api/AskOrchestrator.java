@@ -6,12 +6,18 @@ import com.lit.fire.flame.nlq.audit.AskMetrics;
 import com.lit.fire.flame.nlq.audit.LlmUsageRecorder;
 import com.lit.fire.flame.nlq.config.AskEngineProperties;
 import com.lit.fire.flame.nlq.connection.ConnectionRequest;
+import com.lit.fire.flame.nlq.connection.DatasourceRegistry;
 import com.lit.fire.flame.nlq.connection.DynamicConnectionFactory;
 import com.lit.fire.flame.nlq.math.AnswerSynthesisService;
 import com.lit.fire.flame.nlq.math.AskAnswer;
 import com.lit.fire.flame.nlq.schema.DatabaseSchema;
+import com.lit.fire.flame.nlq.schema.NamedSchema;
+import com.lit.fire.flame.nlq.schema.SchemaCacheService;
+import com.lit.fire.flame.nlq.schema.SchemaFilter;
 import com.lit.fire.flame.nlq.schema.SchemaIntrospector;
 import com.lit.fire.flame.nlq.schema.SkipList;
+import com.lit.fire.flame.nlq.schema.SkipListFactory;
+import com.lit.fire.flame.nlq.sql.FederatedSqlPlan;
 import com.lit.fire.flame.nlq.sql.QueryExecutionException;
 import com.lit.fire.flame.nlq.sql.QueryExecutionService;
 import com.lit.fire.flame.nlq.sql.QueryResult;
@@ -19,6 +25,7 @@ import com.lit.fire.flame.nlq.sql.ResultRedactor;
 import com.lit.fire.flame.nlq.sql.SqlGenerationResult;
 import com.lit.fire.flame.nlq.sql.SqlGenerationService;
 import com.lit.fire.flame.nlq.sql.SqlSafetyGuard;
+import com.lit.fire.flame.nlq.sql.SubQuery;
 import com.lit.fire.flame.nlq.sql.UnsafeSqlException;
 import com.lit.fire.flame.nlq.llm.LlmException;
 import org.slf4j.Logger;
@@ -29,10 +36,13 @@ import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.Collection;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -64,7 +74,9 @@ public class AskOrchestrator {
     private static final Logger log = LoggerFactory.getLogger(AskOrchestrator.class);
 
     private final DynamicConnectionFactory connectionFactory;
+    private final DatasourceRegistry registry;
     private final SchemaIntrospector introspector;
+    private final SchemaCacheService schemaCache;
     private final SqlGenerationService sqlGenerationService;
     private final SqlSafetyGuard safetyGuard;
     private final QueryExecutionService executionService;
@@ -76,7 +88,9 @@ public class AskOrchestrator {
     private final LlmUsageRecorder usageRecorder;
 
     public AskOrchestrator(DynamicConnectionFactory connectionFactory,
+                           DatasourceRegistry registry,
                            SchemaIntrospector introspector,
+                           SchemaCacheService schemaCache,
                            SqlGenerationService sqlGenerationService,
                            SqlSafetyGuard safetyGuard,
                            QueryExecutionService executionService,
@@ -87,7 +101,9 @@ public class AskOrchestrator {
                            AskMetrics metrics,
                            LlmUsageRecorder usageRecorder) {
         this.connectionFactory = connectionFactory;
+        this.registry = registry;
         this.introspector = introspector;
+        this.schemaCache = schemaCache;
         this.sqlGenerationService = sqlGenerationService;
         this.safetyGuard = safetyGuard;
         this.executionService = executionService;
@@ -133,86 +149,26 @@ public class AskOrchestrator {
         Map<String, Long> timings = new LinkedHashMap<>();
         long startNanos = System.nanoTime();
 
-        Connection conn = null;
+        List<Connection> openConnections = new ArrayList<>();
         try {
             if (request == null) {
                 throw new IllegalArgumentException("request body is required");
-            }
-            ConnectionRequest connection = request.getConnection();
-            if (connection == null) {
-                throw new IllegalArgumentException("connection is required");
             }
             String question = request.getQuestion();
             if (question == null || question.trim().isEmpty()) {
                 throw new IllegalArgumentException("question is required");
             }
-            audit.question(question.trim())
-                    .databaseHost(AskAuditLogger.targetHost(connection.getJdbcUrl()));
+            question = question.trim();
 
-            SkipList skipList = effectiveSkipList(request);
-            audit.skippedTables(new ArrayList<>(skipList.skippedTables()))
-                    .skippedColumns(new ArrayList<>(skipList.skippedColumns()))
-                    .maskedColumns(new ArrayList<>(skipList.maskedColumns()));
-            ExecutionComponents components = componentsFor(request.getMaxRows());
-            String model = blankToNull(request.getModel());
+            // Resolve which database(s) to answer against: explicit connection(s), else the registry.
+            List<ConnectionRequest> targets = resolveTargets(request);
 
-            long t = System.nanoTime();
-            conn = connectionFactory.open(connection);
-            timings.put("connectMillis", millisSince(t));
-
-            // (F2) Introspect through the effective skip-list, so skipped objects never reach the model.
-            t = System.nanoTime();
-            DatabaseSchema schema = introspector.introspect(conn, skipList);
-            timings.put("introspectMillis", millisSince(t));
-            audit.databaseProduct(schema.getProductName());
-
-            // (F4) Draft a single read-only query from the question + skip-filtered schema.
-            t = System.nanoTime();
-            SqlGenerationResult generation = sqlGenerationService.generate(question, schema, model);
-            timings.put("generateMillis", millisSince(t));
-            audit.tablesUsed(generation.getTablesUsed());
-
-            if (generation.isClarificationNeeded()) {
-                timings.put("totalMillis", millisSince(startNanos));
-                log.debug("Ask returned a clarification after generation ({} table(s) visible)",
-                        schema.getTables().size());
-                metrics.incrementClarifications();
-                recordAudit(audit, AskAuditRecord.Outcome.CLARIFICATION, "clarification", timings);
-                return AskResponse.clarification(requestId,
-                        generation.getClarificationQuestion(), generation.getTablesUsed(), timings);
+            if (targets.size() == 1) {
+                return askSingle(request, requestId, targets.get(0), question,
+                        audit, timings, startNanos, openConnections);
             }
-
-            // (F5) The trust boundary: validate read-only + skip-list and bound the row cap.
-            t = System.nanoTime();
-            String safeSql = components.guard.validate(generation.getSql(), skipList, schema);
-            timings.put("validateMillis", millisSince(t));
-            audit.generatedSql(safeSql);
-
-            // (F6) Execute exactly the validated SQL, read-only and bounded.
-            t = System.nanoTime();
-            QueryResult execution = components.executor.execute(conn, safeSql, skipList, schema);
-            timings.put("executeMillis", millisSince(t));
-
-            // (F9) Redact the rows before anything downstream sees them: mask masked-column values and
-            // drop any skip-listed column that slipped through (e.g. via a database-expanded SELECT *).
-            t = System.nanoTime();
-            QueryResult redacted = resultRedactor.redact(execution, skipList);
-            timings.put("redactMillis", millisSince(t));
-            audit.rowCount(redacted.getRowCount()).truncated(redacted.isTruncated());
-
-            // (F7) Synthesize the final answer over the REDACTED rows, applying any statistics in Java.
-            t = System.nanoTime();
-            AskAnswer answer = answerSynthesisService.answer(question, generation, redacted, model);
-            timings.put("synthesizeMillis", millisSince(t));
-
-            timings.put("totalMillis", millisSince(startNanos));
-            log.debug("Ask answered: {} row(s), {} formula(s), truncated={}, total={}ms",
-                    redacted.getRowCount(), answer.getFormulasApplied().size(),
-                    redacted.isTruncated(), timings.get("totalMillis"));
-            metrics.incrementAnswers();
-            recordAudit(audit, AskAuditRecord.Outcome.ANSWERED, null, timings);
-            return AskResponse.answered(requestId, answer, safeSql, generation.getTablesUsed(),
-                    redacted.isTruncated(), redacted.getRowCount(), timings);
+            return askFederated(request, requestId, targets, question,
+                    audit, timings, startNanos, openConnections);
         } catch (Exception e) {
             // One audit line and the right counters for the failure, then rethrow the typed exception
             // unchanged so the controller maps it to a sanitized HTTP status. The reason recorded here
@@ -224,7 +180,311 @@ public class AskOrchestrator {
             throw e;
         } finally {
             usageRecorder.clear();
-            closeQuietly(conn);
+            for (Connection conn : openConnections) {
+                closeQuietly(conn);
+            }
+        }
+    }
+
+    /**
+     * The single-database pipeline (F1–F7): resolve the schema (from the hourly cache if present, else
+     * a live introspection), draft one query, validate, execute, redact, and synthesize. The execution
+     * connection is opened <b>lazily</b> — only when live introspection is needed or the query is about
+     * to run — so a cached schema + a clarification needs no target connection at all. Used whenever
+     * exactly one database is resolved (an ad-hoc {@code connection} or a single registry database).
+     */
+    private AskResponse askSingle(AskRequest request, String requestId, ConnectionRequest connection,
+                                  String question, AskAuditRecord.Builder audit,
+                                  Map<String, Long> timings, long startNanos,
+                                  List<Connection> openConnections)
+            throws SQLException, LlmException, UnsafeSqlException, QueryExecutionException {
+        audit.question(question)
+                .databaseHost(AskAuditLogger.targetHost(connection.getJdbcUrl()));
+
+        SkipList skipList = effectiveSkipList(request, connection);
+        audit.skippedTables(new ArrayList<>(skipList.skippedTables()))
+                .skippedColumns(new ArrayList<>(skipList.skippedColumns()))
+                .maskedColumns(new ArrayList<>(skipList.maskedColumns()));
+        ExecutionComponents components = componentsFor(request.getMaxRows());
+        String model = blankToNull(request.getModel());
+        Map<String, Connection> open = new LinkedHashMap<>();
+        timings.put("connectMillis", 0L);
+        timings.put("introspectMillis", 0L);
+
+        // (F2) Schema from the cache (filtered for any per-request skips), or a live introspection.
+        DatabaseSchema schema = resolveSchema(connection, skipList, open, openConnections, timings);
+        audit.databaseProduct(schema.getProductName());
+
+        // (F4) Draft a single read-only query from the question + skip-filtered schema.
+        long t = System.nanoTime();
+        SqlGenerationResult generation = sqlGenerationService.generate(question, schema, model);
+        timings.put("generateMillis", millisSince(t));
+        audit.tablesUsed(generation.getTablesUsed());
+
+        if (generation.isClarificationNeeded()) {
+            timings.put("totalMillis", millisSince(startNanos));
+            log.debug("Ask returned a clarification after generation ({} table(s) visible)",
+                    schema.getTables().size());
+            metrics.incrementClarifications();
+            recordAudit(audit, AskAuditRecord.Outcome.CLARIFICATION, "clarification", timings);
+            return AskResponse.clarification(requestId, generation.getClarificationQuestion(),
+                    generation.getTablesUsed(), generation.getMissingData(), timings);
+        }
+
+        // The query is about to run — ensure a live connection (may already be open from introspection).
+        Connection conn = openConnection(connection, open, openConnections, timings);
+
+        // (F5) The trust boundary: validate read-only + skip-list and bound the row cap.
+        t = System.nanoTime();
+        String safeSql = components.guard.validate(generation.getSql(), skipList, schema);
+        timings.put("validateMillis", millisSince(t));
+        audit.generatedSql(safeSql);
+
+        // (F6) Execute exactly the validated SQL, read-only and bounded.
+        t = System.nanoTime();
+        QueryResult execution = components.executor.execute(conn, safeSql, skipList, schema);
+        timings.put("executeMillis", millisSince(t));
+
+        // (F9) Redact the rows before anything downstream sees them: mask masked-column values and
+        // drop any skip-listed column that slipped through (e.g. via a database-expanded SELECT *).
+        t = System.nanoTime();
+        QueryResult redacted = resultRedactor.redact(execution, skipList);
+        timings.put("redactMillis", millisSince(t));
+        audit.rowCount(redacted.getRowCount()).truncated(redacted.isTruncated());
+
+        // (F7) Synthesize the final answer over the REDACTED rows, applying any statistics in Java
+        // (and, for formulas not in the code catalog, via the logged LLM-compute fallback).
+        t = System.nanoTime();
+        AskAnswer answer = answerSynthesisService.answer(question, generation, redacted, model, requestId);
+        timings.put("synthesizeMillis", millisSince(t));
+
+        timings.put("totalMillis", millisSince(startNanos));
+        log.debug("Ask answered: {} row(s), {} formula(s), truncated={}, total={}ms",
+                redacted.getRowCount(), answer.getFormulasApplied().size(),
+                redacted.isTruncated(), timings.get("totalMillis"));
+        metrics.incrementAnswers();
+        recordAudit(audit, AskAuditRecord.Outcome.ANSWERED, null, timings);
+        return AskResponse.answered(requestId, answer, safeSql, generation.getTablesUsed(),
+                redacted.isTruncated(), redacted.getRowCount(), timings);
+    }
+
+    /**
+     * The federated (multi-database) pipeline: resolve each target's schema (cache-first, live
+     * fallback), ask the model for one read-only sub-query per database (it cannot JOIN across them),
+     * then validate→execute→redact each against its own connection and collate the labeled results into
+     * one answer (F7). Execution connections are opened <b>lazily</b> — only for the databases a
+     * sub-query actually targets — so unused databases are never connected to. Per-stage timings are
+     * summed across databases; the planning and synthesis stages are each a single LLM round.
+     */
+    private AskResponse askFederated(AskRequest request, String requestId,
+                                     List<ConnectionRequest> targets, String question,
+                                     AskAuditRecord.Builder audit, Map<String, Long> timings,
+                                     long startNanos, List<Connection> openConnections)
+            throws SQLException, LlmException, UnsafeSqlException, QueryExecutionException {
+        String model = blankToNull(request.getModel());
+        ExecutionComponents components = componentsFor(request.getMaxRows());
+
+        audit.question(question);
+        List<String> hosts = new ArrayList<>();
+        for (ConnectionRequest target : targets) {
+            String host = AskAuditLogger.targetHost(target.getJdbcUrl());
+            if (host != null && !host.isEmpty()) {
+                hosts.add(host);
+            }
+        }
+        audit.databaseHost(hosts.isEmpty() ? null : String.join(",", hosts));
+
+        // (F2) Resolve each database's schema — from the hourly cache when present, else a live
+        // introspection (which opens, and keeps, that database's connection for reuse at execution).
+        Map<String, Connection> open = new LinkedHashMap<>();
+        Map<String, DbContext> contexts = new LinkedHashMap<>();
+        timings.put("connectMillis", 0L);
+        timings.put("introspectMillis", 0L);
+        List<NamedSchema> schemas = new ArrayList<>();
+        List<String> products = new ArrayList<>();
+        for (ConnectionRequest target : targets) {
+            SkipList skipList = effectiveSkipList(request, target);
+            DatabaseSchema schema = resolveSchema(target, skipList, open, openConnections, timings);
+            products.add(schema.getProductName());
+            schemas.add(new NamedSchema(target.getName(), schema));
+            contexts.put(target.getName().toLowerCase(Locale.ROOT),
+                    new DbContext(target.getName(), target, skipList, schema));
+        }
+        audit.databaseProduct(String.join(",", products));
+
+        // (F4) One model round drafts a read-only sub-query per database it needs.
+        long t = System.nanoTime();
+        FederatedSqlPlan plan = sqlGenerationService.generateFederated(question, schemas, model);
+        timings.put("generateMillis", millisSince(t));
+        audit.tablesUsed(plan.allTablesUsed());
+
+        if (plan.isClarificationNeeded()) {
+            timings.put("totalMillis", millisSince(startNanos));
+            log.debug("Federated Ask returned a clarification ({} database(s) visible)", schemas.size());
+            metrics.incrementClarifications();
+            recordAudit(audit, AskAuditRecord.Outcome.CLARIFICATION, "clarification", timings);
+            return AskResponse.clarification(requestId,
+                    plan.getClarificationQuestion(), plan.allTablesUsed(), plan.getMissingData(), timings);
+        }
+
+        // (F5/F6/F9) Validate, execute, and redact each sub-query against its own database, opening the
+        // connection lazily for just the databases that a sub-query targets.
+        long validateTotal = 0L;
+        long executeTotal = 0L;
+        long redactTotal = 0L;
+        int totalRows = 0;
+        boolean anyTruncated = false;
+        List<AnswerSynthesisService.LabeledResult> labeled = new ArrayList<>();
+        List<SubQueryInfo> subQueries = new ArrayList<>();
+        List<String> allTables = new ArrayList<>();
+        List<String> sqls = new ArrayList<>();
+        for (SubQuery sub : plan.getQueries()) {
+            DbContext ctx = contexts.get(sub.getDatabase().toLowerCase(Locale.ROOT));
+            if (ctx == null) {
+                // enforceFederated guarantees the database matches; defensive only.
+                continue;
+            }
+            Connection conn = openConnection(ctx.connection, open, openConnections, timings);
+
+            long tv = System.nanoTime();
+            String safeSql = components.guard.validate(sub.getSql(), ctx.skipList, ctx.schema);
+            validateTotal += millisSince(tv);
+
+            long te = System.nanoTime();
+            QueryResult execution = components.executor.execute(conn, safeSql, ctx.skipList, ctx.schema);
+            executeTotal += millisSince(te);
+
+            long tr = System.nanoTime();
+            QueryResult redacted = resultRedactor.redact(execution, ctx.skipList);
+            redactTotal += millisSince(tr);
+
+            labeled.add(new AnswerSynthesisService.LabeledResult(ctx.name, redacted));
+            subQueries.add(new SubQueryInfo(ctx.name, safeSql, sub.getTablesUsed(),
+                    redacted.getRowCount(), redacted.isTruncated()));
+            for (String table : sub.getTablesUsed()) {
+                allTables.add(ctx.name + "." + table);
+            }
+            sqls.add("-- " + ctx.name + "\n" + safeSql);
+            totalRows += redacted.getRowCount();
+            anyTruncated = anyTruncated || redacted.isTruncated();
+        }
+        timings.put("validateMillis", validateTotal);
+        timings.put("executeMillis", executeTotal);
+        timings.put("redactMillis", redactTotal);
+        audit.generatedSql(String.join("\n", sqls));
+        audit.rowCount(totalRows).truncated(anyTruncated);
+
+        // (F7) Collate the labeled result sets into one answer.
+        long ts = System.nanoTime();
+        AskAnswer answer = answerSynthesisService.answerFederated(question, plan.getAssumptions(),
+                labeled, model, requestId);
+        timings.put("synthesizeMillis", millisSince(ts));
+
+        timings.put("totalMillis", millisSince(startNanos));
+        log.debug("Federated Ask answered across {} database(s): {} total row(s), {} formula(s), total={}ms",
+                targets.size(), totalRows, answer.getFormulasApplied().size(), timings.get("totalMillis"));
+        metrics.incrementAnswers();
+        recordAudit(audit, AskAuditRecord.Outcome.ANSWERED, null, timings);
+        return AskResponse.answeredFederated(requestId, answer, subQueries, allTables,
+                anyTruncated, totalRows, timings);
+    }
+
+    /**
+     * Resolve the schema for one database: prefer the hourly cache (filtering it for any per-request
+     * skips), and on a miss introspect live — opening (and keeping, for execution reuse) that database's
+     * connection. Accumulates connect/introspect timings.
+     */
+    private DatabaseSchema resolveSchema(ConnectionRequest connection, SkipList skipList,
+                                         Map<String, Connection> open, List<Connection> openConnections,
+                                         Map<String, Long> timings) throws SQLException {
+        if (properties.getSchemaCache().isEnabled()) {
+            Optional<DatabaseSchema> cached = schemaCache.get(connection.getName());
+            if (cached.isPresent()) {
+                return SchemaFilter.apply(cached.get(), skipList);
+            }
+        }
+        Connection conn = openConnection(connection, open, openConnections, timings);
+        long t = System.nanoTime();
+        DatabaseSchema schema = introspector.introspect(conn, skipList);
+        addMillis(timings, "introspectMillis", millisSince(t));
+        return schema;
+    }
+
+    /** Open a database's connection once and reuse it; accumulates connect timing. */
+    private Connection openConnection(ConnectionRequest connection, Map<String, Connection> open,
+                                      List<Connection> openConnections, Map<String, Long> timings)
+            throws SQLException {
+        String key = connection.getName();
+        Connection existing = open.get(key);
+        if (existing != null) {
+            return existing;
+        }
+        long t = System.nanoTime();
+        Connection conn = connectionFactory.open(connection);
+        addMillis(timings, "connectMillis", millisSince(t));
+        open.put(key, conn);
+        openConnections.add(conn);
+        return conn;
+    }
+
+    private static void addMillis(Map<String, Long> timings, String key, long add) {
+        timings.merge(key, add, Long::sum);
+    }
+
+    /**
+     * Resolve the target databases in precedence order: an explicit {@code connections} list, else a
+     * single {@code connection}, else the server-side registry ({@code databases} subset, or all).
+     * Each target is given a unique non-blank name and the count is capped at {@code maxDatabases}.
+     *
+     * @throws IllegalArgumentException if nothing is resolved, a named registry database is unknown, or
+     *                                  too many databases are requested
+     */
+    private List<ConnectionRequest> resolveTargets(AskRequest request) {
+        List<ConnectionRequest> targets = new ArrayList<>();
+        if (!request.getConnections().isEmpty()) {
+            targets.addAll(request.getConnections());
+        } else if (request.getConnection() != null) {
+            targets.add(request.getConnection());
+        } else {
+            List<String> names = request.getDatabases();
+            if (names == null || names.isEmpty()) {
+                targets.addAll(registry.all());
+                if (targets.isEmpty()) {
+                    throw new IllegalArgumentException(
+                            "no target database: none supplied in the request and the registry is empty");
+                }
+            } else {
+                for (String name : names) {
+                    ConnectionRequest c = registry.get(name);
+                    if (c == null) {
+                        throw new IllegalArgumentException("unknown database '" + name + "'");
+                    }
+                    targets.add(c);
+                }
+            }
+        }
+        assignNames(targets);
+        int max = properties.getMaxDatabases();
+        if (targets.size() > max) {
+            throw new IllegalArgumentException(
+                    "too many target databases: " + targets.size() + " exceeds the configured maximum " + max);
+        }
+        return targets;
+    }
+
+    /** Give every target a unique, non-blank name (used as the federated database label). */
+    private static void assignNames(List<ConnectionRequest> targets) {
+        Set<String> used = new HashSet<>();
+        for (int i = 0; i < targets.size(); i++) {
+            ConnectionRequest c = targets.get(i);
+            String name = (c.getName() == null || c.getName().trim().isEmpty())
+                    ? "db" + (i + 1) : c.getName().trim();
+            String base = name;
+            int n = 2;
+            while (!used.add(name.toLowerCase(Locale.ROOT))) {
+                name = base + "_" + n++;
+            }
+            c.setName(name);
         }
     }
 
@@ -281,23 +541,9 @@ public class AskOrchestrator {
      * lists, the server-side {@code masked-columns}, and the configurable auto-skip name patterns.
      * Re-enforced downstream at introspection, validation, execution, and output redaction.
      */
-    private SkipList effectiveSkipList(AskRequest request) {
-        ConnectionRequest connection = request.getConnection();
-        List<String> tables = new ArrayList<>();
-        addAll(tables, connection.getSkipTables());
-        addAll(tables, request.getSkipTables());
-        List<String> columns = new ArrayList<>();
-        addAll(columns, connection.getSkipColumns());
-        addAll(columns, request.getSkipColumns());
-        AskEngineProperties.AutoSkip autoSkip = properties.getAutoSkip();
-        return SkipList.builder()
-                .addSkipTables(properties.getDefaultSkipTables())
-                .addSkipTables(tables)
-                .addSkipColumns(properties.getDefaultSkipColumns())
-                .addSkipColumns(columns)
-                .addMaskedColumns(properties.getMaskedColumns())
-                .autoSkipPatterns(autoSkip.getPatterns(), autoSkip.isEnabled())
-                .build();
+    private SkipList effectiveSkipList(AskRequest request, ConnectionRequest connection) {
+        return SkipListFactory.effective(request.getSkipTables(), request.getSkipColumns(),
+                connection, properties);
     }
 
     /**
@@ -332,6 +578,10 @@ public class AskOrchestrator {
         copy.setAutoSkip(properties.getAutoSkip());
         copy.setAudit(properties.getAudit());
         copy.setLlmProvider(properties.getLlmProvider());
+        copy.setSecretsPath(properties.getSecretsPath());
+        copy.setMaxDatabases(properties.getMaxDatabases());
+        copy.setSchemaCache(properties.getSchemaCache());
+        copy.setFormulaGap(properties.getFormulaGap());
         return copy;
     }
 
@@ -344,12 +594,6 @@ public class AskOrchestrator {
         } catch (SQLException e) {
             // Best-effort cleanup of a short-lived connection. Never log the connection details.
             log.debug("failed to close target connection cleanly: {}", e.getSQLState());
-        }
-    }
-
-    private static void addAll(List<String> target, Collection<String> source) {
-        if (source != null) {
-            target.addAll(source);
         }
     }
 
@@ -369,6 +613,21 @@ public class AskOrchestrator {
         ExecutionComponents(SqlSafetyGuard guard, QueryExecutionService executor) {
             this.guard = guard;
             this.executor = executor;
+        }
+    }
+
+    /** Per-database state held across the federated pipeline: its connection details, skip-list, schema. */
+    private static final class DbContext {
+        private final String name;
+        private final ConnectionRequest connection;
+        private final SkipList skipList;
+        private final DatabaseSchema schema;
+
+        DbContext(String name, ConnectionRequest connection, SkipList skipList, DatabaseSchema schema) {
+            this.name = name;
+            this.connection = connection;
+            this.skipList = skipList;
+            this.schema = schema;
         }
     }
 }

@@ -777,10 +777,94 @@ Bound from prefix `aura.ask` (`nlq.config.AskEngineProperties`):
 | `aura.ask.audit.persist` | `false` | Also persist each audit record to AuraMath's own DB (log-only when `false`). (F10) |
 | `aura.ask.audit.table` | `ask_audit_log` | Target table for persisted audit records (not auto-created). (F10) |
 | `aura.ask.llm-provider` | `claude` | Selected `LlmClient` provider. |
+| `aura.ask.secrets-path` | `~/config.secrets` | Host credential file the `DatasourceRegistry` loads at startup. (F12) |
+| `aura.ask.max-databases` | `5` | Max databases one Ask may fan out to (registry or explicit). (F12) |
+| `aura.ask.schema-cache.enabled` | `true` | Toggle the hourly schema cache + refresh job. (F13) |
+| `aura.ask.schema-cache.table` | `ask_schema_cache` | Table (AuraMath's own DB) of cached schemas; auto-created. (F13) |
+| `aura.ask.schema-cache.refresh-interval-ms` | `3600000` | Schema refresh interval (hourly). (F13) |
+| `aura.ask.schema-cache.fallback-to-live` | `true` | On a cache miss, introspect the target live for that request. (F13) |
+| `aura.ask.formula-gap.persist` | `true` | Persist LLM-computed formula gaps to AuraMath's own DB (auto-created). (F14) |
+| `aura.ask.formula-gap.table` | `ask_formula_gap` | Table for logged formula gaps. (F14) |
 
 The LLM API key is read from `secrets.txt` (`anthropic.api.key=`) and is never committed. The active
 provider is chosen by `aura.ask.llm-provider` (only `claude` is implemented today; any other value
 fails fast at startup).
+
+## Multi-database registry & cross-database answering (F12)
+
+The engine can answer one question across **several** databases without credentials in the request.
+
+**Registry.** `nlq.connection.DatasourceRegistry` loads `aura.ask.secrets-path` (default
+`~/config.secrets`, a Java-properties file) once at startup. Each `ask.db.<name>.*` group becomes a
+named, read-only `ConnectionRequest` (`url`, `driver`, `username`, `password`, `skipTables`,
+`skipColumns`); every URL is validated by `JdbcUrlValidator` and invalid/missing-URL entries are
+skipped with a sanitized warning. A missing file ⇒ empty registry (the per-request connection path
+still works). `GET /api/ask/databases` exposes only name/driver/host — never credentials.
+
+**Target resolution** (`AskOrchestrator.resolveTargets`): explicit `connections` list → single
+`connection` → registry (`databases` subset, or all). The count is capped at `aura.ask.max-databases`.
+One resolved database uses the unchanged single-DB pipeline; two or more take the federated path.
+
+**Federated pipeline.** Separate JDBC connections cannot be JOINed, so the engine: opens + introspects
+each database (per-database skip-lists); asks the model — via `SqlGenerationService.generateFederated`
+and the `sql_generation_federated_system.txt` prompt — for **one read-only sub-query per database**
+(`FederatedSqlPlan`/`SubQuery`); validates (F5), executes (F6), and redacts (F9) each against its own
+connection; then `AnswerSynthesisService.answerFederated` collates. Collation builds one view whose
+columns are namespaced `<database>.<column>` (rows tagged `_database`), so `FormulaEvaluator` computes
+per-database aggregates deterministically (a value absent for another database's row is simply skipped),
+while the narrative is shown the labeled rows to reason across sources. The response carries a
+`subQueries` array (per-database SQL/tables/rows); top-level `sql` is `null` and `tablesUsed` is the
+`database.table` union. All connections are closed in a `finally` block.
+
+**Security trade-off.** Holding target credentials in server memory is an explicit relaxation of the
+"credentials only ever per-request" stance, chosen so questions need no credentials. Connections remain
+read-only; the file should be `chmod 600`; credentials are never logged or returned.
+
+## Hourly schema cache (F13)
+
+Rather than introspecting every target on each question, a scheduled job caches each registered
+database's schema in AuraMath's own Postgres and the Ask path answers from the cache.
+
+- **`nlq.schema.SchemaRefreshJob`** — `@Scheduled` (after a short startup delay, then every
+  `schema-cache.refresh-interval-ms`, default hourly). For each `DatasourceRegistry` database it opens a
+  read-only connection, introspects through that connection's **base** (request-independent) skip-list
+  (`SkipListFactory.base`), and stores the result. Each database refreshes independently; a failure on
+  one is logged (class name only) and the rest proceed.
+- **`nlq.schema.SchemaCacheService`** — stores the full structured `DatabaseSchema` as JSON (Gson) in
+  `ask_schema_cache` (PK = database name; auto-created) in AuraMath's own DB via the autoconfigured
+  `JdbcTemplate`, and reconstructs it on read. **Fail-soft:** any SQL error → `get` returns empty and
+  the caller introspects live, so the cache can never break a request. Structure only — no row data.
+- **Read path** (`AskOrchestrator.resolveSchema`): prefer the cache, then `SchemaFilter.apply` removes
+  any extra per-request skips (the cache is built with the base policy only); on a miss, introspect live
+  and reuse that connection for execution. Execution connections are opened **lazily** — only for the
+  databases a sub-query actually targets — so a cached schema + a clarification needs no target
+  connection at all.
+
+## Mathematician layer — LLM-compute fallback & formula-gap log (F14)
+
+The deterministic catalog (F7) cannot cover every formula a question may need. When the plan names a
+formula outside the catalog, instead of skipping it the engine computes it via the LLM and records the
+gap so it can be implemented in code later.
+
+- `FormulaEvaluator.isSupported(formula)` distinguishes a catalog formula (computed in Java, as always)
+  from one that is not. Only non-catalog formulas take the fallback; catalog formulas never do.
+- **`nlq.math.LlmComputeService`** computes a single value for one non-catalog operation strictly from
+  the retrieved rows (structured output `{computable, value, expression, explanation}`); it returns
+  nothing when the model reports it cannot compute a well-defined number, so no figure is fabricated.
+- **`AnswerSynthesisService`** splits the plan: catalog operations go to `FormulaEvaluator`, non-catalog
+  ones to `LlmComputeService`; both feed the same `computedValues`/`formulasApplied`, and the narrative
+  step is unchanged. For each LLM-computed formula a **`FormulaGapLogger`** writes a structured record
+  (and, by default, a row in `ask_formula_gap` in AuraMath's own DB) — the backlog of formulas to add to
+  the catalog. Records carry no credentials and no raw row values beyond the one computed figure.
+- **Trust boundary:** this is the *only* place the model does arithmetic, and only for uncatalogued
+  formulas; every use is logged. When the fallback beans are absent (e.g. in unit tests) the behaviour
+  is exactly as before — a non-catalog formula is skipped with a note.
+
+## Missing-data clarification (req #6)
+
+When the engine cannot answer, the SQL-generation step also returns `missingData` — the specific data
+the question needs but the schema(s) do not provide — surfaced on `AskResponse.missingData` alongside
+the clarification question, so callers learn exactly what is lacking rather than only being re-asked.
 
 ## Feature checklist
 
@@ -796,3 +880,6 @@ fails fast at startup).
 - [x] **F9** — Sensitive-data hardening: skipped/masked columns, auto-skip name patterns, and output redaction (`nlq.schema`, `nlq.sql`).
 - [x] **F10** — Audit logging & observability: per-request credential-free audit record + structured log line, optional persistence, request-id correlation, and metrics (`nlq.audit`, `nlq.api`).
 - [ ] **F11** — Full end-to-end integration tests against Postgres/MySQL targets + remaining hardening.
+- [x] **F12** — Multi-database registry (`~/config.secrets`) + cross-database (federated) answering: `GET /api/ask/databases`, credential-free requests, per-database sub-queries collated into one answer (`nlq.connection`, `nlq.sql`, `nlq.math`, `nlq.api`).
+- [x] **F13** — Hourly schema cache in AuraMath's own Postgres: scheduled refresh job + cache service, cache-first read path with live fallback and lazy execution connections (`nlq.schema`).
+- [x] **F14** — LLM-compute fallback for formulas not in the code catalog + formula-gap logging/persistence for later cataloging (`nlq.math`, `nlq.audit`).

@@ -29,7 +29,9 @@ Hard rules — follow every one:
   "signed up", or what window "last month" covers.
 - If the question CANNOT be answered from this schema — the data it needs is absent, or it is too
   ambiguous to map onto the available columns — set "clarificationNeeded" to true, put one
-  specific question in "clarificationQuestion", and leave "sql" empty. Do NOT guess.
+  specific question in "clarificationQuestion", and leave "sql" empty. Do NOT guess. Also list in
+  "missingData" the specific data the question needs but the schema does not provide (e.g. "a
+  refund-date column", "a costs table"), so the caller knows exactly what is lacking.
 
 Answer by calling the provided tool with these fields: sql, tablesUsed, assumptions,
-confidence (0.0–1.0), clarificationNeeded, clarificationQuestion.
+confidence (0.0–1.0), clarificationNeeded, clarificationQuestion, missingData.

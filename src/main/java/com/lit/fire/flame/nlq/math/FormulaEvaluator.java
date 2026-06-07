@@ -70,6 +70,21 @@ public final class FormulaEvaluator {
             "abs", "sqrt", "cbrt", "exp", "log", "log2", "log10", "min", "max",
             "pow", "ceil", "floor", "signum");
 
+    /** The deterministic formula catalog this evaluator can compute in Java (normalized names). */
+    private static final Set<String> CATALOG = Set.of(
+            "count", "sum", "mean", "min", "max", "median", "std_dev", "variance", "percentile",
+            "weighted_average", "growth_rate", "cagr", "regression_slope", "regression_intercept",
+            "correlation", "expression");
+
+    /**
+     * Whether {@code formula} (after normalization/aliasing) is in the deterministic code catalog. The
+     * synthesis layer uses this to route a formula the engine does <b>not</b> implement to the
+     * LLM-compute fallback (and log it), while catalog formulas are always computed here.
+     */
+    public static boolean isSupported(String formula) {
+        return CATALOG.contains(normalize(formula));
+    }
+
     /**
      * Evaluate every operation in {@code plan} against {@code result}.
      *
