@@ -299,16 +299,16 @@ public class EntityMarketingService {
         String sql =
                 "WITH per_post AS (" +
                 "  SELECT author AS global_user_id, COALESCE(views_count, 0)::bigint AS engagement " +
-                "  FROM x_posts          WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' " +
+                "  FROM x_posts          WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' AND sentiment_score <> 0 " +
                 "  UNION ALL " +
                 "  SELECT author, COALESCE(likes_count, 0)::bigint " +
-                "  FROM youtube_comments WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' " +
+                "  FROM youtube_comments WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' AND sentiment_score <> 0 " +
                 "  UNION ALL " +
                 "  SELECT author, COALESCE(num_comments, 0)::bigint " +
-                "  FROM reddit_posts     WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' " +
+                "  FROM reddit_posts     WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' AND sentiment_score <> 0 " +
                 "  UNION ALL " +
                 "  SELECT author, COALESCE(like_count, 0)::bigint " +
-                "  FROM instagram_posts  WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' " +
+                "  FROM instagram_posts  WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' AND sentiment_score <> 0 " +
                 "), per_user AS (" +
                 "  SELECT global_user_id, COUNT(*) AS post_count, SUM(engagement) AS total_engagement " +
                 "  FROM per_post GROUP BY global_user_id " +

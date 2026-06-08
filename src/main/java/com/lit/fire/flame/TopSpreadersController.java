@@ -47,7 +47,8 @@ public class TopSpreadersController {
                      "FROM x_posts " +
                      "WHERE keyword ILIKE ? " +
                      "AND created_at >= NOW() - INTERVAL '90 days' " +
-                     "AND views_count > 0";
+                     "AND views_count > 0 " +
+                     "AND sentiment_score <> 0";
 
         List<Map<String, Object>> rows = jdbcTemplate.queryForList(sql, "%" + keyword + "%");
 
@@ -58,7 +59,7 @@ public class TopSpreadersController {
         return postsByAuthor.entrySet().stream()
                 .filter(entry -> entry.getValue().size() >= 2)
                 .map(entry -> scoreAuthor(entry.getKey(), entry.getValue()))
-                .sorted(Comparator.comparingDouble(r -> -((double) r.get("viral_potential_score"))))
+                .sorted(Comparator.comparingDouble((Map<String, Object> r) -> (double) r.get("viral_potential_score")).reversed())
                 .limit(TOP_N)
                 .collect(Collectors.toList());
     }
