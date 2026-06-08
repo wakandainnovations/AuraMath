@@ -1,10 +1,15 @@
 package com.lit.fire.flame;
 
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.ContentDisposition;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RestController;
+
+import java.nio.charset.StandardCharsets;
 
 import java.time.DayOfWeek;
 import java.time.ZoneId;
@@ -25,6 +30,9 @@ import java.util.stream.Collectors;
  *                                                         user opens for any
  *                                                         entity of their choice
  *
+ * A third endpoint renders the SHAREABLE report (same payload) as a polished marketing PDF:
+ *   GET /api/marketing/entity-report/{entityId}/pdf     – sales-oriented PDF for a prospect
+ *
  * Sections returned:
  *   entityProfile          – what this entity is and how much chatter it drives
  *   conversationProfile    – how and when the conversation spikes (virality)
@@ -41,6 +49,7 @@ public class EntityReportController {
 
     @Autowired private EntityIntelService     intel;
     @Autowired private EntityMarketingService marketing;
+    @Autowired private EntityReportPdfRenderer pdfRenderer;
 
     private static final DateTimeFormatter TS_FMT       = DateTimeFormatter.ISO_LOCAL_DATE_TIME;
     private static final ZoneId            IST          = ZoneId.of("Asia/Kolkata");
@@ -61,6 +70,43 @@ public class EntityReportController {
     @GetMapping("/api/marketing/entity/{entityId}/report")
     public ResponseEntity<Map<String, Object>> getEntityReport(@PathVariable String entityId) {
         return ResponseEntity.ok(buildReport(entityId));
+    }
+
+    /**
+     * Shareable report rendered as a polished, sales-oriented PDF — the artefact handed to a
+     * prospect to make the marketing pitch. Reuses {@link #buildReport} so the PDF and JSON
+     * representations stay in lock-step. Returns the PDF inline so it opens directly in a browser.
+     */
+    @GetMapping(value = "/api/marketing/entity-report/{entityId}/pdf", produces = MediaType.APPLICATION_PDF_VALUE)
+    public ResponseEntity<byte[]> getShareableReportPdf(@PathVariable String entityId) {
+        Map<String, Object> report = buildReport(entityId);
+        if (!pdfRenderer.isRenderable(report)) {
+            String message = String.valueOf(report.getOrDefault("message", "No report available for this entity"));
+            return ResponseEntity.status(404)
+                    .contentType(MediaType.TEXT_PLAIN)
+                    .body(message.getBytes(StandardCharsets.UTF_8));
+        }
+
+        byte[] pdf = pdfRenderer.render(report);
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_PDF);
+        headers.setContentDisposition(ContentDisposition.inline()
+                .filename(pdfFilename(report, entityId))
+                .build());
+        return new ResponseEntity<>(pdf, headers, 200);
+    }
+
+    /** Reader-friendly download filename derived from the entity name, e.g. {@code Taylor-Swift-intelligence-report.pdf}. */
+    private String pdfFilename(Map<String, Object> report, String entityId) {
+        Object profile = report.get("entityProfile");
+        String name = entityId;
+        if (profile instanceof Map) {
+            Object n = ((Map<?, ?>) profile).get("name");
+            if (n != null && !n.toString().isBlank()) name = n.toString();
+        }
+        String slug = name.trim().replaceAll("[^A-Za-z0-9]+", "-").replaceAll("(^-|-$)", "");
+        if (slug.isEmpty()) slug = "entity";
+        return slug + "-intelligence-report.pdf";
     }
 
     // -------------------------------------------------------------------------
