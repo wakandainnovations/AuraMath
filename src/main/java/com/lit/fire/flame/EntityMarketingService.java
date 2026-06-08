@@ -198,6 +198,58 @@ public class EntityMarketingService {
         return out;
     }
 
+    /**
+     * Authors classified as "Brand Evangelist" in {@code author_categories} who have
+     * also posted about {@code keyword}. The classification is global (per-author,
+     * not keyword-scoped), so we intersect it with the per-keyword post activity to
+     * surface the evangelists relevant to this campaign, ranked by branching ratio
+     * (amplification potential) and then by their engagement on the keyword.
+     */
+    public List<Map<String, Object>> brandEvangelists(String keyword) {
+        String sql =
+                "WITH per_post AS (" +
+                "  SELECT author AS global_user_id, COALESCE(views_count, 0)::bigint AS engagement " +
+                "  FROM x_posts          WHERE keyword ILIKE ? AND author IS NOT NULL AND author <> '' " +
+                "  UNION ALL " +
+                "  SELECT author, COALESCE(likes_count, 0)::bigint " +
+                "  FROM youtube_comments WHERE keyword ILIKE ? AND author IS NOT NULL AND author <> '' " +
+                "  UNION ALL " +
+                "  SELECT author, COALESCE(num_comments, 0)::bigint " +
+                "  FROM reddit_posts     WHERE keyword ILIKE ? AND author IS NOT NULL AND author <> '' " +
+                "  UNION ALL " +
+                "  SELECT author, COALESCE(like_count, 0)::bigint " +
+                "  FROM instagram_posts  WHERE keyword ILIKE ? AND author IS NOT NULL AND author <> '' " +
+                "), per_user AS (" +
+                "  SELECT global_user_id, COUNT(*) AS post_count, SUM(engagement) AS total_engagement " +
+                "  FROM per_post GROUP BY global_user_id " +
+                ") " +
+                "SELECT ac.author, ac.audience_classification, ac.influence_tier, ac.posting_style, " +
+                "       ac.dominant_tone, ac.primary_platform, ac.branching_ratio, ac.total_posts, " +
+                "       pu.post_count, pu.total_engagement " +
+                "FROM per_user pu " +
+                "JOIN author_categories ac ON ac.author = pu.global_user_id " +
+                "WHERE ac.audience_classification = 'Brand Evangelist' " +
+                "ORDER BY ac.branching_ratio DESC NULLS LAST, pu.total_engagement DESC";
+
+        List<Map<String, Object>> rows = jdbc.queryForList(sql, keyword, keyword, keyword, keyword);
+        List<Map<String, Object>> out = new ArrayList<>(rows.size());
+        for (Map<String, Object> row : rows) {
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("author",                  row.get("author"));
+            entry.put("audienceClassification",  row.get("audience_classification"));
+            entry.put("influenceTier",           row.get("influence_tier"));
+            entry.put("postingStyle",            row.get("posting_style"));
+            entry.put("dominantTone",            row.get("dominant_tone"));
+            entry.put("primaryPlatform",         row.get("primary_platform"));
+            entry.put("branchingRatio",          toDouble(row.get("branching_ratio")));
+            entry.put("totalPosts",              toLong(row.get("total_posts")));
+            entry.put("keywordPostCount",        toLong(row.get("post_count")));
+            entry.put("keywordEngagement",       toLong(row.get("total_engagement")));
+            out.add(entry);
+        }
+        return out;
+    }
+
     /** Per-platform reach for {@code keyword} with relative-strength ratios. */
     public Map<String, Object> channelStrategy(String keyword, String entityLabel) {
         long[] x         = reachForTable("x_posts",          "views_count",  keyword);
