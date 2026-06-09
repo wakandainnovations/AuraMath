@@ -407,6 +407,70 @@ public class EntityMarketingService {
         return n == null ? 0L : n;
     }
 
+    // -------------------------------------------------------------------------
+    // Entity-scoped reach / engagement aggregates across the full keyword set.
+    // "Reach" reuses the platform exposure columns already used by
+    // channelStrategy (X→views_count, YouTube→likes_count, Reddit→num_comments,
+    // Instagram→like_count). "Engagement" sums the active-interaction columns
+    // (likes + comments) so it is a genuinely distinct signal from raw exposure
+    // — on X especially, reach (views) dwarfs engagement (likes+replies).
+    // Both scope by LOWER(keyword) IN (...), matching audienceSize(List).
+    // -------------------------------------------------------------------------
+
+    /** Per-platform exposure reach plus the cross-platform total, as a JSON-ready map. */
+    public Map<String, Object> reachByPlatform(List<String> keywords) {
+        long x  = reachSum("x_posts",          "COALESCE(views_count, 0)",   keywords);
+        long yt = reachSum("youtube_comments",  "COALESCE(likes_count, 0)",   keywords);
+        long rd = reachSum("reddit_posts",      "COALESCE(num_comments, 0)",  keywords);
+        long ig = reachSum("instagram_posts",   "COALESCE(like_count, 0)",    keywords);
+        return platformBreakdown(x, yt, rd, ig,
+                Map.of("X", "views_count", "YouTube", "likes_count",
+                       "Reddit", "num_comments", "Instagram", "like_count"));
+    }
+
+    /** Per-platform interaction engagement (likes + comments) plus the total. */
+    public Map<String, Object> engagementByPlatform(List<String> keywords) {
+        long x  = reachSum("x_posts",          "COALESCE(likes_count, 0) + COALESCE(comment_count, 0)",  keywords);
+        long yt = reachSum("youtube_comments",  "COALESCE(likes_count, 0) + COALESCE(reply_count, 0)",   keywords);
+        long rd = reachSum("reddit_posts",      "COALESCE(score, 0) + COALESCE(num_comments, 0)",        keywords);
+        long ig = reachSum("instagram_posts",   "COALESCE(like_count, 0) + COALESCE(comments_count, 0)", keywords);
+        return platformBreakdown(x, yt, rd, ig,
+                Map.of("X", "likes_count + comment_count", "YouTube", "likes_count + reply_count",
+                       "Reddit", "score + num_comments", "Instagram", "like_count + comments_count"));
+    }
+
+    /** SUM of {@code valueExpr} over rows whose keyword is in the entity's set. */
+    private long reachSum(String table, String valueExpr, List<String> keywords) {
+        if (keywords == null || keywords.isEmpty()) return 0L;
+        String in  = placeholders(keywords.size());
+        String sql = "SELECT COALESCE(SUM(" + valueExpr + "), 0)::bigint FROM " + table +
+                     " WHERE LOWER(keyword) IN (" + in + ")";
+        Long n = jdbc.queryForObject(sql, Long.class, repeatLowered(keywords, 1));
+        return n == null ? 0L : n;
+    }
+
+    private static Map<String, Object> platformBreakdown(
+            long x, long yt, long rd, long ig, Map<String, String> metricColumns) {
+        List<Map<String, Object>> channels = new ArrayList<>();
+        channels.add(channelEntry("X",         x,  0));
+        channels.add(channelEntry("YouTube",   yt, 0));
+        channels.add(channelEntry("Reddit",    rd, 0));
+        channels.add(channelEntry("Instagram", ig, 0));
+        channels.forEach(c -> c.remove("postCount"));   // postCount is not meaningful here
+        channels.sort((a, b) -> Long.compare((Long) b.get("reach"), (Long) a.get("reach")));
+
+        long total = x + yt + rd + ig;
+        for (Map<String, Object> c : channels) {
+            long v = (Long) c.get("reach");
+            c.put("share", total == 0 ? 0.0 : (double) v / total);
+        }
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("total",        total);
+        body.put("metricColumns", metricColumns);
+        body.put("byPlatform",   channels);
+        return body;
+    }
+
     private long[] reachForTable(String table, String reachColumn, String keyword) {
         String sql = "SELECT COALESCE(SUM(" + reachColumn + "), 0)::bigint AS reach, " +
                      "       COUNT(*)::bigint                              AS post_count " +
