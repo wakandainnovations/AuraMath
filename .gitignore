@@ -40,3 +40,4 @@ build/
 
 # Host-side Ask engine credentials must never be committed
 config.secrets
+src/main/resources/secrets.txt
