@@ -106,6 +106,17 @@ public class HawkesIntensityCalculator {
 
         final double T = eventTimes.get(eventTimes.size() - 1);
 
+        // If every event collapses to (near) the same instant the observation window is
+        // ~0. The Hawkes integral term then vanishes and the log-likelihood becomes
+        // unbounded in alpha, which makes BOBYQA's quadratic model degenerate and throw
+        // "trust region step has failed to reduce Q". alpha is not identifiable here, so
+        // skip the optimizer and report background rate only.
+        final double DISTINCT_EPS = 1e-9;
+        long distinctTimes = eventTimes.stream().distinct().count();
+        if (T <= DISTINCT_EPS || distinctTimes < 2) {
+            return new HawkesParameters(eventTimes.size() / Math.max(T, 1.0), 0.0);
+        }
+
         // The log-likelihood function for a Hawkes process with an exponential kernel.
         // We use a numerical optimizer to find the parameters that maximize this function.
         // This is equivalent to minimizing the negative log-likelihood.
@@ -154,17 +165,24 @@ public class HawkesIntensityCalculator {
 
         // Number of interpolation points: 2 * num_params + 1
         BOBYQAOptimizer optimizer = new BOBYQAOptimizer(5, initialRadius, stoppingRadius);
-        PointValuePair result = optimizer.optimize(
-                new MaxEval(2000),
-                new ObjectiveFunction(negLogLikelihood),
-                GoalType.MINIMIZE,
-                new InitialGuess(new double[]{muGuess, alphaGuess}),
-                // Bounds for parameters: mu > 0 and 0 <= alpha < beta for stationarity
-                new SimpleBounds(new double[]{1e-9, 0}, new double[]{muUpperBound, alphaRange})
-        );
+        try {
+            PointValuePair result = optimizer.optimize(
+                    new MaxEval(2000),
+                    new ObjectiveFunction(negLogLikelihood),
+                    GoalType.MINIMIZE,
+                    new InitialGuess(new double[]{muGuess, alphaGuess}),
+                    // Bounds for parameters: mu > 0 and 0 <= alpha < beta for stationarity
+                    new SimpleBounds(new double[]{1e-9, 0}, new double[]{muUpperBound, alphaRange})
+            );
 
-        double[] optimalParams = result.getPoint();
-        return new HawkesParameters(optimalParams[0], optimalParams[1]);
+            double[] optimalParams = result.getPoint();
+            return new HawkesParameters(optimalParams[0], optimalParams[1]);
+        } catch (org.apache.commons.math3.exception.MathIllegalStateException e) {
+            // BOBYQA could not improve its trust-region model (degenerate/ill-conditioned
+            // likelihood surface for this author's timing data). Fall back to the initial
+            // guess rather than failing the whole request.
+            return new HawkesParameters(muGuess, alphaGuess);
+        }
     }
 
 

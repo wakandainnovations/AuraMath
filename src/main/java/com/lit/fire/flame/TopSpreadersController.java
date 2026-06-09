@@ -1,6 +1,8 @@
 package com.lit.fire.flame;
 
 import com.lit.fire.flame.models.UniversalPost;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -16,6 +18,8 @@ import java.util.stream.Collectors;
 @RestController
 @RequestMapping("/api/marketing")
 public class TopSpreadersController {
+
+    private static final Logger log = LoggerFactory.getLogger(TopSpreadersController.class);
 
     private static final int TOP_N = 50;
     private static final double COMMENT_WEIGHT = 3.0;
@@ -58,10 +62,24 @@ public class TopSpreadersController {
 
         return postsByAuthor.entrySet().stream()
                 .filter(entry -> entry.getValue().size() >= 2)
-                .map(entry -> scoreAuthor(entry.getKey(), entry.getValue()))
+                .map(entry -> scoreAuthorSafely(entry.getKey(), entry.getValue()))
+                .filter(Objects::nonNull)
                 .sorted(Comparator.comparingDouble((Map<String, Object> r) -> (double) r.get("viral_potential_score")).reversed())
                 .limit(TOP_N)
                 .collect(Collectors.toList());
+    }
+
+    /**
+     * Scores a single author, isolating any failure so one bad author cannot abort the
+     * whole ranking. Returns null (skipping the author) if scoring throws.
+     */
+    private Map<String, Object> scoreAuthorSafely(String author, List<Map<String, Object>> authorPosts) {
+        try {
+            return scoreAuthor(author, authorPosts);
+        } catch (RuntimeException e) {
+            log.warn("Skipping author '{}' in top-spreaders ranking: {}", author, e.toString());
+            return null;
+        }
     }
 
     private Map<String, Object> scoreAuthor(String author, List<Map<String, Object>> authorPosts) {
