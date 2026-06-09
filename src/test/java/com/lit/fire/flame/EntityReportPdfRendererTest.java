@@ -62,6 +62,21 @@ public class EntityReportPdfRendererTest {
     }
 
     @Test
+    public void topAdvocatesRenderReadableHandleNotRawMapDump() throws Exception {
+        // Regression: the nested platform_handles structure must render as a readable "@handle",
+        // never as a raw Java map dump like "{x={post_count=2.0, profile_url=..., ...}}".
+        byte[] pdf = renderer.render(fullReport());
+        String text = extractPdfText(pdf);
+
+        assertTrue(text.contains("@superfan1"),
+                "advocate author should render as a readable handle derived from profile_url");
+        assertFalse(text.contains("post_count="),
+                "raw map fields must not leak into the rendered report");
+        assertFalse(text.contains("by_platform"),
+                "raw map structure must not leak into the rendered report");
+    }
+
+    @Test
     public void rendersWhenSentimentBreakdownHasZeroSegments() {
         // A degenerate sentiment split (all neutral) exercises the zero-width-segment guard
         // in the stacked bar without producing a malformed table.
@@ -203,11 +218,10 @@ public class EntityReportPdfRendererTest {
         List<Map<String, Object>> out = new ArrayList<>();
         for (int i = 1; i <= 3; i++) {
             Map<String, Object> a = new LinkedHashMap<>();
-            Map<String, Object> handles = new LinkedHashMap<>();
-            handles.put("x", "@superfan" + i);
             a.put("global_user_id", "u-" + i);
             a.put("tribe_label", "Pop Superfans");
-            a.put("platform_handles", handles);
+            // Real production shape: { primary_platform, by_platform: { "x": { profile_url, ... } } }.
+            a.put("platform_handles", nestedPlatformHandles("superfan" + i));
             a.put("peak_activity_times", new LinkedHashMap<>());
             a.put("hawkes_alpha", 0.9 - i * 0.1);
             a.put("post_count", 320L - i * 10);
@@ -216,6 +230,23 @@ public class EntityReportPdfRendererTest {
             out.add(a);
         }
         return out;
+    }
+
+    /** Mirrors MarketingEnrichmentEngine.buildPlatformHandlesJson — the nested structure stored in the DB. */
+    private Map<String, Object> nestedPlatformHandles(String handle) {
+        Map<String, Object> entry = new LinkedHashMap<>();
+        entry.put("profile_url", "https://twitter.com/" + handle);
+        entry.put("sample_post_url", "https://twitter.com/" + handle + "/status/2043283814571467216");
+        entry.put("post_count", 2.0);
+        entry.put("total_likes", 1.0);
+        entry.put("total_comments", 0.0);
+        entry.put("avg_engagement_per_post", 0.5);
+        Map<String, Object> byPlatform = new LinkedHashMap<>();
+        byPlatform.put("x", entry);
+        Map<String, Object> handles = new LinkedHashMap<>();
+        handles.put("primary_platform", "x");
+        handles.put("by_platform", byPlatform);
+        return handles;
     }
 
     private Map<String, Object> recommendations() {
@@ -283,5 +314,17 @@ public class EntityReportPdfRendererTest {
     private static boolean containsEof(byte[] pdf) {
         String tail = new String(pdf, Math.max(0, pdf.length - 1024), Math.min(pdf.length, 1024), StandardCharsets.ISO_8859_1);
         return tail.contains("%%EOF");
+    }
+
+    private static String extractPdfText(byte[] pdf) throws Exception {
+        com.lowagie.text.pdf.PdfReader reader = new com.lowagie.text.pdf.PdfReader(pdf);
+        com.lowagie.text.pdf.parser.PdfTextExtractor extractor =
+                new com.lowagie.text.pdf.parser.PdfTextExtractor(reader);
+        StringBuilder sb = new StringBuilder();
+        for (int page = 1; page <= reader.getNumberOfPages(); page++) {
+            sb.append(extractor.getTextFromPage(page)).append('\n');
+        }
+        reader.close();
+        return sb.toString();
     }
 }

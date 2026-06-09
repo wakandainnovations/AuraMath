@@ -697,14 +697,49 @@ public class EntityReportPdfRenderer {
     }
 
     private static String advocateHandle(Map<String, Object> a) {
-        Object handles = a.get("platform_handles");
-        if (handles instanceof Map && !((Map<?, ?>) handles).isEmpty()) {
-            Object first = ((Map<?, ?>) handles).values().iterator().next();
-            String h = String.valueOf(first);
-            if (!h.isEmpty() && !"null".equals(h)) return h;
+        Map<String, Object> handles = asMap(a.get("platform_handles"));
+        if (!handles.isEmpty()) {
+            // Real shape: { primary_platform: "x", by_platform: { "x": { profile_url, ... } } }.
+            // Fall back to treating the map itself as the per-platform map (legacy/flat shapes).
+            Map<String, Object> byPlatform = asMap(handles.get("by_platform"));
+            if (byPlatform.isEmpty()) byPlatform = handles;
+            if (!byPlatform.isEmpty()) {
+                String primary = str(handles, "primary_platform", "");
+                Object selected = byPlatform.get(primary);
+                if (!(selected instanceof Map)) selected = byPlatform.values().iterator().next();
+
+                if (selected instanceof Map) {
+                    Map<String, Object> entry = asMap(selected);
+                    String handle = handleFromProfileUrl(str(entry, "profile_url", ""));
+                    if (!handle.isEmpty()) return handle;
+                    String url = str(entry, "profile_url", "");
+                    if (!url.isEmpty()) return url;
+                } else {
+                    // Legacy flat shape: values are plain handle strings.
+                    String h = String.valueOf(selected);
+                    if (!h.isEmpty() && !"null".equals(h)) return h;
+                }
+            }
         }
         String gid = str(a, "global_user_id", "");
         return gid.isEmpty() ? "—" : gid;
+    }
+
+    /** Derive a readable "@handle" from a profile URL, e.g. https://twitter.com/mmcLondon -> @mmcLondon. */
+    private static String handleFromProfileUrl(String url) {
+        if (url == null) return "";
+        String u = url.trim();
+        if (u.isEmpty()) return "";
+        int q = u.indexOf('?');
+        if (q >= 0) u = u.substring(0, q);
+        int hash = u.indexOf('#');
+        if (hash >= 0) u = u.substring(0, hash);
+        while (u.endsWith("/")) u = u.substring(0, u.length() - 1);
+        int slash = u.lastIndexOf('/');
+        String last = slash >= 0 ? u.substring(slash + 1) : u;
+        if (last.isEmpty() || last.contains(".")) return "";
+        if (last.startsWith("@")) last = last.substring(1);
+        return last.isEmpty() ? "" : "@" + last;
     }
 
     private static Color toneColor(String tone) {
