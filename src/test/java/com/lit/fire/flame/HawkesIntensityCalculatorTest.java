@@ -1,7 +1,7 @@
 package com.lit.fire.flame;
 
 import com.lit.fire.flame.models.UniversalPost;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
@@ -11,8 +11,8 @@ import java.util.stream.Collectors;
 import java.util.stream.LongStream;
 import java.util.stream.Stream;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Tests for {@link HawkesIntensityCalculator}, focused on the degenerate inputs that
@@ -37,11 +37,11 @@ public class HawkesIntensityCalculatorTest {
 
     /** Asserts the parameters are finite and respect the model's bound constraints. */
     private static void assertValid(HawkesIntensityCalculator.HawkesParameters p, double beta) {
-        assertTrue("mu should be finite", Double.isFinite(p.mu));
-        assertTrue("alpha should be finite", Double.isFinite(p.alpha));
-        assertTrue("mu should be non-negative", p.mu >= 0);
-        assertTrue("alpha should be non-negative", p.alpha >= 0);
-        assertTrue("alpha should stay below beta for stationarity", p.alpha < beta);
+        assertTrue(Double.isFinite(p.mu), "mu should be finite");
+        assertTrue(Double.isFinite(p.alpha), "alpha should be finite");
+        assertTrue(p.mu >= 0, "mu should be non-negative");
+        assertTrue(p.alpha >= 0, "alpha should be non-negative");
+        assertTrue(p.alpha < beta, "alpha should stay below beta for stationarity");
     }
 
     @Test
