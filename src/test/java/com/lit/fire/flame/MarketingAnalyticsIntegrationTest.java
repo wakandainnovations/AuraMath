@@ -1,19 +1,17 @@
 package com.lit.fire.flame;
 
-import org.junit.Test;
-import org.junit.runner.RunWith;
+import org.junit.jupiter.api.Disabled;
+import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.test.context.junit4.SpringRunner;
 
 import java.util.List;
 import java.util.Map;
 
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 
-@RunWith(SpringRunner.class)
 @SpringBootTest
 public class MarketingAnalyticsIntegrationTest {
 
@@ -24,6 +22,8 @@ public class MarketingAnalyticsIntegrationTest {
     private MarketingEnrichmentEngine marketingEnrichmentEngine;
 
     @Test
+    @Disabled("Manual integration test: requires a populated local 'aura' DB and mutates "
+            + "marketing_target_profiles via enrichAndSave(). Run explicitly, not in the default suite.")
     public void executeMarketingAnalyticsPipeline() {
         // 1. Establish a real JDBC connection to the database
         // Verify database has data
@@ -80,7 +80,7 @@ public class MarketingAnalyticsIntegrationTest {
         System.out.println("=======================================");
         
         // Assertions to ensure it doesn't use hardcoded data (we fetched from DB)
-        assertNotNull("Seed author should not be null", seedAuthorId);
-        assertFalse("Lookalikes list should not be empty", lookalikes.isEmpty());
+        assertNotNull(seedAuthorId, "Seed author should not be null");
+        assertFalse(lookalikes.isEmpty(), "Lookalikes list should not be empty");
     }
 }
