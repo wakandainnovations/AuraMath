@@ -39,7 +39,7 @@ import java.util.stream.Collectors;
  *   topicIntelligence      – which keywords drive bursts and at what tone
  *   audienceSentiment      – overall sentiment of the conversation
  *   channelStrategy        – where the conversation lives across platforms
- *   topAdvocates           – highest-amplification voices in the conversation
+ *   topAdvocates           – highest-engagement voices in the conversation
  *   marketingRecommendations – actionable campaign guidance
  *   redFlags               – risks a marketer should know
  *   opportunityFlags       – specific openings to exploit

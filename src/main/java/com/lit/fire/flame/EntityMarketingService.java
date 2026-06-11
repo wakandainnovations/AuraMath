@@ -320,12 +320,20 @@ public class EntityMarketingService {
         return n == null ? 0L : n;
     }
 
-    /** Top-N advocates for an entity ranked by Hawkes alpha, across its keyword set. */
+    /**
+     * Top-N advocates for an entity ranked by total engagement aggregated across
+     * its keyword set, with Hawkes alpha breaking ties.
+     */
     public List<Map<String, Object>> topSpreaders(List<String> keywords, int limit) {
         if (keywords == null || keywords.isEmpty()) return List.of();
         List<Map<String, Object>> rows = aggregateByKeywords(keywords);
-        rows.sort((a, b) -> Double.compare(toDouble(b.get("influence_rank")),
-                                           toDouble(a.get("influence_rank"))));
+        rows.sort((a, b) -> {
+            int byEngagement = Long.compare(toLong(b.get("total_engagement")),
+                                            toLong(a.get("total_engagement")));
+            if (byEngagement != 0) return byEngagement;
+            return Double.compare(toDouble(b.get("influence_rank")),
+                                  toDouble(a.get("influence_rank")));
+        });
 
         int take = Math.min(limit, rows.size());
         List<Map<String, Object>> out = new ArrayList<>(take);
@@ -345,21 +353,27 @@ public class EntityMarketingService {
         return out;
     }
 
-    /** Per-user activity aggregated across an entity's full keyword set. */
+    /**
+     * Per-user activity aggregated across an entity's full keyword set.
+     * Engagement sums the active-interaction columns per platform (likes +
+     * comments), matching {@link #engagementByPlatform} — not raw exposure
+     * like X views, which would let one viral view-count drown out genuinely
+     * interactive advocates.
+     */
     private List<Map<String, Object>> aggregateByKeywords(List<String> keywords) {
         String in = placeholders(keywords.size());
         String sql =
                 "WITH per_post AS (" +
-                "  SELECT author AS global_user_id, COALESCE(views_count, 0)::bigint AS engagement " +
+                "  SELECT author AS global_user_id, (COALESCE(likes_count, 0) + COALESCE(comment_count, 0))::bigint AS engagement " +
                 "  FROM x_posts          WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' AND sentiment_score <> 0 " +
                 "  UNION ALL " +
-                "  SELECT author, COALESCE(likes_count, 0)::bigint " +
+                "  SELECT author, (COALESCE(likes_count, 0) + COALESCE(reply_count, 0))::bigint " +
                 "  FROM youtube_comments WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' AND sentiment_score <> 0 " +
                 "  UNION ALL " +
-                "  SELECT author, COALESCE(num_comments, 0)::bigint " +
+                "  SELECT author, (COALESCE(score, 0) + COALESCE(num_comments, 0))::bigint " +
                 "  FROM reddit_posts     WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' AND sentiment_score <> 0 " +
                 "  UNION ALL " +
-                "  SELECT author, COALESCE(like_count, 0)::bigint " +
+                "  SELECT author, (COALESCE(like_count, 0) + COALESCE(comments_count, 0))::bigint " +
                 "  FROM instagram_posts  WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' AND sentiment_score <> 0 " +
                 "), per_user AS (" +
                 "  SELECT global_user_id, COUNT(*) AS post_count, SUM(engagement) AS total_engagement " +

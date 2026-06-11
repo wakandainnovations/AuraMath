@@ -341,7 +341,7 @@ public class EntityReportPdfRenderer {
     private void topAdvocates(Document doc, List<Object> advocates) throws DocumentException {
         if (advocates.isEmpty()) return;
         sectionHeader(doc, "07", "Top Advocates");
-        Paragraph p = new Paragraph("The highest-amplification voices already driving this conversation — natural seeding targets.", SMALL);
+        Paragraph p = new Paragraph("The highest-engagement voices already driving this conversation — natural seeding targets.", SMALL);
         p.setSpacingAfter(7f);
         doc.add(p);
 
