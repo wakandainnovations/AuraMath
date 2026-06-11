@@ -340,13 +340,19 @@ public class EntityMarketingService {
         for (int i = 0; i < take; i++) {
             Map<String, Object> row = rows.get(i);
             Map<String, Object> entry = new LinkedHashMap<>();
+            long postCount       = toLong(row.get("post_count"));
+            long totalEngagement = toLong(row.get("total_engagement"));
             entry.put("global_user_id",      row.get("global_user_id"));
             entry.put("tribe_label",         row.get("tribe_label"));
             entry.put("platform_handles",    JsonbUtil.asTree(row.get("platform_handles"), gson));
             entry.put("peak_activity_times", JsonbUtil.asTree(row.get("peak_activity_times"), gson));
             entry.put("hawkes_alpha",        toDouble(row.get("influence_rank")));
-            entry.put("post_count",          toLong(row.get("post_count")));
-            entry.put("total_engagement",    toLong(row.get("total_engagement")));
+            entry.put("post_count",          postCount);
+            entry.put("total_likes",         toLong(row.get("total_likes")));
+            entry.put("total_comments",      toLong(row.get("total_comments")));
+            entry.put("total_engagement",    totalEngagement);
+            entry.put("engagement_per_post", postCount == 0 ? 0L
+                                                            : Math.round((double) totalEngagement / postCount));
             entry.put("moi_score",           toDouble(row.get("moi_score")));
             out.add(entry);
         }
@@ -358,29 +364,33 @@ public class EntityMarketingService {
      * Engagement sums the active-interaction columns per platform (likes +
      * comments), matching {@link #engagementByPlatform} — not raw exposure
      * like X views, which would let one viral view-count drown out genuinely
-     * interactive advocates.
+     * interactive advocates. Likes and comments are also carried separately
+     * so callers can show what an author's engagement is made of (Reddit's
+     * "likes" component is its post score).
      */
     private List<Map<String, Object>> aggregateByKeywords(List<String> keywords) {
         String in = placeholders(keywords.size());
         String sql =
                 "WITH per_post AS (" +
-                "  SELECT author AS global_user_id, (COALESCE(likes_count, 0) + COALESCE(comment_count, 0))::bigint AS engagement " +
+                "  SELECT author AS global_user_id, COALESCE(likes_count, 0)::bigint AS likes, COALESCE(comment_count, 0)::bigint AS comments " +
                 "  FROM x_posts          WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' AND sentiment_score <> 0 " +
                 "  UNION ALL " +
-                "  SELECT author, (COALESCE(likes_count, 0) + COALESCE(reply_count, 0))::bigint " +
+                "  SELECT author, COALESCE(likes_count, 0)::bigint, COALESCE(reply_count, 0)::bigint " +
                 "  FROM youtube_comments WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' AND sentiment_score <> 0 " +
                 "  UNION ALL " +
-                "  SELECT author, (COALESCE(score, 0) + COALESCE(num_comments, 0))::bigint " +
+                "  SELECT author, COALESCE(score, 0)::bigint, COALESCE(num_comments, 0)::bigint " +
                 "  FROM reddit_posts     WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' AND sentiment_score <> 0 " +
                 "  UNION ALL " +
-                "  SELECT author, (COALESCE(like_count, 0) + COALESCE(comments_count, 0))::bigint " +
+                "  SELECT author, COALESCE(like_count, 0)::bigint, COALESCE(comments_count, 0)::bigint " +
                 "  FROM instagram_posts  WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' AND sentiment_score <> 0 " +
                 "), per_user AS (" +
-                "  SELECT global_user_id, COUNT(*) AS post_count, SUM(engagement) AS total_engagement " +
+                "  SELECT global_user_id, COUNT(*) AS post_count, SUM(likes) AS total_likes, " +
+                "         SUM(comments) AS total_comments, SUM(likes + comments) AS total_engagement " +
                 "  FROM per_post GROUP BY global_user_id " +
                 ") " +
                 "SELECT m.global_user_id, m.platform_handles, m.tribe_label, m.influence_rank, " +
-                "       m.peak_activity_times, m.moi_score, pu.post_count, pu.total_engagement " +
+                "       m.peak_activity_times, m.moi_score, pu.post_count, " +
+                "       pu.total_likes, pu.total_comments, pu.total_engagement " +
                 "FROM per_user pu " +
                 "JOIN marketing_target_profiles m ON m.global_user_id = pu.global_user_id";
         return jdbc.queryForList(sql, repeatLowered(keywords, 4));

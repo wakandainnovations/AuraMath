@@ -341,12 +341,13 @@ public class EntityReportPdfRenderer {
     private void topAdvocates(Document doc, List<Object> advocates) throws DocumentException {
         if (advocates.isEmpty()) return;
         sectionHeader(doc, "07", "Top Advocates");
-        Paragraph p = new Paragraph("The highest-engagement voices already driving this conversation — natural seeding targets.", SMALL);
+        Paragraph p = new Paragraph("The highest-engagement voices already driving this conversation — natural seeding targets. "
+                + "Engagement counts likes and comments earned across the author's posts, so a single viral post can outrank a high-volume poster.", SMALL);
         p.setSpacingAfter(7f);
         doc.add(p);
 
-        PdfPTable t = fullWidth(new float[]{ 34, 24, 14, 14, 14 });
-        headerRow(t, "AUTHOR", "SEGMENT", "POSTS", "ENGAGEMENT", "INFLUENCE");
+        PdfPTable t = fullWidth(new float[]{ 26, 18, 9, 12, 12, 13, 10 });
+        headerRow(t, "AUTHOR", "SEGMENT", "POSTS", "LIKES", "COMMENTS", "ENGAGEMENT", "INFLUENCE");
         int i = 0;
         int shown = 0;
         for (Object o : advocates) {
@@ -356,6 +357,8 @@ public class EntityReportPdfRenderer {
             td(t, advocateHandle(a), bg, true, Element.ALIGN_LEFT);
             td(t, str(a, "tribe_label", "—"), bg, false, Element.ALIGN_LEFT);
             td(t, fmtInt(a.get("post_count")), bg, false, Element.ALIGN_CENTER);
+            td(t, fmtInt(a.get("total_likes")), bg, false, Element.ALIGN_CENTER);
+            td(t, fmtInt(a.get("total_comments")), bg, false, Element.ALIGN_CENTER);
             td(t, fmtInt(a.get("total_engagement")), bg, false, Element.ALIGN_CENTER);
             td(t, String.format("%.2f", num(a.get("hawkes_alpha"))), bg, false, Element.ALIGN_CENTER);
         }
