@@ -371,13 +371,15 @@ valid `{genre}` path values for the three endpoints below.
 
 **`GET /api/marketing/genre/{genre}/potential-viewers`**
 
-Users whose `top_genres[{genre}]` > `0.7`, sorted by predicted conversion probability
-`p_conv = sigmoid(genre_interest_score * influence_rank)`.
+Users whose `top_movie_genres[{genre}]` > `1.0`, sorted by predicted conversion probability
+`p_conv = sigmoid(genre_interest_score * influence_rank)`. The genre weight sums the
+classifier's per-post scores, and one matched post contributes at least `1.0`, so the
+threshold requires more than a single post's worth of genre signal.
 
 ```json
 {
   "genre": "horror",
-  "threshold": 0.7,
+  "threshold": 1.0,
   "scoringModel": "p_conv = 1 / (1 + exp(-(genre_interest_score * influence_rank)))",
   "totalViewers": 27,
   "viewers": [
@@ -386,10 +388,10 @@ Users whose `top_genres[{genre}]` > `0.7`, sorted by predicted conversion probab
       "tribe_label": "Cinephile-Critic",
       "platform_handles": { "primary_platform": "x", "by_platform": { "x": {"profile_url": "..."} } },
       "peak_activity_times": { "hours": [21,22,23] },
-      "genre_interest_score": 0.91,
+      "genre_interest_score": 3.0,
       "influence_rank": 0.84,
       "moi_score": 12.7,
-      "p_conv": 0.683
+      "p_conv": 0.926
     }
   ]
 }

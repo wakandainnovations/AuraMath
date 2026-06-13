@@ -27,7 +27,10 @@ import java.util.Map;
 @RequestMapping("/api/marketing/genre")
 public class GenreMarketingAPI {
 
-    private static final double GENRE_INTEREST_THRESHOLD = 0.7;
+    // top_movie_genres weights are per-post classifier scores summed over the
+    // user's posts, and a single matched post contributes at least 1.0 — so
+    // requiring > 1.0 means more than one post's worth of genre signal.
+    private static final double GENRE_INTEREST_THRESHOLD = 1.0;
     private static final int    SUPER_SPREADER_LIMIT     = 50;
 
     private static final Type GENRE_MAP_TYPE = new TypeToken<Map<String, Double>>() {}.getType();
@@ -60,16 +63,16 @@ public class GenreMarketingAPI {
     // -------------------------------------------------------------------------
     // GET /api/marketing/genre/{genre}/potential-viewers
     //
-    // Users whose GenreInterestScore for {genre} > 0.7, sorted by conversion
-    // probability P_conv = sigmoid(genreInterestScore * influence_rank).
+    // Users whose GenreInterestScore for {genre} exceeds GENRE_INTEREST_THRESHOLD,
+    // sorted by conversion probability P_conv = sigmoid(genreInterestScore * influence_rank).
     // -------------------------------------------------------------------------
     @GetMapping("/{genre}/potential-viewers")
     public ResponseEntity<Map<String, Object>> potentialViewers(@PathVariable String genre) {
         List<Map<String, Object>> rows = jdbc.queryForList(
                 "SELECT global_user_id, platform_handles, tribe_label, influence_rank, " +
-                "       top_genres, peak_activity_times, moi_score " +
+                "       top_movie_genres, peak_activity_times, moi_score " +
                 "FROM marketing_target_profiles " +
-                "WHERE top_genres::text ILIKE ?",
+                "WHERE top_movie_genres::text ILIKE ?",
                 "%\"" + genre + "\"%");
 
         List<Map<String, Object>> viewers = new ArrayList<>();
@@ -114,9 +117,9 @@ public class GenreMarketingAPI {
     public ResponseEntity<Map<String, Object>> superSpreaders(@PathVariable String genre) {
         List<Map<String, Object>> rows = jdbc.queryForList(
                 "SELECT global_user_id, platform_handles, tribe_label, influence_rank, " +
-                "       top_genres, peak_activity_times, moi_score " +
+                "       top_movie_genres, peak_activity_times, moi_score " +
                 "FROM marketing_target_profiles " +
-                "WHERE top_genres::text ILIKE ? " +
+                "WHERE top_movie_genres::text ILIKE ? " +
                 "ORDER BY influence_rank DESC NULLS LAST " +
                 "LIMIT ?",
                 "%\"" + genre + "\"%", SUPER_SPREADER_LIMIT);
@@ -171,7 +174,7 @@ public class GenreMarketingAPI {
         long[] instagramStats = classifyTable("instagram_posts",  genre);
 
         Long audienceSize = jdbc.queryForObject(
-                "SELECT COUNT(*) FROM marketing_target_profiles WHERE top_genres::text ILIKE ?",
+                "SELECT COUNT(*) FROM marketing_target_profiles WHERE top_movie_genres::text ILIKE ?",
                 Long.class, "%\"" + genre + "\"%");
 
         List<Map<String, Object>> channels = new ArrayList<>();
@@ -218,7 +221,7 @@ public class GenreMarketingAPI {
     // -------------------------------------------------------------------------
 
     private Double extractGenreScore(Map<String, Object> row, String genre) {
-        String json = JsonbUtil.asJsonString(row.get("top_genres"));
+        String json = JsonbUtil.asJsonString(row.get("top_movie_genres"));
         if (json == null || json.isEmpty()) {
             return null;
         }

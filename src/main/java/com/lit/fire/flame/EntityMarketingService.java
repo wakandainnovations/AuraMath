@@ -14,8 +14,8 @@ import java.util.Map;
 /**
  * Shared back-end for keyword-scoped marketing endpoints (politics, celebrity).
  *
- * Genre routes use {@code marketing_target_profiles.top_genres} because genre
- * scores are precomputed at enrichment time. Parties and celebrities have no
+ * Genre routes use {@code marketing_target_profiles.top_movie_genres} because
+ * genre scores are precomputed at enrichment time. Parties and celebrities have no
  * equivalent column, so we identify their audience by matching the post's
  * {@code keyword} field against the entity's {@code entity_keywords} rows
  * (case-insensitive), aggregating engagement per author, and joining back to
