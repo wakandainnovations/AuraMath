@@ -350,6 +350,7 @@ public class EntityMarketingService {
             entry.put("post_count",          postCount);
             entry.put("total_likes",         toLong(row.get("total_likes")));
             entry.put("total_comments",      toLong(row.get("total_comments")));
+            entry.put("total_views",         toLong(row.get("total_views")));
             entry.put("total_engagement",    totalEngagement);
             entry.put("engagement_per_post", postCount == 0 ? 0L
                                                             : Math.round((double) totalEngagement / postCount));
@@ -366,31 +367,35 @@ public class EntityMarketingService {
      * like X views, which would let one viral view-count drown out genuinely
      * interactive advocates. Likes and comments are also carried separately
      * so callers can show what an author's engagement is made of (Reddit's
-     * "likes" component is its post score).
+     * "likes" component is its post score). Views are carried as a separate
+     * informational column — kept out of total_engagement for the reason
+     * above — and only X exposes a view count, so the other platforms
+     * contribute zero.
      */
     private List<Map<String, Object>> aggregateByKeywords(List<String> keywords) {
         String in = placeholders(keywords.size());
         String sql =
                 "WITH per_post AS (" +
-                "  SELECT author AS global_user_id, COALESCE(likes_count, 0)::bigint AS likes, COALESCE(comment_count, 0)::bigint AS comments " +
+                "  SELECT author AS global_user_id, COALESCE(likes_count, 0)::bigint AS likes, COALESCE(comment_count, 0)::bigint AS comments, COALESCE(views_count, 0)::bigint AS views " +
                 "  FROM x_posts          WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' AND sentiment_score <> 0 " +
                 "  UNION ALL " +
-                "  SELECT author, COALESCE(likes_count, 0)::bigint, COALESCE(reply_count, 0)::bigint " +
+                "  SELECT author, COALESCE(likes_count, 0)::bigint, COALESCE(reply_count, 0)::bigint, 0::bigint " +
                 "  FROM youtube_comments WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' AND sentiment_score <> 0 " +
                 "  UNION ALL " +
-                "  SELECT author, COALESCE(score, 0)::bigint, COALESCE(num_comments, 0)::bigint " +
+                "  SELECT author, COALESCE(score, 0)::bigint, COALESCE(num_comments, 0)::bigint, 0::bigint " +
                 "  FROM reddit_posts     WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' AND sentiment_score <> 0 " +
                 "  UNION ALL " +
-                "  SELECT author, COALESCE(like_count, 0)::bigint, COALESCE(comments_count, 0)::bigint " +
+                "  SELECT author, COALESCE(like_count, 0)::bigint, COALESCE(comments_count, 0)::bigint, 0::bigint " +
                 "  FROM instagram_posts  WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' AND sentiment_score <> 0 " +
                 "), per_user AS (" +
                 "  SELECT global_user_id, COUNT(*) AS post_count, SUM(likes) AS total_likes, " +
-                "         SUM(comments) AS total_comments, SUM(likes + comments) AS total_engagement " +
+                "         SUM(comments) AS total_comments, SUM(views) AS total_views, " +
+                "         SUM(likes + comments) AS total_engagement " +
                 "  FROM per_post GROUP BY global_user_id " +
                 ") " +
                 "SELECT m.global_user_id, m.platform_handles, m.tribe_label, m.influence_rank, " +
                 "       m.peak_activity_times, m.moi_score, pu.post_count, " +
-                "       pu.total_likes, pu.total_comments, pu.total_engagement " +
+                "       pu.total_likes, pu.total_comments, pu.total_views, pu.total_engagement " +
                 "FROM per_user pu " +
                 "JOIN marketing_target_profiles m ON m.global_user_id = pu.global_user_id";
         return jdbc.queryForList(sql, repeatLowered(keywords, 4));
