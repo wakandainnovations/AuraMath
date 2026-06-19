@@ -33,7 +33,7 @@ public class TopicalSpreaderDetector {
     @Autowired
     public TopicalSpreaderDetector(JdbcTemplate jdbc,
                                    GenreClassifier classifier,
-                                   @Value("${hawkes.beta:1.0}") double beta) {
+                                   @Value("${hawkes.beta:3.0}") double beta) {
         this.jdbc = jdbc;
         this.classifier = classifier;
         this.beta = beta;

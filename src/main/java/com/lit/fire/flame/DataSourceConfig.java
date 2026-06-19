@@ -1,6 +1,7 @@
 package com.lit.fire.flame;
 
 import com.fasterxml.jackson.core.JsonGenerator;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.jackson.Jackson2ObjectMapperBuilderCustomizer;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -44,8 +45,17 @@ public class DataSourceConfig {
         return new AspectSentimentAnalyzer();
     }
 
+    /**
+     * Exponential-kernel decay rate (per HOUR — event times are rescaled to hours in
+     * {@link HawkesIntensityCalculator}). beta sets both the self-excitation half-life
+     * (ln 2 / beta hours) and the stationarity ceiling on alpha (0 <= alpha < beta).
+     * Raised from the historical 1.0 so bursty cascade-starters are no longer clipped at
+     * the alpha = 1.0 boundary. Tune via the {@code hawkes.beta} property.
+     */
     @Bean
-    public HawkesIntensityCalculator hawkesIntensityCalculator(DataSource dataSource) throws SQLException {
-        return new HawkesIntensityCalculator(dataSource.getConnection(), 1.0);
+    public HawkesIntensityCalculator hawkesIntensityCalculator(
+            DataSource dataSource,
+            @Value("${hawkes.beta:3.0}") double beta) throws SQLException {
+        return new HawkesIntensityCalculator(dataSource.getConnection(), beta);
     }
 }

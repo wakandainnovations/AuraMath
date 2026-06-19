@@ -36,6 +36,16 @@ public class HawkesIntensityCalculator {
     private final double beta;
 
     /**
+     * Event times are rescaled to HOURS before estimation. The exponential kernel decay
+     * exp(-beta * dt) is only meaningful when beta and the inter-event spacing share a
+     * scale: with beta = 1.0 and event times in seconds, the kernel decays to ~0 within
+     * ~20s while real posts are minutes-to-days apart, making alpha unidentifiable and
+     * pinning it to its lower bound for every author. Working in hours keeps beta = 1.0
+     * (a ~0.7h half-life) meaningful for typical posting cadence.
+     */
+    private static final double SECONDS_PER_HOUR = 3600.0;
+
+    /**
      * A simple data class to hold the estimated Hawkes process parameters.
      */
     public static class HawkesParameters {
@@ -83,9 +93,10 @@ public class HawkesIntensityCalculator {
                 .collect(Collectors.toList());
 
         if (!eventTimes.isEmpty()) {
-            long firstTimestamp = eventTimes.get(0).longValue();
+            double firstTimestamp = eventTimes.get(0);
+            // Rescale to hours relative to the first event (see SECONDS_PER_HOUR).
             eventTimes = eventTimes.stream()
-                    .map(t -> (t - firstTimestamp))
+                    .map(t -> (t - firstTimestamp) / SECONDS_PER_HOUR)
                     .collect(Collectors.toList());
         }
 
@@ -190,7 +201,7 @@ public class HawkesIntensityCalculator {
      * Retrieves and processes event timestamps for a given author from the database.
      *
      * @param author The author whose posts are to be fetched.
-     * @return A list of event times in seconds, relative to the first event.
+     * @return A list of event times in hours, relative to the first event.
      * @throws SQLException if a database access error occurs.
      */
     private List<Double> getEventTimesForAuthor(String author) throws SQLException {
@@ -217,9 +228,9 @@ public class HawkesIntensityCalculator {
                         if (firstTimestamp == -1) {
                             firstTimestamp = timestamp.getTime();
                         }
-                        // Convert timestamps to seconds relative to the first event
-                        double eventTimeInSeconds = (timestamp.getTime() - firstTimestamp) / 1000.0;
-                        eventTimes.add(eventTimeInSeconds);
+                        // Convert timestamps to hours relative to the first event (see SECONDS_PER_HOUR).
+                        double eventTimeInHours = (timestamp.getTime() - firstTimestamp) / 1000.0 / SECONDS_PER_HOUR;
+                        eventTimes.add(eventTimeInHours);
                     }
                 }
             }
