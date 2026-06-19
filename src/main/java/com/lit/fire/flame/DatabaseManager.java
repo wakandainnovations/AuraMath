@@ -39,9 +39,10 @@ public class DatabaseManager {
 
             connection = DriverManager.getConnection(dbUrl, dbUser, dbPassword);
 
-            // Initialize HawkesIntensityCalculator with a default beta value.
-            // This can be made configurable.
-            double defaultBeta = 1.0;
+            // Initialize HawkesIntensityCalculator with a default beta value (per hour;
+            // event times are rescaled to hours before estimation). Matches the
+            // hawkes.beta default used by the Spring-managed beans.
+            double defaultBeta = 3.0;
             hawkesCalculator = new HawkesIntensityCalculator(connection, defaultBeta);
             aspectAnalyzer = new AspectSentimentAnalyzer();
         } catch (SQLException e) {
