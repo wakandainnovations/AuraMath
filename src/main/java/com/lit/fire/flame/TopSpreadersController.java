@@ -4,6 +4,7 @@ import com.lit.fire.flame.models.UniversalPost;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -24,6 +25,16 @@ public class TopSpreadersController {
     private static final int TOP_N = 50;
     private static final double COMMENT_WEIGHT = 3.0;
 
+    /**
+     * Minimum matching posts an author needs to enter the ranking. Authors below this are
+     * dropped before scoring. Defaults to 1 (no gating); raise it to require repeat activity.
+     * Single-post authors get a well-defined alpha = 0 from the Hawkes estimator, so a low
+     * threshold is safe — it just admits sparse keywords (e.g. niche/new titles) that would
+     * otherwise return empty.
+     */
+    @Value("${top-spreaders.min-posts:1}")
+    private int minPosts;
+
     @Autowired
     private JdbcTemplate jdbcTemplate;
 
@@ -41,7 +52,8 @@ public class TopSpreadersController {
      * without zeroing out high-engagement organic spreaders whose post cadence fits α ≈ 0.
      *
      * Comments are weighted 3× likes because they require materially more user effort and
-     * correlate more strongly with downstream sharing. Requires ≥ 2 matching posts per author.
+     * correlate more strongly with downstream sharing. Authors need at least
+     * {@code top-spreaders.min-posts} matching posts (default 1) to be ranked.
      *
      * average_sentiment_score is included so the team avoids seeding with high-influence detractors.
      */
@@ -61,7 +73,7 @@ public class TopSpreadersController {
                 .collect(Collectors.groupingBy(r -> (String) r.get("author")));
 
         return postsByAuthor.entrySet().stream()
-                .filter(entry -> entry.getValue().size() >= 2)
+                .filter(entry -> entry.getValue().size() >= minPosts)
                 .map(entry -> scoreAuthorSafely(entry.getKey(), entry.getValue()))
                 .filter(Objects::nonNull)
                 .sorted(Comparator.comparingDouble((Map<String, Object> r) -> (double) r.get("viral_potential_score")).reversed())
