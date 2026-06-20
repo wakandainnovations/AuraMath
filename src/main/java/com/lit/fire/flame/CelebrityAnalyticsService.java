@@ -1,6 +1,7 @@
 package com.lit.fire.flame;
 
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 
@@ -38,6 +39,14 @@ public class CelebrityAnalyticsService {
     @Autowired private JdbcTemplate            jdbc;
     @Autowired private EntityIntelService      intel;
     @Autowired private EntityMarketingService  marketing;
+
+    /**
+     * Decay rate (β) of the Hawkes kernel used to fit the advocates' stored {@code influence_rank}
+     * (raw α, produced by {@link MarketingEnrichmentEngine}'s hours-based calculator). Used to turn
+     * raw α into the dimensionless branching ratio n = α/β so advocacy is comparable to {@code
+     * branchingRatio}. Raw α is unit-dependent and must never be compared across estimators directly.
+     */
+    @Value("${hawkes.beta:3.0}") private double advocacyBeta;
 
     /** True if the entity exists and is of type CELEBRITY. */
     public static boolean isCelebrity(EntityIntelService.EntityProfile entity) {
@@ -105,9 +114,12 @@ public class CelebrityAnalyticsService {
         long   engagementTotal= ((Number) engagement.get("total")).longValue();
 
         List<Map<String, Object>> advocates = marketing.topSpreaders(entity.keywords, ADVOCATE_TOP);
-        double advocacyAlphaMean = advocates.stream()
+        // hawkes_alpha (stored influence_rank) is raw α fitted at β = advocacyBeta. Divide by β to get
+        // the dimensionless branching ratio n = α/β ∈ [0,1), matching how branchingRatio is formed above
+        // and preventing the previous clamp01 from flattening every strong advocate (raw α could reach β).
+        double advocacyBranchingRatio = (advocacyBeta > 0 ? advocates.stream()
                 .mapToDouble(a -> ((Number) a.getOrDefault("hawkes_alpha", 0.0)).doubleValue())
-                .average().orElse(0.0);
+                .average().orElse(0.0) / advocacyBeta : 0.0);
 
         SentimentStats sentiment = sentimentStats(entries);
 
@@ -118,7 +130,7 @@ public class CelebrityAnalyticsService {
                 reachTotal, engagementTotal,
                 sentiment.positive, sentiment.negative, sentiment.neutral,
                 sentiment.stdevNorm, sentiment.negativeBurstShare,
-                advocacyAlphaMean);
+                advocacyBranchingRatio);
 
         CelebrityMetricsModel.Metrics m = CelebrityMetricsModel.compute(signals);
 

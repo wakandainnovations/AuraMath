@@ -69,7 +69,7 @@ public final class CelebrityMetricsModel {
      * @param neutralCount        posts with neutral tone
      * @param sentimentStdev      stdev of normalised sentiment in [0,1] (score/100)
      * @param negativeBurstShare  fraction of in-burst posts that are negative, [0,1]
-     * @param advocacyAlphaMean   mean Hawkes alpha of the top advocates, [0,1]
+     * @param advocacyBranchingRatio mean Hawkes branching ratio (alpha/beta) of the top advocates, [0,1)
      */
     public record Signals(
             long   totalPosts,
@@ -83,7 +83,7 @@ public final class CelebrityMetricsModel {
             long   neutralCount,
             double sentimentStdev,
             double negativeBurstShare,
-            double advocacyAlphaMean) { }
+            double advocacyBranchingRatio) { }
 
     /** Computed metrics. Percentages are 0–100; values are absolute. */
     public record Metrics(
@@ -156,7 +156,7 @@ public final class CelebrityMetricsModel {
 
         double postsPerFan       = s.fanBaseSize() > 0 ? (double) s.totalPosts() / s.fanBaseSize() : 0.0;
         double repeatPosting     = saturate(postsPerFan - 1.0, 1.0);   // >1 post/fan ⇒ loyalty
-        double advocacy          = clamp01(s.advocacyAlphaMean());
+        double advocacy          = clamp01(s.advocacyBranchingRatio());
         double volatility        = clamp01(2.0 * s.sentimentStdev());  // 0.5 stdev ⇒ saturated
         double negativeBurst     = clamp01(s.negativeBurstShare());
 

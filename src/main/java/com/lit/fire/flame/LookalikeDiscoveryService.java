@@ -648,7 +648,7 @@ public class LookalikeDiscoveryService {
         Map<String, Map<String, Double>> raw = new HashMap<>();
         String sql = "SELECT " + authorColumn + ", sentiment_category, COUNT(*) AS cnt" +
                      " FROM " + table +
-                     " WHERE sentiment_category IS NOT NULL" +
+                     " WHERE sentiment_category IS NOT NULL AND sentiment_score <> 0" +
                      " GROUP BY " + authorColumn + ", sentiment_category";
 
         jdbcTemplate.query(sql, rs -> {

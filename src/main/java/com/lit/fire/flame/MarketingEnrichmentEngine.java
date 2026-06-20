@@ -311,7 +311,9 @@ public class MarketingEnrichmentEngine {
     }
 
     private Stream<UniversalPost> streamTable(String tableName) {
-        String sql = "SELECT * FROM " + tableName;
+        // sentiment_score = 0 is the DB sentinel for "invalid / not usable for the use-case";
+        // such rows must be excluded from every downstream metric (MOI, Hawkes alpha, persona features).
+        String sql = "SELECT * FROM " + tableName + " WHERE sentiment_score <> 0";
         return jdbcTemplate.queryForStream(sql, (rs, rowNum) -> postMapper.map(rs, tableName));
     }
 }

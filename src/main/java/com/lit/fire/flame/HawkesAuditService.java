@@ -27,6 +27,10 @@ public class HawkesAuditService {
     @Autowired
     private JdbcTemplate jdbcTemplate;
 
+    // NOTE: this estimator works in MINUTES (β = 0.1/min, ~6.9-min half-life), whereas the
+    // HawkesIntensityCalculator path works in HOURS (β default 3.0/hr). Raw α is therefore on a
+    // different scale in each; only the dimensionless branching ratio n = α/β is comparable across
+    // them, so always divide by the matching β before comparing or combining α from the two paths.
     public static final double BETA        = 0.1;   // /min — ~6.9-min half-life
     public static final double CLUSTER_WIN = 10.0;  // minutes
     public static final int    CLUSTER_MIN = 3;

@@ -186,19 +186,24 @@ public class AspectDriversPrecomputer implements InitializingBean {
         }
     }
 
-    /** x_posts carries a continuous numeric sentiment_score. */
+    /**
+     * x_posts carries a numeric sentiment_score on a 0–100 scale (50 = neutral, 0 = invalid).
+     * It is centred to signed [-1, 1] via {@code (score - 50) / 50} so that it shares a scale
+     * with the category platforms' ±0.6 mapping and can register as a Weakness (avg &lt; 0).
+     */
     private void scanX(Accumulator acc) {
         String sql =
                 "SELECT keyword, text, sentiment_score FROM (" +
                 "  SELECT keyword, text, sentiment_score, " +
                 "         ROW_NUMBER() OVER (PARTITION BY keyword ORDER BY created_at DESC) AS rn " +
-                "  FROM x_posts WHERE keyword IS NOT NULL AND text IS NOT NULL" +
+                "  FROM x_posts WHERE keyword IS NOT NULL AND text IS NOT NULL AND sentiment_score <> 0" +
                 ") t WHERE rn <= ?";
         streamingJdbc.query(sql, rs -> {
             String keyword = rs.getString("keyword");
             String text = rs.getString("text");
-            double score = rs.getDouble("sentiment_score");
-            if (rs.wasNull()) score = 0.0;
+            double raw = rs.getDouble("sentiment_score");
+            if (rs.wasNull() || raw == 0.0) return;   // invalid sentinel — excluded (SQL already filters)
+            double score = (raw - 50.0) / 50.0;        // 0–100 → signed [-1, 1], 50 = neutral
             acc.add(keyword, "x", text, score);
         }, MAX_POSTS_PER_PLATFORM);
     }
@@ -214,7 +219,7 @@ public class AspectDriversPrecomputer implements InitializingBean {
                 "SELECT keyword, " + (titleCol != null ? titleCol + ", " : "") + textCol + ", sentiment_category FROM (" +
                 "  SELECT " + selectCols + ", " +
                 "         ROW_NUMBER() OVER (PARTITION BY keyword ORDER BY " + orderCol + " DESC) AS rn " +
-                "  FROM " + table + " WHERE keyword IS NOT NULL" +
+                "  FROM " + table + " WHERE keyword IS NOT NULL AND sentiment_score <> 0" +
                 ") t WHERE rn <= ?";
         streamingJdbc.query(sql, rs -> {
             String keyword = rs.getString("keyword");

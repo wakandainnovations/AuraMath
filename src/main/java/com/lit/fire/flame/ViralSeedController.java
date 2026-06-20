@@ -209,7 +209,8 @@ public class ViralSeedController {
      * the right trailer cut for each channel.
      *
      * sentiment_score sourcing (applied during precompute):
-     *   x_posts        → real sentiment_score column (continuous [-1, 1])
+     *   x_posts        → numeric sentiment_score column on a 0–100 scale (50 = neutral, 0 = invalid),
+     *                    centred to signed [-1, 1] via (score - 50) / 50 so all platforms share a scale
      *   youtube_comments, reddit_posts, instagram_posts → sentiment_category converted:
      *                    "positive" → +0.6 | "negative" → -0.6 | anything else → 0.0
      */

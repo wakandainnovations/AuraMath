@@ -13,6 +13,18 @@ import java.util.Properties;
 import java.util.stream.Stream;
 import java.util.stream.Collectors;
 
+/**
+ * Extracts aspect terms from post text and attaches the post's <em>precomputed</em> sentiment to
+ * each of them.
+ *
+ * <p>This is deliberately an aspect <em>extractor</em>, not an independent sentiment model: the
+ * pipeline runs only {@code tokenize, ssplit, pos} to pick out noun aspects, and the sentiment value
+ * carried for each aspect is the score the caller supplies (the externally computed
+ * {@code sentiment_score} stored per post). It does NOT run CoreNLP's own sentiment annotator —
+ * doing so would re-derive sentiment from scratch, ignore the stored score, and bypass the
+ * "{@code sentiment_score = 0} means invalid" sentinel that callers filter on. Callers are expected
+ * to pass a sentiment already on the desired scale (e.g. the 0–100 column centred to signed [-1,1]).
+ */
 public class AspectSentimentAnalyzer {
 
     private final StanfordCoreNLP pipeline;
@@ -31,7 +43,7 @@ public class AspectSentimentAnalyzer {
         for (CoreMap sentence : document.get(CoreAnnotations.SentencesAnnotation.class)) {
             for (CoreLabel token : sentence.get(CoreAnnotations.TokensAnnotation.class)) {
                 String pos = token.get(CoreAnnotations.PartOfSpeechAnnotation.class);
-                if (pos.startsWith("NN")) { // Noun
+                if (pos != null && pos.startsWith("NN")) { // Noun (guard null POS tag)
                     String aspect = token.originalText().toLowerCase();
                     aspectSentiments.put(aspect, sentimentScore);
                 }

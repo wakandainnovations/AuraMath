@@ -26,7 +26,7 @@ public class CelebrityMetricsModelTest {
                 /* neutralCount        */ 10_000,
                 /* sentimentStdev      */ 0.12,
                 /* negativeBurstShare  */ 0.05,
-                /* advocacyAlphaMean   */ 0.8);
+                /* advocacyBranchingRatio */ 0.8);
     }
 
     @Test
@@ -70,7 +70,7 @@ public class CelebrityMetricsModelTest {
                 clean.totalPosts(), clean.fanBaseSize(), clean.observationSpanDays(),
                 clean.branchingRatio(), clean.reachTotal(), clean.engagementTotal(),
                 /* positive */ 4_000, /* negative */ 40_000, /* neutral */ 6_000,
-                /* stdev */ 0.45, /* negBurstShare */ 0.8, clean.advocacyAlphaMean());
+                /* stdev */ 0.45, /* negBurstShare */ 0.8, clean.advocacyBranchingRatio());
 
         CelebrityMetricsModel.Metrics cleanM = CelebrityMetricsModel.compute(clean);
         CelebrityMetricsModel.Metrics toxicM = CelebrityMetricsModel.compute(toxic);
@@ -93,6 +93,45 @@ public class CelebrityMetricsModelTest {
                 600, 100, 300, 0.15, 0.1, 0.3);
         assertTrue(CelebrityMetricsModel.compute(big).predictedBrandValueUsd()
                  > CelebrityMetricsModel.compute(small).predictedBrandValueUsd());
+    }
+
+    /** aListClean(), but with a specific advocacy branching ratio (alpha/beta). */
+    private static CelebrityMetricsModel.Signals withAdvocacy(double advocacyBranchingRatio) {
+        CelebrityMetricsModel.Signals c = aListClean();
+        return new CelebrityMetricsModel.Signals(
+                c.totalPosts(), c.fanBaseSize(), c.observationSpanDays(), c.branchingRatio(),
+                c.reachTotal(), c.engagementTotal(), c.positiveCount(), c.negativeCount(),
+                c.neutralCount(), c.sentimentStdev(), c.negativeBurstShare(), advocacyBranchingRatio);
+    }
+
+    @Test
+    void advocacyScoreTracksBranchingRatioWithoutFlatteningInRange() {
+        // Regression for the saturation bug: advocacy used to receive raw Hawkes alpha (which can
+        // exceed 1 and was clamped to a flat 1.0). It is now the branching ratio alpha/beta ∈ [0,1),
+        // so distinct in-range values must map through to distinct, monotonic advocacy sub-scores.
+        double low  = CelebrityMetricsModel.compute(withAdvocacy(0.30)).advocacyScore();
+        double high = CelebrityMetricsModel.compute(withAdvocacy(0.90)).advocacyScore();
+
+        assertEquals(0.30, low,  1e-9, "in-range branching ratio must pass through, not flatten");
+        assertEquals(0.90, high, 1e-9, "strong advocate must not be clamped to the same value as a weak one");
+        assertTrue(high > low, "advocacy sub-score must increase with the branching ratio");
+    }
+
+    @Test
+    void advocacyBranchingRatioFeedsFanLoyalty() {
+        // advocacy is a weighted component of fan loyalty (15%); raising it must raise fanLoyaltyPct.
+        double weakLoyalty   = CelebrityMetricsModel.compute(withAdvocacy(0.10)).fanLoyaltyPct();
+        double strongLoyalty = CelebrityMetricsModel.compute(withAdvocacy(0.95)).fanLoyaltyPct();
+        assertTrue(strongLoyalty > weakLoyalty,
+                "more loyal advocates (higher branching ratio) should raise fan loyalty");
+    }
+
+    @Test
+    void advocacyAtOrAboveOneSaturatesByDesign() {
+        // Upstream normalisation keeps the ratio < 1, but the model still guards the supercritical
+        // edge: a branching ratio ≥ 1 clamps to the bounded sub-score 1.0 (never exceeds it).
+        assertEquals(1.0, CelebrityMetricsModel.compute(withAdvocacy(1.0)).advocacyScore(), 1e-9);
+        assertEquals(1.0, CelebrityMetricsModel.compute(withAdvocacy(2.5)).advocacyScore(), 1e-9);
     }
 
     @Test

@@ -59,6 +59,9 @@ public class AudienceSegmenter {
      * @return A map of user IDs to their assigned tribe ID.
      */
     public Map<String, String> segmentUsers(Map<String, double[]> userFeatureVectors) {
+        if (userFeatureVectors.isEmpty()) {
+            return new HashMap<>();
+        }
         if (structure == null) {
             createDatasetStructure(userFeatureVectors);
         }
@@ -69,6 +72,11 @@ public class AudienceSegmenter {
         }
 
         try {
+            // K-Means requires at least as many instances as clusters. For tiny / niche inputs,
+            // degrade k to the number of users instead of letting Weka throw — otherwise the catch
+            // below would return an empty map and every user would lose their tribe assignment.
+            int effectiveK = Math.max(1, Math.min(numClusters, data.numInstances()));
+            kMeans.setNumClusters(effectiveK);
             kMeans.buildClusterer(data);
         } catch (Exception e) {
             e.printStackTrace();
@@ -100,7 +108,8 @@ public class AudienceSegmenter {
         Instances centroids = kMeans.getClusterCentroids();
         StringBuilder report = new StringBuilder();
 
-        for (int i = 0; i < numClusters; i++) {
+        // Use the actual centroid count: k may have been degraded for small inputs (see segmentUsers).
+        for (int i = 0; i < centroids.numInstances(); i++) {
             report.append("Tribe_").append(i + 1).append(" Characteristics:\n");
             Instance centroid = centroids.get(i);
             for (int j = 0; j < centroid.numAttributes(); j++) {
