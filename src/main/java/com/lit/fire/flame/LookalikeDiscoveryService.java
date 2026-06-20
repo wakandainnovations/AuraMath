@@ -147,9 +147,7 @@ public class LookalikeDiscoveryService {
             profileMap.put((String) p.get("global_user_id"), p);
         }
 
-        if (!profileMap.containsKey(seedAuthorId)) {
-            throw new IllegalArgumentException("Unknown seedAuthorId: " + seedAuthorId);
-        }
+        seedAuthorId = resolveSeedAuthorId(profiles, seedAuthorId);
 
         String seedTribe = (String) profileMap.get(seedAuthorId).get("tribe_label");
 
@@ -295,10 +293,8 @@ public class LookalikeDiscoveryService {
         for (Map<String, Object> p : profiles) {
             profileMap.put((String) p.get("global_user_id"), p);
         }
+        seedAuthorId = resolveSeedAuthorId(profiles, seedAuthorId);
         Map<String, Object> seedProfile = profileMap.get(seedAuthorId);
-        if (seedProfile == null) {
-            throw new IllegalArgumentException("Unknown seedAuthorId: " + seedAuthorId);
-        }
         String seedTribe = (String) seedProfile.get("tribe_label");
 
         Map<String, Map<String, Double>> xSentiments = loadSentimentDistributions("x_posts", "author");
@@ -395,6 +391,81 @@ public class LookalikeDiscoveryService {
         scored.sort((a, b) -> Double.compare(
                 (double) b.get("similarity_score"), (double) a.get("similarity_score")));
         return scored.stream().limit(limit).collect(Collectors.toList());
+    }
+
+    // ------------------------------------------------------------------
+    // Seed resolution
+    //
+    // marketing_target_profiles is keyed by the raw author display string (the
+    // same value stored in the source tables' `author` column), and every
+    // downstream join in this service correlates on that exact string. Callers,
+    // however, rarely have the byte-exact display name — they pass a slightly
+    // different casing, stray whitespace, an '@' prefix, or punctuation. We try
+    // an exact match first (fast path, preserves the stored key for the joins),
+    // then fall back to the same normalization CrossPlatformIdentityResolver uses
+    // so trivial variants still resolve to their canonical stored key.
+    // ------------------------------------------------------------------
+    // Package-private for direct unit testing — depends only on the profiles list, not the DB.
+    String resolveSeedAuthorId(List<Map<String, Object>> profiles, String seedAuthorId) {
+        // Fast path: the caller already supplied the exact stored key.
+        for (Map<String, Object> p : profiles) {
+            if (seedAuthorId.equals(p.get("global_user_id"))) {
+                return seedAuthorId;
+            }
+        }
+
+        // Fallback: match on the normalized form against the stored keys.
+        String normalizedSeed = normalizeAuthor(seedAuthorId);
+        if (!normalizedSeed.isEmpty()) {
+            List<String> matches = new ArrayList<>();
+            for (Map<String, Object> p : profiles) {
+                String key = (String) p.get("global_user_id");
+                if (key != null && normalizeAuthor(key).equals(normalizedSeed) && !matches.contains(key)) {
+                    matches.add(key);
+                }
+            }
+            if (matches.size() == 1) {
+                return matches.get(0);
+            }
+            if (matches.size() > 1) {
+                // Distinct stored keys collapse to the same normalized form — the
+                // cross-platform split-profile case. We can't pick safely; surface
+                // the exact ids so the caller can disambiguate.
+                throw new IllegalArgumentException(
+                        "Ambiguous seedAuthorId '" + seedAuthorId + "': matches multiple profiles "
+                        + matches + ". Pass one of these exact ids.");
+            }
+        }
+
+        List<String> suggestions = suggestSimilarAuthors(profiles, normalizedSeed);
+        String hint = suggestions.isEmpty() ? "" : " Did you mean: " + suggestions + "?";
+        throw new IllegalArgumentException("Unknown seedAuthorId: " + seedAuthorId + "." + hint);
+    }
+
+    /** Lowercase and drop every non-alphanumeric character — matches the
+     * normalization in {@link CrossPlatformIdentityResolver}'s COLLECT_AUTHORS_SQL. */
+    private static String normalizeAuthor(String author) {
+        return author == null ? "" : author.toLowerCase().replaceAll("[^a-z0-9]", "");
+    }
+
+    /** Up to five stored keys whose normalized form overlaps the seed, to make an
+     * unresolved seed actionable rather than a bare "unknown". */
+    private List<String> suggestSimilarAuthors(List<Map<String, Object>> profiles, String normalizedSeed) {
+        if (normalizedSeed.isEmpty()) {
+            return Collections.emptyList();
+        }
+        List<String> out = new ArrayList<>();
+        for (Map<String, Object> p : profiles) {
+            String key = (String) p.get("global_user_id");
+            if (key == null) continue;
+            String norm = normalizeAuthor(key);
+            if (norm.isEmpty()) continue;
+            if (norm.contains(normalizedSeed) || normalizedSeed.contains(norm)) {
+                out.add(key);
+                if (out.size() >= 5) break;
+            }
+        }
+        return out;
     }
 
     /**
