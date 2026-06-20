@@ -448,24 +448,78 @@ public class LookalikeDiscoveryService {
         return author == null ? "" : author.toLowerCase().replaceAll("[^a-z0-9]", "");
     }
 
-    /** Up to five stored keys whose normalized form overlaps the seed, to make an
+    /** A stored key is only offered as a "did you mean" when it clears this
+     * similarity bar. A bare substring test is far too loose — a one- or
+     * two-character key is a substring of almost every long name — so we score
+     * by edit distance and surface only genuinely close matches. */
+    private static final double SUGGESTION_MIN_SIMILARITY = 0.5;
+    /** Ignore keys whose normalized form is shorter than this when suggesting:
+     * a 1-2 char author is never a useful "did you mean", and (as a substring of
+     * almost anything) only produces noise like {@code [c, i, C, D, N]}. */
+    private static final int SUGGESTION_MIN_KEY_LEN = 3;
+
+    /** Up to five stored keys closest to the seed, ranked by similarity, to make an
      * unresolved seed actionable rather than a bare "unknown". */
     private List<String> suggestSimilarAuthors(List<Map<String, Object>> profiles, String normalizedSeed) {
-        if (normalizedSeed.isEmpty()) {
+        if (normalizedSeed.length() < SUGGESTION_MIN_KEY_LEN) {
+            // Too short to discriminate — almost every key would look "similar".
             return Collections.emptyList();
         }
-        List<String> out = new ArrayList<>();
+        List<Map.Entry<String, Double>> scored = new ArrayList<>();
+        Set<String> seen = new LinkedHashSet<>();
         for (Map<String, Object> p : profiles) {
             String key = (String) p.get("global_user_id");
-            if (key == null) continue;
+            if (key == null || !seen.add(key)) continue;
             String norm = normalizeAuthor(key);
-            if (norm.isEmpty()) continue;
-            if (norm.contains(normalizedSeed) || normalizedSeed.contains(norm)) {
-                out.add(key);
-                if (out.size() >= 5) break;
+            if (norm.length() < SUGGESTION_MIN_KEY_LEN) continue;
+            double sim = authorSimilarity(normalizedSeed, norm);
+            if (sim >= SUGGESTION_MIN_SIMILARITY) {
+                scored.add(Map.entry(key, sim));
             }
         }
+        scored.sort((a, b) -> Double.compare(b.getValue(), a.getValue()));
+        List<String> out = new ArrayList<>();
+        for (Map.Entry<String, Double> e : scored) {
+            out.add(e.getKey());
+            if (out.size() >= 5) break;
+        }
         return out;
+    }
+
+    /** Similarity in [0,1] between two normalized author strings. Levenshtein-based,
+     * but a genuine containment (one is a substring of the other, with the shorter
+     * side itself meaningful) is treated as a strong match regardless of the length
+     * gap — so an abbreviation like "kvn" still surfaces "kvnproductions". */
+    private static double authorSimilarity(String a, String b) {
+        int maxLen = Math.max(a.length(), b.length());
+        if (maxLen == 0) return 0.0;
+        int minLen = Math.min(a.length(), b.length());
+        if (minLen >= SUGGESTION_MIN_KEY_LEN && (a.contains(b) || b.contains(a))) {
+            // Rank closer-length containments ahead of lopsided ones, but keep all
+            // of them above the suggestion bar.
+            return 0.5 + 0.5 * ((double) minLen / maxLen);
+        }
+        return 1.0 - (double) levenshtein(a, b) / maxLen;
+    }
+
+    /** Standard two-row Levenshtein edit distance. */
+    private static int levenshtein(String a, String b) {
+        int n = a.length(), m = b.length();
+        if (n == 0) return m;
+        if (m == 0) return n;
+        int[] prev = new int[m + 1];
+        int[] curr = new int[m + 1];
+        for (int j = 0; j <= m; j++) prev[j] = j;
+        for (int i = 1; i <= n; i++) {
+            curr[0] = i;
+            char ca = a.charAt(i - 1);
+            for (int j = 1; j <= m; j++) {
+                int cost = ca == b.charAt(j - 1) ? 0 : 1;
+                curr[j] = Math.min(Math.min(curr[j - 1] + 1, prev[j] + 1), prev[j - 1] + cost);
+            }
+            int[] tmp = prev; prev = curr; curr = tmp;
+        }
+        return prev[m];
     }
 
     /**

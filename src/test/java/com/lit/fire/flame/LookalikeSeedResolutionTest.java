@@ -8,6 +8,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -77,5 +78,33 @@ public class LookalikeSeedResolutionTest {
         // If the exact key exists it must be returned verbatim, never treated as ambiguous.
         List<Map<String, Object>> profiles = profiles("KVN Productions", "@KVNProductions");
         assertEquals("KVN Productions", service.resolveSeedAuthorId(profiles, "KVN Productions"));
+    }
+
+    @Test
+    public void shortJunkKeysAreNotSuggested() {
+        // Regression: a long seed used to surface every 1-2 char author as a
+        // "Did you mean", producing garbage like "[c, i, C, D, N]" because each is
+        // a substring of "kvnproductions". Those must never be suggested; the
+        // genuinely-near "Kvn" is the only acceptable hint.
+        List<Map<String, Object>> profiles = profiles("c", "i", "C", "D", "N", "Kvn", "Jane Doe");
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+                () -> service.resolveSeedAuthorId(profiles, "KVN Productions"));
+        String msg = ex.getMessage();
+        assertTrue(msg.startsWith("Unknown seedAuthorId: KVN Productions"), msg);
+        for (String junk : new String[]{"[c,", " c,", " c]", " i,", " D,", " N]"}) {
+            assertFalse(msg.contains(junk), "junk single-char key leaked into suggestions: " + msg);
+        }
+        assertTrue(msg.contains("Kvn"), "the near match should still be offered: " + msg);
+        assertFalse(msg.contains("Jane Doe"), "an unrelated author must not be suggested: " + msg);
+    }
+
+    @Test
+    public void closeTypoIsSuggested() {
+        // A near-miss (single transposed/dropped char) should still be offered.
+        List<Map<String, Object>> profiles = profiles("KVN Productions", "Unrelated Person");
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+                () -> service.resolveSeedAuthorId(profiles, "KVN Prodctions"));
+        assertTrue(ex.getMessage().contains("KVN Productions"), ex.getMessage());
+        assertFalse(ex.getMessage().contains("Unrelated Person"), ex.getMessage());
     }
 }
