@@ -95,7 +95,38 @@ public class HawkesAuditService {
     // -------------------------------------------------------------------------
 
     public AuditResult compute(String author) {
-        return computeFromRows(author, fetchRows(author));
+        List<Map<String, Object>> rows = fetchRows(author);
+        if (rows.isEmpty()) {
+            // The caller may have supplied a platform handle (e.g. "sri50") rather than
+            // the global_user_id stored in the posts tables. Try to resolve the handle
+            // via the profile_url stored in marketing_target_profiles.platform_handles.
+            String resolved = resolveHandleToGlobalId(author);
+            if (resolved != null) {
+                rows = fetchRows(resolved);
+                return computeFromRows(resolved, rows);
+            }
+        }
+        return computeFromRows(author, rows);
+    }
+
+    /**
+     * Looks up a platform handle (e.g. "sri50") in the profile_url values stored
+     * inside marketing_target_profiles.platform_handles JSONB and returns the
+     * matching global_user_id, or null if none is found.
+     */
+    private String resolveHandleToGlobalId(String handle) {
+        String sql =
+            "SELECT global_user_id FROM marketing_target_profiles " +
+            "WHERE EXISTS (" +
+            "  SELECT 1 FROM jsonb_each(platform_handles->'by_platform') bp(k, v) " +
+            "  WHERE v->>'profile_url' ILIKE ?" +
+            ") LIMIT 1";
+        List<Map<String, Object>> rows = jdbcTemplate.queryForList(sql, "%/" + handle);
+        if (!rows.isEmpty()) {
+            Object gid = rows.get(0).get("global_user_id");
+            return gid != null ? gid.toString() : null;
+        }
+        return null;
     }
 
     /**
