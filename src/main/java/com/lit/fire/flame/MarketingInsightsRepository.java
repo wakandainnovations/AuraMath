@@ -34,13 +34,14 @@ public class MarketingInsightsRepository {
                 COLUMN_TRIBE_LABEL + " TEXT," +
                 COLUMN_INFLUENCE_RANK + " REAL," +
                 COLUMN_TOP_GENRES + " TEXT," +
-                COLUMN_TOP_MOVIE_GENRES + " TEXT," +
+                COLUMN_TOP_MOVIE_GENRES + " jsonb," +
                 COLUMN_PEAK_ACTIVITY_TIMES + " TEXT," +
                 COLUMN_MOI_SCORE + " REAL)";
         jdbcTemplate.execute(sql);
-        // Idempotent migration for existing deployments where the table predates this column.
+        // Migrate existing deployments where top_movie_genres was created as TEXT.
         jdbcTemplate.execute("ALTER TABLE " + TABLE_MARKETING_TARGET_PROFILES +
-                " ADD COLUMN IF NOT EXISTS " + COLUMN_TOP_MOVIE_GENRES + " jsonb");
+                " ALTER COLUMN " + COLUMN_TOP_MOVIE_GENRES + " TYPE jsonb USING " +
+                COLUMN_TOP_MOVIE_GENRES + "::jsonb");
     }
 
     /**

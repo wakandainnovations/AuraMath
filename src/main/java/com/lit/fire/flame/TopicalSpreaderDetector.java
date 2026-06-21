@@ -159,7 +159,7 @@ public class TopicalSpreaderDetector {
 
     private List<UniversalPost> fetchYoutubeComments() {
         String sql = "SELECT id, author, text, keyword, published_at " +
-                     "FROM youtube_comments WHERE author IS NOT NULL AND author <> '' AND sentiment_category IS NOT NULL";
+                     "FROM youtube_comments WHERE author IS NOT NULL AND author <> '' AND sentiment_score BETWEEN 1 AND 100";
         return jdbc.query(sql, (rs, rowNum) -> {
             Map<String, Object> metadata = new HashMap<>();
             metadata.put("keyword", rs.getString("keyword"));
@@ -175,7 +175,7 @@ public class TopicalSpreaderDetector {
 
     private List<UniversalPost> fetchRedditPosts() {
         String sql = "SELECT id, author, title, text, keyword, created_at " +
-                     "FROM reddit_posts WHERE author IS NOT NULL AND author <> '' AND sentiment_category IS NOT NULL";
+                     "FROM reddit_posts WHERE author IS NOT NULL AND author <> '' AND sentiment_score BETWEEN 1 AND 100";
         return jdbc.query(sql, (rs, rowNum) -> {
             String title = rs.getString("title") == null ? "" : rs.getString("title");
             String body = rs.getString("text") == null ? "" : rs.getString("text");
@@ -194,7 +194,7 @@ public class TopicalSpreaderDetector {
 
     private List<UniversalPost> fetchInstagramPosts() {
         String sql = "SELECT id, author, text, keyword, media_type, timestamp " +
-                     "FROM instagram_posts WHERE author IS NOT NULL AND author <> '' AND sentiment_category IS NOT NULL";
+                     "FROM instagram_posts WHERE author IS NOT NULL AND author <> '' AND sentiment_score BETWEEN 1 AND 100";
         return jdbc.query(sql, (rs, rowNum) -> {
             Map<String, Object> metadata = new HashMap<>();
             metadata.put("keyword", rs.getString("keyword"));
