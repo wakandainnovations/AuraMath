@@ -68,7 +68,13 @@ public class GenreMarketingAPI {
     // GET /api/marketing/genre/{genre}/potential-viewers
     //
     // Users whose GenreInterestScore for {genre} exceeds GENRE_INTEREST_THRESHOLD,
-    // sorted by conversion probability P_conv = sigmoid(genreInterestScore * influence_rank).
+    // sorted by conversion probability:
+    //   genre_affinity  = genre_interest_score / Σ(all genre scores)   ∈ [0, 1]
+    //   p_conv          = sigmoid(genre_affinity × influence_rank)
+    //
+    // Normalising by total genre score prevents prolific authors from saturating
+    // sigmoid purely through post volume; genre_affinity captures what share of
+    // an author's genre-tagged content belongs to this genre.
     // -------------------------------------------------------------------------
     @GetMapping("/{genre}/potential-viewers")
     public ResponseEntity<Map<String, Object>> potentialViewers(@PathVariable String genre) {
@@ -86,8 +92,10 @@ public class GenreMarketingAPI {
                 continue;
             }
 
+            double totalScore    = extractTotalGenreScore(row);
+            double genreAffinity = totalScore > 0 ? genreScore / totalScore : 0.0;
             double influenceRank = toDouble(row.get("influence_rank"));
-            double pConv = sigmoid(genreScore * influenceRank);
+            double pConv         = sigmoid(genreAffinity * influenceRank);
 
             Map<String, Object> entry = new LinkedHashMap<>();
             entry.put("global_user_id",       row.get("global_user_id"));
@@ -95,6 +103,7 @@ public class GenreMarketingAPI {
             entry.put("platform_handles",     JsonbUtil.asTree(row.get("platform_handles"), gson));
             entry.put("peak_activity_times",  JsonbUtil.asTree(row.get("peak_activity_times"), gson));
             entry.put("genre_interest_score", genreScore);
+            entry.put("genre_affinity",       genreAffinity);
             entry.put("influence_rank",       influenceRank);
             entry.put("moi_score",            toDouble(row.get("moi_score")));
             entry.put("p_conv",               pConv);
@@ -106,7 +115,7 @@ public class GenreMarketingAPI {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("genre",        genre);
         body.put("threshold",    GENRE_INTEREST_THRESHOLD);
-        body.put("scoringModel", "p_conv = 1 / (1 + exp(-(genre_interest_score * influence_rank)))");
+        body.put("scoringModel", "p_conv = sigmoid(genre_affinity * influence_rank); genre_affinity = genre_interest_score / total_genre_score");
         body.put("totalViewers", viewers.size());
         body.put("viewers",      viewers);
         return ResponseEntity.ok(body);
@@ -262,6 +271,18 @@ public class GenreMarketingAPI {
             }
         }
         return null;
+    }
+
+    private double extractTotalGenreScore(Map<String, Object> row) {
+        String json = JsonbUtil.asJsonString(row.get("top_movie_genres"));
+        if (json == null || json.isEmpty()) return 0.0;
+        Map<String, Double> parsed = gson.fromJson(json, GENRE_MAP_TYPE);
+        if (parsed == null) return 0.0;
+        double total = 0.0;
+        for (Double v : parsed.values()) {
+            if (v != null) total += v;
+        }
+        return total;
     }
 
     /**
