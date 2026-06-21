@@ -64,7 +64,7 @@ public class TopSpreadersController {
                      "WHERE keyword ILIKE ? " +
                      "AND created_at >= NOW() - INTERVAL '90 days' " +
                      "AND views_count > 0 " +
-                     "AND sentiment_score <> 0";
+                     "AND sentiment_score BETWEEN 1 AND 100";
 
         List<Map<String, Object>> rows = jdbcTemplate.queryForList(sql, "%" + keyword + "%");
 
@@ -108,7 +108,11 @@ public class TopSpreadersController {
         double engagementCount = totalLikes + COMMENT_WEIGHT * totalComments;
 
         double avgSentiment = authorPosts.stream()
-                .filter(r -> r.get("sentiment_score") != null && ((Number) r.get("sentiment_score")).doubleValue() != 0.0)
+                .filter(r -> {
+                    if (r.get("sentiment_score") == null) return false;
+                    double s = ((Number) r.get("sentiment_score")).doubleValue();
+                    return s >= 1.0 && s <= 100.0;
+                })
                 .mapToDouble(r -> ((Number) r.get("sentiment_score")).doubleValue())
                 .average()
                 .orElse(0.0);
