@@ -5,6 +5,7 @@ import com.google.gson.reflect.TypeToken;
 import com.lit.fire.flame.GenreClassifier.GenreLabel;
 import com.lit.fire.flame.models.UniversalPost;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -36,9 +37,10 @@ public class GenreMarketingAPI {
 
     private static final Type GENRE_MAP_TYPE = new TypeToken<Map<String, Double>>() {}.getType();
 
-    @Autowired private JdbcTemplate           jdbc;
-    @Autowired private GenreClassifier        classifier;
+    @Autowired private JdbcTemplate            jdbc;
+    @Autowired private GenreClassifier         classifier;
     @Autowired private TopicalSpreaderDetector detector;
+    @Value("${hawkes.beta:3.0}") private double hawkesBeta;
     private final Gson gson = new Gson();
 
     // -------------------------------------------------------------------------
@@ -142,6 +144,7 @@ public class GenreMarketingAPI {
             entry.put("platform_handles",     JsonbUtil.asTree(enrich.get("platform_handles"), gson));
             entry.put("peak_activity_times",  JsonbUtil.asTree(enrich.get("peak_activity_times"), gson));
             entry.put("hawkes_alpha",         r.alpha());
+            entry.put("branching_ratio",      r.alpha() / hawkesBeta);
             entry.put("genre_post_count",     r.postCount());
             entry.put("genre_interest_score", genreScore == null ? 0.0 : genreScore);
             entry.put("moi_score",            toDouble(enrich.get("moi_score")));
