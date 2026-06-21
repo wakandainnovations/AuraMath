@@ -187,9 +187,8 @@ public class AspectDriversPrecomputer implements InitializingBean {
     }
 
     /**
-     * x_posts carries a numeric sentiment_score on a 0–100 scale (50 = neutral, 0 = invalid).
-     * It is centred to signed [-1, 1] via {@code (score - 50) / 50} so that it shares a scale
-     * with the category platforms' ±0.6 mapping and can register as a Weakness (avg &lt; 0).
+     * x_posts carries a numeric sentiment_score on a 1–100 scale (50 = neutral, 0 = invalid).
+     * Scores of 0 are excluded by the SQL filter; the raw value is passed through unchanged.
      */
     private void scanX(Accumulator acc) {
         String sql =
@@ -204,8 +203,7 @@ public class AspectDriversPrecomputer implements InitializingBean {
             String text = rs.getString("text");
             double raw = rs.getDouble("sentiment_score");
             if (rs.wasNull() || raw < 1.0 || raw > 100.0) return; // 0 = invalid; valid range is [1, 100]
-            double score = (raw - 50.0) / 50.0;        // 1–100 → signed [-0.98, 1], 50 = neutral
-            acc.add(keyword, "x", text, score);
+            acc.add(keyword, "x", text, raw);
         }, MAX_POSTS_PER_PLATFORM);
     }
 
@@ -312,12 +310,13 @@ public class AspectDriversPrecomputer implements InitializingBean {
         return new String[]{key.substring(0, sep), key.substring(sep + 1)};
     }
 
-    /** Mirrors the category→score mapping the endpoint previously applied at request time. */
+    /** Maps a sentiment category to a 1–100 score (50 = neutral, 0 = invalid/unknown). */
     private static double categoryToScore(String category) {
         if (category == null) return 0.0;
         return switch (category.toLowerCase()) {
-            case "positive" -> 0.6;
-            case "negative" -> -0.6;
+            case "positive" -> 75.0;
+            case "negative" -> 25.0;
+            case "neutral"  -> 50.0;
             default         -> 0.0;
         };
     }

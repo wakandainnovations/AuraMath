@@ -209,10 +209,10 @@ public class ViralSeedController {
      * the right trailer cut for each channel.
      *
      * sentiment_score sourcing (applied during precompute):
-     *   x_posts        → numeric sentiment_score column on a 0–100 scale (50 = neutral, 0 = invalid),
-     *                    centred to signed [-1, 1] via (score - 50) / 50 so all platforms share a scale
-     *   youtube_comments, reddit_posts, instagram_posts → sentiment_category converted:
-     *                    "positive" → +0.6 | "negative" → -0.6 | anything else → 0.0
+     *   x_posts        → numeric sentiment_score column on a 1–100 scale (50 = neutral, 0 = invalid).
+     *                    Used as-is; invalid (0) posts are excluded by the precomputer.
+     *   youtube_comments, reddit_posts, instagram_posts → sentiment_category converted to 1–100:
+     *                    "positive" → 75 | "negative" → 25 | "neutral" → 50 | unknown → 0 (excluded)
      */
     @GetMapping("/aspect-drivers/{keyword}")
     public Map<String, Object> getAspectDrivers(@PathVariable String keyword) {
@@ -359,10 +359,10 @@ public class ViralSeedController {
             if (n < MIN_ASPECT_MENTIONS) continue;
 
             double avg = sum / n;
-            if (avg == 0.0) continue;
+            if (avg == 0.0) continue; // 0 = invalid marker; skip aspects where all posts were invalid
 
-            // Shrinkage toward 0 so a 3-post outlier can't outrank a high-volume consensus.
-            double impact = avg * n / (n + MIN_ASPECT_MENTIONS);
+            // Shrinkage toward neutral (50) so a low-volume outlier can't outrank a high-volume consensus.
+            double impact = 50.0 + (avg - 50.0) * n / (n + MIN_ASPECT_MENTIONS);
 
             Map<String, Object> item = new LinkedHashMap<>();
             item.put("aspect",           e.getKey());
@@ -370,8 +370,9 @@ public class ViralSeedController {
             item.put("postsMentioning",  n);
             item.put("impactScore",      round3(impact));
 
-            if (avg > 0) strengths.add(item);
-            else         weaknesses.add(item);
+            if (avg > 50.0)      strengths.add(item);
+            else if (avg < 50.0) weaknesses.add(item);
+            // avg == 50 exactly: neutral, not a driver — skip
         }
 
         // Strengths: highest impactScore first. Weaknesses: most negative impactScore first.
