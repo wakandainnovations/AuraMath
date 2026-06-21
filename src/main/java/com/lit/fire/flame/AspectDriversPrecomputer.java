@@ -196,14 +196,15 @@ public class AspectDriversPrecomputer implements InitializingBean {
                 "SELECT keyword, text, sentiment_score FROM (" +
                 "  SELECT keyword, text, sentiment_score, " +
                 "         ROW_NUMBER() OVER (PARTITION BY keyword ORDER BY created_at DESC) AS rn " +
-                "  FROM x_posts WHERE keyword IS NOT NULL AND text IS NOT NULL AND sentiment_score <> 0" +
+                "  FROM x_posts WHERE keyword IS NOT NULL AND text IS NOT NULL" +
+                "    AND sentiment_score BETWEEN 1 AND 100" +
                 ") t WHERE rn <= ?";
         streamingJdbc.query(sql, rs -> {
             String keyword = rs.getString("keyword");
             String text = rs.getString("text");
             double raw = rs.getDouble("sentiment_score");
-            if (rs.wasNull() || raw == 0.0) return;   // invalid sentinel — excluded (SQL already filters)
-            double score = (raw - 50.0) / 50.0;        // 0–100 → signed [-1, 1], 50 = neutral
+            if (rs.wasNull() || raw < 1.0 || raw > 100.0) return; // 0 = invalid; valid range is [1, 100]
+            double score = (raw - 50.0) / 50.0;        // 1–100 → signed [-0.98, 1], 50 = neutral
             acc.add(keyword, "x", text, score);
         }, MAX_POSTS_PER_PLATFORM);
     }
@@ -219,7 +220,7 @@ public class AspectDriversPrecomputer implements InitializingBean {
                 "SELECT keyword, " + (titleCol != null ? titleCol + ", " : "") + textCol + ", sentiment_category FROM (" +
                 "  SELECT " + selectCols + ", " +
                 "         ROW_NUMBER() OVER (PARTITION BY keyword ORDER BY " + orderCol + " DESC) AS rn " +
-                "  FROM " + table + " WHERE keyword IS NOT NULL AND sentiment_score <> 0" +
+                "  FROM " + table + " WHERE keyword IS NOT NULL AND sentiment_category IS NOT NULL" +
                 ") t WHERE rn <= ?";
         streamingJdbc.query(sql, rs -> {
             String keyword = rs.getString("keyword");

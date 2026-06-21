@@ -299,7 +299,7 @@ public class ViralSeedController {
                             .computeIfAbsent(rs.getString("platform"), k -> new HashMap<>())
                             .computeIfAbsent(rs.getString("aspect"), k -> new double[2]);
                     acc[0] += rs.getDouble("s");
-                    acc[1] += rs.getInt("n");
+                    acc[1] += rs.getLong("n");
                 }, args);
 
         // Overall view: merge every platform's aspect aggregates by summing sums and counts.
@@ -355,7 +355,7 @@ public class ViralSeedController {
 
         for (Map.Entry<String, double[]> e : aspectMap.entrySet()) {
             double sum = e.getValue()[0];
-            int n = (int) e.getValue()[1];
+            long n = (long) e.getValue()[1];
             if (n < MIN_ASPECT_MENTIONS) continue;
 
             double avg = sum / n;
