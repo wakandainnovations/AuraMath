@@ -70,6 +70,22 @@ public class TopicalSpreaderDetector {
         return spreaders;
     }
 
+    /**
+     * Returns every qualifying author for {@code genre} sorted by genre-scoped Hawkes
+     * alpha descending, with no percentile cutoff. Callers apply their own limit.
+     * Alpha is estimated only from posts that the GenreClassifier tagged with this genre,
+     * so the score reflects spreading influence within the genre, not overall posting activity.
+     */
+    public List<SpreaderResult> rankBySpreading(GenreLabel genre) {
+        if (genre == null || genre.genre() == null || genre.genre().isBlank()) {
+            return Collections.emptyList();
+        }
+        Map<String, List<UniversalPost>> postsByAuthor = loadAndFilterByGenre(genre.genre());
+        List<SpreaderResult> results = computeAlphas(postsByAuthor);
+        results.sort((a, b) -> Double.compare(b.alpha(), a.alpha()));
+        return results;
+    }
+
     public Map<String, Double> computeAlphaByAuthor(GenreLabel genre) {
         Map<String, List<UniversalPost>> postsByAuthor = loadAndFilterByGenre(genre.genre());
         Map<String, Double> result = new HashMap<>();

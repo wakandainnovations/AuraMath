@@ -18,6 +18,7 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 
 /**
  * Genre-scoped marketing endpoints backed by {@code marketing_target_profiles}.
@@ -35,8 +36,9 @@ public class GenreMarketingAPI {
 
     private static final Type GENRE_MAP_TYPE = new TypeToken<Map<String, Double>>() {}.getType();
 
-    @Autowired private JdbcTemplate    jdbc;
-    @Autowired private GenreClassifier classifier;
+    @Autowired private JdbcTemplate           jdbc;
+    @Autowired private GenreClassifier        classifier;
+    @Autowired private TopicalSpreaderDetector detector;
     private final Gson gson = new Gson();
 
     // -------------------------------------------------------------------------
@@ -111,41 +113,62 @@ public class GenreMarketingAPI {
     // -------------------------------------------------------------------------
     // GET /api/marketing/genre/{genre}/super-spreaders
     //
-    // Top 50 users for {genre} by Hawkes alpha (stored as influence_rank).
+    // Top 50 users for {genre} by Hawkes alpha estimated from {genre} posts only.
+    // TopicalSpreaderDetector filters posts to genre-matching ones before fitting
+    // the Hawkes process, so the alpha score reflects spreading influence within
+    // the genre rather than overall cross-topic posting infectivity.
     // -------------------------------------------------------------------------
     @GetMapping("/{genre}/super-spreaders")
     public ResponseEntity<Map<String, Object>> superSpreaders(@PathVariable String genre) {
-        List<Map<String, Object>> rows = jdbc.queryForList(
-                "SELECT global_user_id, platform_handles, tribe_label, influence_rank, " +
-                "       top_movie_genres, peak_activity_times, moi_score " +
-                "FROM marketing_target_profiles " +
-                "WHERE top_movie_genres::text ILIKE ? " +
-                "ORDER BY influence_rank DESC NULLS LAST " +
-                "LIMIT ?",
-                "%\"" + genre + "\"%", SUPER_SPREADER_LIMIT);
+        List<TopicalSpreaderDetector.SpreaderResult> ranked =
+                detector.rankBySpreading(new GenreLabel(genre, 1.0));
+
+        int take = Math.min(SUPER_SPREADER_LIMIT, ranked.size());
+        List<TopicalSpreaderDetector.SpreaderResult> top = ranked.subList(0, take);
+
+        List<String> authorIds = top.stream()
+                .map(TopicalSpreaderDetector.SpreaderResult::author)
+                .collect(Collectors.toList());
+        Map<String, Map<String, Object>> enrichByAuthor = fetchEnrichment(authorIds);
 
         List<Map<String, Object>> spreaders = new ArrayList<>();
-        for (Map<String, Object> row : rows) {
-            Double genreScore = extractGenreScore(row, genre);
+        for (TopicalSpreaderDetector.SpreaderResult r : top) {
+            Map<String, Object> enrich = enrichByAuthor.getOrDefault(r.author(), Map.of());
+            Double genreScore = extractGenreScore(enrich, genre);
 
             Map<String, Object> entry = new LinkedHashMap<>();
-            entry.put("global_user_id",       row.get("global_user_id"));
-            entry.put("tribe_label",          row.get("tribe_label"));
-            entry.put("platform_handles",     JsonbUtil.asTree(row.get("platform_handles"), gson));
-            entry.put("peak_activity_times",  JsonbUtil.asTree(row.get("peak_activity_times"), gson));
-            entry.put("hawkes_alpha",         toDouble(row.get("influence_rank")));
+            entry.put("global_user_id",       r.author());
+            entry.put("tribe_label",          enrich.get("tribe_label"));
+            entry.put("platform_handles",     JsonbUtil.asTree(enrich.get("platform_handles"), gson));
+            entry.put("peak_activity_times",  JsonbUtil.asTree(enrich.get("peak_activity_times"), gson));
+            entry.put("hawkes_alpha",         r.alpha());
+            entry.put("genre_post_count",     r.postCount());
             entry.put("genre_interest_score", genreScore == null ? 0.0 : genreScore);
-            entry.put("moi_score",            toDouble(row.get("moi_score")));
+            entry.put("moi_score",            toDouble(enrich.get("moi_score")));
             spreaders.add(entry);
         }
 
         Map<String, Object> body = new LinkedHashMap<>();
-        body.put("genre",            genre);
-        body.put("limit",            SUPER_SPREADER_LIMIT);
-        body.put("rankingMetric",    "hawkes_alpha (stored as influence_rank)");
-        body.put("totalSpreaders",   spreaders.size());
-        body.put("spreaders",        spreaders);
+        body.put("genre",          genre);
+        body.put("limit",          SUPER_SPREADER_LIMIT);
+        body.put("rankingMetric",  "hawkes_alpha (genre-scoped: estimated from " + genre + " posts only)");
+        body.put("totalSpreaders", spreaders.size());
+        body.put("spreaders",      spreaders);
         return ResponseEntity.ok(body);
+    }
+
+    private Map<String, Map<String, Object>> fetchEnrichment(List<String> authorIds) {
+        if (authorIds.isEmpty()) return Map.of();
+        String placeholders = authorIds.stream().map(x -> "?").collect(Collectors.joining(","));
+        String sql = "SELECT global_user_id, tribe_label, platform_handles, " +
+                     "       peak_activity_times, top_movie_genres, moi_score " +
+                     "FROM marketing_target_profiles WHERE global_user_id IN (" + placeholders + ")";
+        List<Map<String, Object>> rows = jdbc.queryForList(sql, authorIds.toArray());
+        Map<String, Map<String, Object>> result = new HashMap<>();
+        for (Map<String, Object> row : rows) {
+            result.put((String) row.get("global_user_id"), row);
+        }
+        return result;
     }
 
     // -------------------------------------------------------------------------
