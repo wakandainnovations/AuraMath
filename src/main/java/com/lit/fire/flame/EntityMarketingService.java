@@ -307,13 +307,13 @@ public class EntityMarketingService {
         String in = placeholders(keywords.size());
         String sql =
                 "SELECT COUNT(DISTINCT author) FROM (" +
-                "  SELECT author FROM x_posts          WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' " +
+                "  SELECT author FROM x_posts          WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' AND sentiment_score BETWEEN 1 AND 100 " +
                 "  UNION " +
-                "  SELECT author FROM youtube_comments WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' " +
+                "  SELECT author FROM youtube_comments WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' AND sentiment_score BETWEEN 1 AND 100 " +
                 "  UNION " +
-                "  SELECT author FROM reddit_posts     WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' " +
+                "  SELECT author FROM reddit_posts     WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' AND sentiment_score BETWEEN 1 AND 100 " +
                 "  UNION " +
-                "  SELECT author FROM instagram_posts  WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' " +
+                "  SELECT author FROM instagram_posts  WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' AND sentiment_score BETWEEN 1 AND 100 " +
                 ") combined";
         Object[] args = repeatLowered(keywords, 4);
         Long n = jdbc.queryForObject(sql, Long.class, args);
