@@ -29,9 +29,10 @@ import java.util.stream.Collectors;
 @RequestMapping("/api/marketing/genre")
 public class GenreMarketingAPI {
 
-    // top_movie_genres weights are per-post classifier scores summed over the
-    // user's posts, and a single matched post contributes at least 1.0 — so
-    // requiring > 1.0 means more than one post's worth of genre signal.
+    // top_movie_genres stores sentiment-weighted genre engagement: each post's
+    // contribution is max(0, signed_sentiment) × log(engagement+1) × classifier_weight.
+    // Scores are non-negative; threshold > 1.0 requires meaningful positive engagement
+    // signal (e.g. more than one minimally-engaged post with above-neutral sentiment).
     private static final double GENRE_INTEREST_THRESHOLD = 1.0;
     private static final int    SUPER_SPREADER_LIMIT     = 50;
 
@@ -67,38 +68,76 @@ public class GenreMarketingAPI {
     // -------------------------------------------------------------------------
     // GET /api/marketing/genre/{genre}/potential-viewers
     //
-    // Users whose GenreInterestScore for {genre} exceeds GENRE_INTEREST_THRESHOLD,
-    // sorted by conversion probability:
+    // Queries the mentions pipeline live: for each author, sums
+    //   max(0, (sentiment_score - 50) / 50)
+    // across all their positive-sentiment mentions of {genre} movie/entity posts
+    // (via mention_entities → managed_entities/entity_keywords genre mapping).
+    // Deduplication: DISTINCT (mention_id, genre) prevents inflating scores when
+    // a mention links to multiple entities that share the same genre.
+    //
     //   genre_affinity  = genre_interest_score / Σ(all genre scores)   ∈ [0, 1]
     //   p_conv          = sigmoid(genre_affinity × influence_rank)
     //
-    // Normalising by total genre score prevents prolific authors from saturating
-    // sigmoid purely through post volume; genre_affinity captures what share of
-    // an author's genre-tagged content belongs to this genre.
+    // Only authors already in marketing_target_profiles are returned (inner JOIN),
+    // ensuring influence_rank is always available for p_conv.
     // -------------------------------------------------------------------------
     @GetMapping("/{genre}/potential-viewers")
     public ResponseEntity<Map<String, Object>> potentialViewers(@PathVariable String genre) {
-        List<Map<String, Object>> rows = jdbc.queryForList(
-                "SELECT global_user_id, platform_handles, tribe_label, influence_rank, " +
-                "       top_movie_genres, peak_activity_times, moi_score " +
-                "FROM marketing_target_profiles " +
-                "WHERE top_movie_genres::text ILIKE ?",
-                "%\"" + genre + "\"%");
+        String sql =
+            "WITH entity_genre AS (" +
+            "  SELECT DISTINCT me.id AS entity_id, TRIM(g.g) AS genre" +
+            "  FROM managed_entities me" +
+            "  CROSS JOIN LATERAL unnest(string_to_array(me.genre, ',')) AS g(g)" +
+            "  WHERE me.genre IS NOT NULL AND me.genre <> ''" +
+            "  UNION" +
+            "  SELECT DISTINCT ek.entity_id, TRIM(g.g) AS genre" +
+            "  FROM entity_keywords ek" +
+            "  CROSS JOIN LATERAL unnest(string_to_array(ek.genre, ',')) AS g(g)" +
+            "  WHERE ek.category = 'media.movie' AND ek.genre IS NOT NULL AND ek.genre <> ''" +
+            ")," +
+            "mention_genre_pairs AS (" +
+            "  SELECT DISTINCT m.id AS mention_id, m.author, m.sentiment_score, eg.genre" +
+            "  FROM mentions m" +
+            "  JOIN mention_entities me_j ON me_j.mention_id = m.id" +
+            "  JOIN entity_genre eg ON eg.entity_id = me_j.managed_entity_id" +
+            "  WHERE m.author IS NOT NULL AND m.sentiment_score BETWEEN 1 AND 100" +
+            ")," +
+            "genre_scores AS (" +
+            "  SELECT author, genre," +
+            "         SUM(GREATEST(0.0, (sentiment_score::float - 50.0) / 50.0)) AS genre_score" +
+            "  FROM mention_genre_pairs" +
+            "  GROUP BY author, genre" +
+            ")," +
+            "author_totals AS (" +
+            "  SELECT author, SUM(genre_score) AS total_score" +
+            "  FROM genre_scores WHERE genre_score > 0" +
+            "  GROUP BY author" +
+            ")," +
+            "target_viewers AS (" +
+            "  SELECT gs.author, gs.genre_score, at.total_score," +
+            "         gs.genre_score / at.total_score AS genre_affinity" +
+            "  FROM genre_scores gs" +
+            "  JOIN author_totals at ON at.author = gs.author" +
+            "  WHERE gs.genre ILIKE ?" +
+            "    AND gs.genre_score > ?" +
+            ")" +
+            "SELECT tv.author, tv.genre_score, tv.genre_affinity," +
+            "       mtp.tribe_label, mtp.platform_handles, mtp.peak_activity_times," +
+            "       mtp.influence_rank, mtp.moi_score" +
+            " FROM target_viewers tv" +
+            " JOIN marketing_target_profiles mtp ON mtp.global_user_id = tv.author";
+
+        List<Map<String, Object>> rows = jdbc.queryForList(sql, genre, GENRE_INTEREST_THRESHOLD);
 
         List<Map<String, Object>> viewers = new ArrayList<>();
         for (Map<String, Object> row : rows) {
-            Double genreScore = extractGenreScore(row, genre);
-            if (genreScore == null || genreScore <= GENRE_INTEREST_THRESHOLD) {
-                continue;
-            }
-
-            double totalScore    = extractTotalGenreScore(row);
-            double genreAffinity = totalScore > 0 ? genreScore / totalScore : 0.0;
+            double genreScore    = toDouble(row.get("genre_score"));
+            double genreAffinity = toDouble(row.get("genre_affinity"));
             double influenceRank = toDouble(row.get("influence_rank"));
             double pConv         = sigmoid(genreAffinity * influenceRank);
 
             Map<String, Object> entry = new LinkedHashMap<>();
-            entry.put("global_user_id",       row.get("global_user_id"));
+            entry.put("global_user_id",       row.get("author"));
             entry.put("tribe_label",          row.get("tribe_label"));
             entry.put("platform_handles",     JsonbUtil.asTree(row.get("platform_handles"), gson));
             entry.put("peak_activity_times",  JsonbUtil.asTree(row.get("peak_activity_times"), gson));
@@ -115,7 +154,11 @@ public class GenreMarketingAPI {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("genre",        genre);
         body.put("threshold",    GENRE_INTEREST_THRESHOLD);
-        body.put("scoringModel", "p_conv = sigmoid(genre_affinity * influence_rank); genre_affinity = genre_interest_score / total_genre_score");
+        body.put("scoringModel",
+                 "p_conv = sigmoid(genre_affinity * influence_rank); " +
+                 "genre_affinity = genre_interest_score / total_mention_genre_score; " +
+                 "genre_interest_score = SUM(max(0, (sentiment_score - 50) / 50)) " +
+                 "from mentions × mention_entities × managed_entities/entity_keywords genre");
         body.put("totalViewers", viewers.size());
         body.put("viewers",      viewers);
         return ResponseEntity.ok(body);
