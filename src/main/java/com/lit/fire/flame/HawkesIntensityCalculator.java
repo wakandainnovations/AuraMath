@@ -141,15 +141,17 @@ public class HawkesIntensityCalculator {
                 integralTerm -= (alpha / beta) * (1 - Math.exp(-beta * (T - ti)));
             }
 
-            // The term representing the sum of the log of the intensity at each event time
+            // The term representing the sum of the log of the intensity at each event time.
+            // Uses the O(n) recursive identity for the exponential kernel (Ozaki 1979):
+            //   A(i) = Σ_{j<i} exp(-β(tᵢ − tⱼ))  =  exp(-β(tᵢ − tᵢ₋₁)) · (1 + A(i−1))
+            // so intensity(i) = μ + α·A(i), reducing the naive O(n²) double loop to O(n).
             double sumLogIntensity = 0;
+            double A = 0.0;
             for (int i = 0; i < eventTimes.size(); i++) {
-                double ti = eventTimes.get(i);
-                double intensity = mu;
-                for (int j = 0; j < i; j++) {
-                    double tj = eventTimes.get(j);
-                    intensity += alpha * Math.exp(-beta * (ti - tj));
+                if (i > 0) {
+                    A = Math.exp(-beta * (eventTimes.get(i) - eventTimes.get(i - 1))) * (1.0 + A);
                 }
+                double intensity = mu + alpha * A;
                 if (intensity <= 0) return 1e15; // Invalid intensity: large finite penalty (Infinity breaks BOBYQA's quadratic model)
                 sumLogIntensity += Math.log(intensity);
             }
