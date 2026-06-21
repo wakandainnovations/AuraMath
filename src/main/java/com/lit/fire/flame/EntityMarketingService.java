@@ -377,16 +377,16 @@ public class EntityMarketingService {
         String sql =
                 "WITH per_post AS (" +
                 "  SELECT author AS global_user_id, COALESCE(likes_count, 0)::bigint AS likes, COALESCE(comment_count, 0)::bigint AS comments, COALESCE(views_count, 0)::bigint AS views " +
-                "  FROM x_posts          WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' AND sentiment_score <> 0 " +
+                "  FROM x_posts          WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' AND sentiment_score BETWEEN 1 AND 100 " +
                 "  UNION ALL " +
                 "  SELECT author, COALESCE(likes_count, 0)::bigint, COALESCE(reply_count, 0)::bigint, 0::bigint " +
-                "  FROM youtube_comments WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' AND sentiment_score <> 0 " +
+                "  FROM youtube_comments WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' AND sentiment_score BETWEEN 1 AND 100 " +
                 "  UNION ALL " +
                 "  SELECT author, COALESCE(score, 0)::bigint, COALESCE(num_comments, 0)::bigint, 0::bigint " +
-                "  FROM reddit_posts     WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' AND sentiment_score <> 0 " +
+                "  FROM reddit_posts     WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' AND sentiment_score BETWEEN 1 AND 100 " +
                 "  UNION ALL " +
                 "  SELECT author, COALESCE(like_count, 0)::bigint, COALESCE(comments_count, 0)::bigint, 0::bigint " +
-                "  FROM instagram_posts  WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' AND sentiment_score <> 0 " +
+                "  FROM instagram_posts  WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' AND sentiment_score BETWEEN 1 AND 100 " +
                 "), per_user AS (" +
                 "  SELECT global_user_id, COUNT(*) AS post_count, SUM(likes) AS total_likes, " +
                 "         SUM(comments) AS total_comments, SUM(views) AS total_views, " +
