@@ -6,6 +6,8 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.Map;
+
 @RestController
 @RequestMapping("/api/admin")
 public class EnrichmentController {
@@ -15,6 +17,9 @@ public class EnrichmentController {
 
     @Autowired
     private CrossPlatformIdentityResolver crossPlatformIdentityResolver;
+
+    @Autowired
+    private NarrativeNoveltyService narrativeNoveltyService;
 
     @PostMapping("/run-enrichment")
     public ResponseEntity<String> runEnrichment() {
@@ -26,5 +31,10 @@ public class EnrichmentController {
     public ResponseEntity<String> resolveIdentities() {
         int inserted = crossPlatformIdentityResolver.resolveIdentities();
         return ResponseEntity.ok("inserted=" + inserted);
+    }
+
+    @PostMapping("/recompute-narrative-novelty")
+    public ResponseEntity<Map<String, Object>> recomputeNarrativeNovelty() {
+        return ResponseEntity.ok(narrativeNoveltyService.recomputeAndPersist());
     }
 }
