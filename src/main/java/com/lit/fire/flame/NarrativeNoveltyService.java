@@ -260,6 +260,40 @@ public class NarrativeNoveltyService {
         return summary;
     }
 
+    /**
+     * Same scoring algorithm as {@link #recomputeAndPersist()} (rebuild corpus, corpus-relative
+     * percentile, rescale into the [0.30, 0.45] band), but persists into the legacy
+     * {@code narrative_novelty_score} column instead of the {@code _v2} columns. Does not read or
+     * write {@code narrative_novelty_score_v2}/{@code narrative_novelty_raw_v2}.
+     */
+    public Map<String, Object> recomputeAndPersistV1() {
+        rebuildCorpus();
+
+        int updated = 0;
+        for (int i = 0; i < corpus.size(); i++) {
+            CorpusDoc d = corpus.get(i);
+            double raw = rawNoveltyPerDoc[i];
+            double pct = percentileRank(raw, referenceDistributionFor(d.primaryGenre()));
+            double score = BAND_FLOOR + pct * (BAND_CEIL - BAND_FLOOR);
+            updated += jdbcTemplate.update(
+                    "UPDATE movies_data_collection SET narrative_novelty_score = ? " +
+                    "WHERE movie_name = ? AND release_date = ? AND language = ?",
+                    score, d.movieName(), d.releaseDate(), d.language());
+        }
+
+        Map<String, Object> validation = jdbcTemplate.queryForMap(
+                "SELECT corr(narrative_novelty_score, revenue) AS corr_revenue, " +
+                "       corr(narrative_novelty_score, imdb_rating) AS corr_imdb, " +
+                "       count(DISTINCT narrative_novelty_score) AS distinct_values " +
+                "FROM movies_data_collection WHERE narrative_novelty_score IS NOT NULL AND revenue > 0");
+
+        Map<String, Object> summary = new LinkedHashMap<>();
+        summary.put("corpusSize", corpus.size());
+        summary.put("rowsUpdated", updated);
+        summary.put("validation", validation);
+        return summary;
+    }
+
     private void ensureSchema() {
         jdbcTemplate.execute("ALTER TABLE movies_data_collection ADD COLUMN IF NOT EXISTS narrative_novelty_score_v2 numeric");
         jdbcTemplate.execute("ALTER TABLE movies_data_collection ADD COLUMN IF NOT EXISTS narrative_novelty_raw_v2 numeric");

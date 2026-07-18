@@ -21,6 +21,9 @@ public class EnrichmentController {
     @Autowired
     private NarrativeNoveltyService narrativeNoveltyService;
 
+    @Autowired
+    private ConflictBalanceService conflictBalanceService;
+
     @PostMapping("/run-enrichment")
     public ResponseEntity<String> runEnrichment() {
         marketingEnrichmentEngine.enrichAndSave();
@@ -36,5 +39,16 @@ public class EnrichmentController {
     @PostMapping("/recompute-narrative-novelty")
     public ResponseEntity<Map<String, Object>> recomputeNarrativeNovelty() {
         return ResponseEntity.ok(narrativeNoveltyService.recomputeAndPersist());
+    }
+
+    /** Same scoring algorithm, but persists into the legacy narrative_novelty_score column (no _v2 suffix). */
+    @PostMapping("/recompute-narrative-novelty-v1")
+    public ResponseEntity<Map<String, Object>> recomputeNarrativeNoveltyV1() {
+        return ResponseEntity.ok(narrativeNoveltyService.recomputeAndPersistV1());
+    }
+
+    @PostMapping("/recompute-conflict-balance")
+    public ResponseEntity<Map<String, Object>> recomputeConflictBalance() {
+        return ResponseEntity.ok(conflictBalanceService.recomputeAndPersist());
     }
 }
