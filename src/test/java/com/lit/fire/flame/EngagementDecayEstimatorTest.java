@@ -1,7 +1,7 @@
 package com.lit.fire.flame;
 
 import com.lit.fire.flame.models.UniversalPost;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
@@ -10,8 +10,8 @@ import java.util.List;
 import java.util.Collections;
 import java.util.stream.Stream;
 
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 
 public class EngagementDecayEstimatorTest {
 
@@ -44,10 +44,10 @@ public class EngagementDecayEstimatorTest {
         System.out.printf("Predicted Engagement Shelf Life: %.2f hours%n", shelfLifeInHours);
         System.out.println("This is the estimated time for the post's engagement rate to drop to 10% of its peak.");
 
-        assertNotEquals("Shelf life should not be infinity", Double.POSITIVE_INFINITY, shelfLifeInHours, 0.0);
-        
+        assertNotEquals(Double.POSITIVE_INFINITY, shelfLifeInHours, 0.0, "Shelf life should not be infinity");
+
         // In a real-world test, you would assert that the value is within an expected range.
-        assertTrue("Shelf life should be a positive value", shelfLifeInHours > 0);
-        assertTrue("Shelf life should be a realistic value for this dataset", shelfLifeInHours < 50);
+        assertTrue(shelfLifeInHours > 0, "Shelf life should be a positive value");
+        assertTrue(shelfLifeInHours < 50, "Shelf life should be a realistic value for this dataset");
     }
 }

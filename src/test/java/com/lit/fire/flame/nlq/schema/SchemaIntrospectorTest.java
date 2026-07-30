@@ -1,6 +1,6 @@
 package com.lit.fire.flame.nlq.schema;
 
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -10,9 +10,9 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Exercises {@link SchemaIntrospector} and {@link SchemaRenderer} against an in-memory SQLite
@@ -59,24 +59,24 @@ public class SchemaIntrospectorTest {
         // The skipped table must not be a model-visible table.
         boolean hasSecrets = schema.getTables().stream()
                 .anyMatch(t -> t.getName().equalsIgnoreCase("secrets"));
-        assertFalse("skipped table 'secrets' must not appear in DatabaseSchema", hasSecrets);
+        assertFalse(hasSecrets, "skipped table 'secrets' must not appear in DatabaseSchema");
 
         // The skipped column must not appear on its table.
         TableInfo users = schema.getTables().stream()
                 .filter(t -> t.getName().equalsIgnoreCase("users"))
                 .findFirst().orElse(null);
-        assertNotNull("users table should be present", users);
+        assertNotNull(users, "users table should be present");
         boolean hasSecretToken = users.getColumns().stream()
                 .anyMatch(c -> c.getName().equalsIgnoreCase("secret_token"));
-        assertFalse("skipped column 'secret_token' must not appear on users", hasSecretToken);
+        assertFalse(hasSecretToken, "skipped column 'secret_token' must not appear on users");
 
         String rendered = renderer.render(schema);
 
         // The explicit requirement: a skipped table name is absent from the rendered output.
-        assertFalse("rendered schema must not contain the skipped table name 'secrets'",
-                rendered.contains("secrets"));
-        assertFalse("rendered schema must not contain the skipped column 'secret_token'",
-                rendered.contains("secret_token"));
+        assertFalse(rendered.contains("secrets"),
+                "rendered schema must not contain the skipped table name 'secrets'");
+        assertFalse(rendered.contains("secret_token"),
+                "rendered schema must not contain the skipped column 'secret_token'");
 
         // Sanity: the surviving structure is rendered.
         assertTrue(rendered.contains("users"));
@@ -94,7 +94,7 @@ public class SchemaIntrospectorTest {
         }
         boolean anyInternal = schema.getTables().stream()
                 .anyMatch(t -> t.getName().toLowerCase().startsWith("sqlite_"));
-        assertFalse("sqlite_* internal tables must be excluded", anyInternal);
+        assertFalse(anyInternal, "sqlite_* internal tables must be excluded");
     }
 
     @Test

@@ -1,7 +1,7 @@
 package com.lit.fire.flame;
 
 import com.lit.fire.flame.models.UniversalPost;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
