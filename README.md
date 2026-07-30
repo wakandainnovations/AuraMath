@@ -24,6 +24,7 @@ of REST endpoints that can be consumed by an ad-buying or campaign-planning serv
    - [Political Marketing (`/api/marketing/party`)](#5a-political-marketing-api)
    - [Celebrity Marketing (`/api/marketing/celebrity`)](#5b-celebrity-marketing-api)
    - [Entity Report (`/api/marketing/entity-report`)](#5c-entity-report-api)
+   - [Language Marketing (`/api/marketing/language`)](#5d-language-marketing-api)
    - [Viral Seeds & Aspect Drivers (`/api/marketing`)](#6-viral-seeds--aspect-drivers)
    - [Top Spreaders (`/api/marketing/top-50-spreaders`)](#7-top-spreaders)
    - [Lookalike Discovery (`/api/marketing/find-lookalikes`)](#8-lookalike-discovery)
@@ -697,6 +698,50 @@ Sections in the response:
 | `0.6 – 0.8` | `Trending`            |
 | `0.3 – 0.6` | `Active Conversation` |
 | `< 0.3`     | `Niche`               |
+
+---
+
+### 5d. Language Marketing API
+
+Flat-JSON endpoint for the language-affinity audience of language-tagged movies. The
+`{language}` path parameter is case-insensitive (e.g. `tamil`, `Tamil`, `TAMIL`).
+
+**`GET /api/marketing/language/{language}/users`**
+
+Every distinct user with a mention linked to a `managed_entities` row where
+`type = 'MOVIE'` and `language` matches `{language}`. `author` → `global_user_id`
+resolution goes through `user_identity_link` (normalize + lookup, same as the
+Engagement Rating and Lookalike Discovery pipelines); mentions whose author has no
+resolved identity are skipped. `engagement_rating` / `tribe_label` / `platform_handles`
+are enriched from `marketing_target_profiles` via a left-join — users are never dropped
+for missing enrichment, those fields are `null` instead. Sorted by `engagement_rating`
+descending, with unenriched (`null`) users last. An unknown language returns an empty
+`users` list, not a `404`.
+
+```json
+{
+  "language": "Tamil",
+  "totalUsers": 3,
+  "users": [
+    {
+      "global_user_id": "user-9f2c1e3a-...",
+      "mention_count": 14,
+      "distinct_movies_mentioned": 4,
+      "engagement_rating": 87.5,
+      "tribe_label": "Cinephile-Critic",
+      "platform_handles": { "primary_platform": "x", "by_platform": { "x": {"profile_url": "..."} } }
+    },
+    {
+      "global_user_id": "user-4b7a08d1-...",
+      "mention_count": 2,
+      "distinct_movies_mentioned": 2,
+      "engagement_rating": null,
+      "tribe_label": null,
+      "platform_handles": null
+    }
+  ]
+}
+```
 
 ---
 
