@@ -10,6 +10,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -95,6 +96,107 @@ public class LanguageMarketingAPI {
         body.put("totalUsers",  users.size());
         body.put("users",       users);
         return ResponseEntity.ok(body);
+    }
+
+    // -------------------------------------------------------------------------
+    // GET /api/marketing/language/{language}/movie/{movieName}/users
+    //
+    // Same join as potentialViewers() above, additionally filtered to managed_entities
+    // whose name matches {movieName} (case-insensitive). mention_count/distinct_movies_
+    // mentioned are scoped to that filtered set, same DISTINCT (mention_id, entity_id)
+    // dedup as Feature 4. mentions_on_this_movie/average_sentiment_score are computed
+    // separately over mentions.sentiment_score restricted to the 1-100 bounds check
+    // used elsewhere (see GenreMarketingAPI), so an out-of-range/null score doesn't
+    // skew the average but the mention still counts toward mention_count.
+    // A movie name that doesn't resolve to any managed_entities row for {language}
+    // yields an empty result set, not an error.
+    // -------------------------------------------------------------------------
+    @GetMapping("/{language}/movie/{movieName}/users")
+    public ResponseEntity<Map<String, Object>> potentialViewersForMovie(
+            @PathVariable String language, @PathVariable String movieName) {
+        String sql =
+            "SELECT DISTINCT m.id AS mention_id, m.author AS author, me.id AS entity_id " +
+            "FROM mentions m " +
+            "JOIN mention_entities me_j ON me_j.mention_id = m.id " +
+            "JOIN managed_entities me ON me.id = me_j.managed_entity_id " +
+            "WHERE me.type = 'MOVIE' AND me.language ILIKE ? AND me.name ILIKE ? " +
+            "  AND m.author IS NOT NULL AND m.author <> ''";
+
+        String sentimentSql =
+            "SELECT DISTINCT m.id AS mention_id, m.author AS author, m.sentiment_score AS sentiment_score " +
+            "FROM mentions m " +
+            "JOIN mention_entities me_j ON me_j.mention_id = m.id " +
+            "JOIN managed_entities me ON me.id = me_j.managed_entity_id " +
+            "WHERE me.type = 'MOVIE' AND me.language ILIKE ? AND me.name ILIKE ? " +
+            "  AND m.author IS NOT NULL AND m.author <> '' " +
+            "  AND m.sentiment_score BETWEEN 1 AND 100";
+
+        Map<String, String> identities = loadIdentityIndex();
+
+        Map<String, Set<Object>> mentionsByUser = new HashMap<>();
+        Map<String, Set<Object>> moviesByUser = new HashMap<>();
+
+        jdbc.query(sql, rs -> {
+            String globalUserId = identities.get(normalize(rs.getString("author")));
+            if (globalUserId == null) {
+                return;
+            }
+            mentionsByUser.computeIfAbsent(globalUserId, k -> new HashSet<>()).add(rs.getObject("mention_id"));
+            moviesByUser.computeIfAbsent(globalUserId, k -> new HashSet<>()).add(rs.getObject("entity_id"));
+        }, language, movieName);
+
+        Map<String, Map<Object, Integer>> sentimentByUser = new HashMap<>();
+        jdbc.query(sentimentSql, rs -> {
+            String globalUserId = identities.get(normalize(rs.getString("author")));
+            if (globalUserId == null) {
+                return;
+            }
+            sentimentByUser
+                    .computeIfAbsent(globalUserId, k -> new LinkedHashMap<>())
+                    .put(rs.getObject("mention_id"), rs.getInt("sentiment_score"));
+        }, language, movieName);
+
+        Map<String, Map<String, Object>> enrichByUser = fetchEnrichment(new ArrayList<>(mentionsByUser.keySet()));
+
+        List<Map<String, Object>> users = new ArrayList<>();
+        for (Map.Entry<String, Set<Object>> entry : mentionsByUser.entrySet()) {
+            String globalUserId = entry.getKey();
+            Map<String, Object> enrich = enrichByUser.getOrDefault(globalUserId, Map.of());
+            Map<Object, Integer> sentimentMentions = sentimentByUser.getOrDefault(globalUserId, Map.of());
+
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("global_user_id",            globalUserId);
+            row.put("mention_count",              entry.getValue().size());
+            row.put("distinct_movies_mentioned",  moviesByUser.getOrDefault(globalUserId, Set.of()).size());
+            row.put("engagement_rating",          enrich.get("engagement_rating"));
+            row.put("tribe_label",                enrich.get("tribe_label"));
+            row.put("platform_handles",           JsonbUtil.asTree(enrich.get("platform_handles"), gson));
+            row.put("mentions_on_this_movie",     sentimentMentions.size());
+            row.put("average_sentiment_score",    averageOf(sentimentMentions.values()));
+            users.add(row);
+        }
+
+        users.sort(Comparator.comparing(
+                (Map<String, Object> row) -> toNullableDouble(row.get("engagement_rating")),
+                Comparator.nullsLast(Comparator.reverseOrder())));
+
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("language",    language);
+        body.put("movie",       movieName);
+        body.put("totalUsers",  users.size());
+        body.put("users",       users);
+        return ResponseEntity.ok(body);
+    }
+
+    private static Double averageOf(Collection<Integer> scores) {
+        if (scores.isEmpty()) {
+            return null;
+        }
+        double sum = 0.0;
+        for (Integer s : scores) {
+            sum += s;
+        }
+        return Math.round((sum / scores.size()) * 10.0) / 10.0;
     }
 
     private Map<String, String> loadIdentityIndex() {

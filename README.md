@@ -743,6 +743,50 @@ descending, with unenriched (`null`) users last. An unknown language returns an 
 }
 ```
 
+**`GET /api/marketing/language/{language}/movie/{movieName}/users`**
+
+Same join as above, additionally filtered to `managed_entities` rows whose `name`
+matches `{movieName}` exactly (case-insensitive; no wildcard is added server-side, so
+`{movieName}` must match the full `managed_entities.name` value). `mention_count` and
+`distinct_movies_mentioned` are scoped to that movie-filtered set. Each user entry
+also carries `mentions_on_this_movie` and `average_sentiment_score`, computed from
+`mentions.sentiment_score` for that user on that movie, restricted to the same
+`sentiment_score BETWEEN 1 AND 100` bounds check used by the Genre Marketing API —
+mentions with an out-of-range or missing sentiment score still count toward
+`mention_count` but are excluded from the average. If `{movieName}` doesn't resolve
+to any `managed_entities` row for `{language}`, the response is `totalUsers: 0` with
+an empty `users` list, not an error.
+
+```json
+{
+  "language": "Tamil",
+  "movie": "Vikram",
+  "totalUsers": 2,
+  "users": [
+    {
+      "global_user_id": "user-9f2c1e3a-...",
+      "mention_count": 6,
+      "distinct_movies_mentioned": 1,
+      "engagement_rating": 87.5,
+      "tribe_label": "Cinephile-Critic",
+      "platform_handles": { "primary_platform": "x", "by_platform": { "x": {"profile_url": "..."} } },
+      "mentions_on_this_movie": 5,
+      "average_sentiment_score": 78.4
+    },
+    {
+      "global_user_id": "user-4b7a08d1-...",
+      "mention_count": 1,
+      "distinct_movies_mentioned": 1,
+      "engagement_rating": null,
+      "tribe_label": null,
+      "platform_handles": null,
+      "mentions_on_this_movie": 0,
+      "average_sentiment_score": null
+    }
+  ]
+}
+```
+
 ---
 
 ### 6. Viral Seeds & Aspect Drivers
