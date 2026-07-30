@@ -60,9 +60,11 @@ from typing import Callable, Optional
 import numpy as np
 import pandas as pd
 import psycopg2
-from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.ensemble import GradientBoostingRegressor, HistGradientBoostingRegressor
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error, r2_score
+from sklearn.model_selection import KFold
+from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler
 
 # ---------------------------------------------------------------------------
@@ -116,6 +118,12 @@ RIDGE_ALPHA = 2.0
 CALIBRATION_CLIP = (0.30, 1.60)
 
 RNG_SEED = 42
+
+# "Predicted correctly" tolerance bands (|predicted - actual| / actual) for the
+# full-corpus out-of-fold accuracy check. No single tolerance is objectively
+# "correct" for box-office prediction, so we report all three.
+ACCURACY_THRESHOLDS = (0.20, 0.30, 0.50)
+CV_FOLDS = 5
 
 
 # ---------------------------------------------------------------------------
@@ -853,6 +861,277 @@ def fit_predictive_model(train: pd.DataFrame, test: pd.DataFrame, cols: list[str
 
 
 # ---------------------------------------------------------------------------
+# Multi-model comparison, including a neural network (MLPRegressor)
+# ---------------------------------------------------------------------------
+# On ~1,400 rows and ~19 features a neural net is not guaranteed to beat a tree
+# ensemble -- MLPs generally want much more data than tabular gradient boosting
+# does to earn their extra flexibility. So this fits several candidates with the
+# identical out-of-fold protocol and lets the accuracy numbers pick the winner,
+# rather than assuming the neural net is "the accurate way" a priori.
+
+MODEL_FACTORIES = {
+    "ridge": lambda: Ridge(alpha=RIDGE_ALPHA, random_state=RNG_SEED),
+    "gbr": lambda: GradientBoostingRegressor(n_estimators=300, max_depth=3, learning_rate=0.05, random_state=RNG_SEED),
+    "hist_gbr": lambda: HistGradientBoostingRegressor(max_iter=300, max_depth=4, learning_rate=0.05, random_state=RNG_SEED),
+    "mlp_neural_net": lambda: MLPRegressor(
+        hidden_layer_sizes=(64, 32), activation="relu", alpha=1e-2, learning_rate_init=1e-3,
+        early_stopping=True, n_iter_no_change=20, max_iter=2000, random_state=RNG_SEED),
+}
+
+
+def cross_validated_predictions_for(df: pd.DataFrame, cols: list[str], model_name: str,
+                                     n_splits: int = CV_FOLDS) -> pd.Series:
+    """Same out-of-fold protocol as cross_validated_predictions, generalized to any model
+    in MODEL_FACTORIES. Standardizing inputs is required for Ridge/MLP and harmless for
+    the tree models, so all four candidates run through one uniform pipeline."""
+    X = df[cols].fillna(0).values
+    y = df["ln_revenue"].values
+    pred = np.full(len(df), np.nan)
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=RNG_SEED)
+    for train_idx, test_idx in kf.split(X):
+        scaler = StandardScaler()
+        Xtr = scaler.fit_transform(X[train_idx])
+        Xte = scaler.transform(X[test_idx])
+        model = MODEL_FACTORIES[model_name]()
+        model.fit(Xtr, y[train_idx])
+        pred[test_idx] = model.predict(Xte)
+    return pd.Series(pred, index=df.index)
+
+
+def compare_models(df: pd.DataFrame, cols: list[str]) -> dict:
+    results = {}
+    for name in MODEL_FACTORIES:
+        pred_log = cross_validated_predictions_for(df, cols, name)
+        _, summary = evaluate_full_corpus_accuracy(df, pred_log)
+        results[name] = summary
+    return results
+
+
+def print_model_comparison(results: dict) -> None:
+    print("\n-- Direct revenue-prediction model comparison (5-fold out-of-fold) --")
+    print(f"  {'model':16s} {'median |%err|':>14s} {'within 20%':>13s} {'within 30%':>13s} {'within 50%':>13s}")
+    for name, s in results.items():
+        n = s["n_movies"]
+        print(f"  {name:16s} {s['median_abs_pct_error']:>13.1f}% "
+              f"{s['within_20pct']['n_correct']:>5d}/{n:<5d} ({s['within_20pct']['pct_correct']:>5.1f}%) "
+              f"{s['within_30pct']['n_correct']:>5d}/{n:<5d} "
+              f"{s['within_50pct']['n_correct']:>5d}/{n:<5d}")
+
+
+# ---------------------------------------------------------------------------
+# Neural-network-calibrated factor min/max + formula-based revenue reconstruction
+# ---------------------------------------------------------------------------
+# This is the literal Y = B0 * prod(1 + delta_i) formula from the brief: B0 comes
+# from a Ridge fit on the budget/quality baseline anchors alone, and each delta_i
+# is a measurable factor's per-movie value rescaled from the literature
+# [stated_min, stated_max] band into a band the neural net re-derives from data
+# (via partial dependence, since an MLP has no single global coefficient the way
+# Ridge does). Unmeasurable factors still can't be calibrated -- no model invents
+# signal for a column that doesn't exist in the schema -- so they're left out of
+# the formula the same way they're absent from the regression features above.
+
+FACTOR_BY_KEY = {f.key: f for f in FACTOR_CATALOG}
+
+
+def fit_baseline_model(train: pd.DataFrame) -> tuple[StandardScaler, Ridge]:
+    X = train[BASELINE_ANCHOR_COLS].fillna(0).values
+    y = train["ln_revenue"].values
+    scaler = StandardScaler()
+    Xs = scaler.fit_transform(X)
+    model = Ridge(alpha=RIDGE_ALPHA, random_state=RNG_SEED)
+    model.fit(Xs, y)
+    return scaler, model
+
+
+def fit_effect_model(train: pd.DataFrame, cols: list[str], model_name: str = "mlp_neural_net"):
+    X = train[cols].fillna(0).values
+    y = train["ln_revenue"].values
+    scaler = StandardScaler()
+    Xs = scaler.fit_transform(X)
+    model = MODEL_FACTORIES[model_name]()
+    model.fit(Xs, y)
+    return scaler, model
+
+
+def compute_factor_effects(scaler: StandardScaler, model, train: pd.DataFrame, cols: list[str]) -> dict:
+    """For each measurable factor, sweep its feature from the literature stated_min to
+    stated_max -- holding every other feature at each row's actual value, i.e. a proper
+    partial-dependence average -- and read the model's average predicted swing in
+    ln(revenue). That swing, per unit of the swept range, is the model's own learned
+    effective 'coefficient' for the factor, used exactly the way the Ridge coefficient
+    was used elsewhere in this script to rescale the literature band into a calibrated
+    one -- just estimated by a model that can capture non-linear interactions instead of
+    a linear fit."""
+    X = train[cols].fillna(0).values
+    effects = {}
+    for key in MEASURABLE_KEYS:
+        col = delta_regressor_col(key)
+        if col not in cols:
+            continue
+        idx = cols.index(col)
+        f = FACTOR_BY_KEY[key]
+        lo_val, hi_val = np.log1p(f.stated_min), np.log1p(f.stated_max)
+        X_lo, X_hi = X.copy(), X.copy()
+        X_lo[:, idx] = lo_val
+        X_hi[:, idx] = hi_val
+        pred_lo = model.predict(scaler.transform(X_lo))
+        pred_hi = model.predict(scaler.transform(X_hi))
+        effect_log = float(np.mean(pred_hi - pred_lo))
+        span = hi_val - lo_val
+        effects[key] = effect_log / span if abs(span) > 1e-9 else 0.0
+    return effects
+
+
+def calibrate_factors_from_effects(effects: dict) -> dict:
+    """Same CALIBRATION_CLIP philosophy as the Ridge-bootstrap calibration elsewhere in
+    this script: a slope of 1.0 means the stated band looks about right as-is; clip to
+    [0.30, 1.60] of the stated band so one noisy partial-dependence read can't flip a
+    factor's sign or blow its range up to something implausible."""
+    calibrated = {}
+    for key, slope in effects.items():
+        f = FACTOR_BY_KEY[key]
+        mult = float(np.clip(slope, *CALIBRATION_CLIP))
+        cal_a, cal_b = f.stated_min * mult, f.stated_max * mult
+        calibrated[key] = (min(cal_a, cal_b), max(cal_a, cal_b), mult)
+    return calibrated
+
+
+def rescale_into_band(value: pd.Series, old_lo: float, old_hi: float, new_lo: float, new_hi: float) -> pd.Series:
+    if abs(old_hi - old_lo) < 1e-9:
+        return pd.Series(new_lo, index=value.index)
+    frac = ((value - old_lo) / (old_hi - old_lo)).clip(0, 1)
+    return new_lo + frac * (new_hi - new_lo)
+
+
+def formula_predict_revenue(df: pd.DataFrame, baseline_scaler: StandardScaler, baseline_model: Ridge,
+                             calibrated: dict) -> pd.Series:
+    Xb = df[BASELINE_ANCHOR_COLS].fillna(0).values
+    ln_revenue = baseline_model.predict(baseline_scaler.transform(Xb))
+    for key, (cal_lo, cal_hi, _mult) in calibrated.items():
+        if key not in df.columns:
+            continue
+        f = FACTOR_BY_KEY[key]
+        delta_calibrated = rescale_into_band(df[key], f.stated_min, f.stated_max, cal_lo, cal_hi)
+        ln_revenue = ln_revenue + np.log1p(delta_calibrated).values
+    return pd.Series(ln_revenue, index=df.index)
+
+
+def formula_reconstruction_oof(df: pd.DataFrame, cols: list[str], model_name: str = "mlp_neural_net",
+                                n_splits: int = CV_FOLDS) -> pd.Series:
+    """Honest out-of-fold version of the formula pipeline: B0 and the factor-effect
+    calibration are both fit on the train fold only, then applied to the held-out fold --
+    so the reported accuracy isn't inflated by calibrating a factor's band on the same
+    rows it's later scored against."""
+    pred = np.full(len(df), np.nan)
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=RNG_SEED)
+    for train_idx, test_idx in kf.split(df):
+        train_fold, test_fold = df.iloc[train_idx], df.iloc[test_idx]
+        b_scaler, b_model = fit_baseline_model(train_fold)
+        eff_scaler, eff_model = fit_effect_model(train_fold, cols, model_name)
+        effects = compute_factor_effects(eff_scaler, eff_model, train_fold, cols)
+        calibrated = calibrate_factors_from_effects(effects)
+        pred[test_idx] = formula_predict_revenue(test_fold, b_scaler, b_model, calibrated).values
+    return pd.Series(pred, index=df.index)
+
+
+def build_nn_calibrated_factor_table(df: pd.DataFrame, cols: list[str], model_name: str = "mlp_neural_net") -> list[dict]:
+    """Final reportable min/max per factor, fit once on the full corpus (as opposed to
+    formula_reconstruction_oof's per-fold refits, which exist only to keep the accuracy
+    check honest)."""
+    eff_scaler, eff_model = fit_effect_model(df, cols, model_name)
+    effects = compute_factor_effects(eff_scaler, eff_model, df, cols)
+    calibrated = calibrate_factors_from_effects(effects)
+    rows = []
+    for f in FACTOR_CATALOG:
+        if f.key in calibrated:
+            cal_lo, cal_hi, mult = calibrated[f.key]
+            rows.append({
+                "id": f.id, "key": f.key, "name": f.name, "category": f.category,
+                "stated_min": f.stated_min, "stated_max": f.stated_max,
+                "calibrated_min": round(cal_lo, 4), "calibrated_max": round(cal_hi, 4),
+                "calibration_multiplier": round(mult, 3), "source": f"{model_name}_partial_dependence",
+            })
+        else:
+            rows.append({
+                "id": f.id, "key": f.key, "name": f.name, "category": f.category,
+                "stated_min": f.stated_min, "stated_max": f.stated_max,
+                "calibrated_min": f.stated_min, "calibrated_max": f.stated_max,
+                "calibration_multiplier": None, "source": "prior_literature",
+            })
+    return rows
+
+
+def write_nn_outputs(nn_factor_table: list[dict], model_comparison: dict,
+                      formula_predictions: pd.DataFrame, formula_summary: dict, output_dir: str) -> None:
+    os.makedirs(output_dir, exist_ok=True)
+    pd.DataFrame(nn_factor_table).to_csv(os.path.join(output_dir, "factor_impact_scores_nn_calibrated.csv"), index=False)
+    with open(os.path.join(output_dir, "model_comparison.json"), "w") as f:
+        json.dump(model_comparison, f, indent=2, default=float)
+    formula_predictions.sort_values("abs_pct_error").to_csv(
+        os.path.join(output_dir, "formula_revenue_predictions.csv"), index=False)
+    with open(os.path.join(output_dir, "formula_accuracy_summary.json"), "w") as f:
+        json.dump(formula_summary, f, indent=2, default=float)
+    print(f"Wrote {output_dir}/factor_impact_scores_nn_calibrated.csv, model_comparison.json, "
+          f"formula_revenue_predictions.csv, formula_accuracy_summary.json")
+
+
+# ---------------------------------------------------------------------------
+# Full-corpus out-of-fold prediction accuracy
+# ---------------------------------------------------------------------------
+
+def cross_validated_predictions(df: pd.DataFrame, cols: list[str], n_splits: int = CV_FOLDS) -> pd.Series:
+    """Out-of-fold ln(revenue) prediction for every row via K-fold GBR, so each
+    movie is scored by a model that never saw its own revenue during training --
+    unlike just refitting on the full corpus and predicting back on it, which
+    would report in-sample fit and overstate accuracy."""
+    X = df[cols].fillna(0).values
+    y = df["ln_revenue"].values
+    pred = np.full(len(df), np.nan)
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=RNG_SEED)
+    for train_idx, test_idx in kf.split(X):
+        gbr = GradientBoostingRegressor(n_estimators=300, max_depth=3, learning_rate=0.05, random_state=RNG_SEED)
+        gbr.fit(X[train_idx], y[train_idx])
+        pred[test_idx] = gbr.predict(X[test_idx])
+    return pd.Series(pred, index=df.index)
+
+
+def evaluate_full_corpus_accuracy(df: pd.DataFrame, pred_ln_revenue: pd.Series,
+                                   thresholds: tuple = ACCURACY_THRESHOLDS) -> tuple[pd.DataFrame, dict]:
+    actual = df["revenue"].astype(float)
+    predicted = np.exp(pred_ln_revenue)
+    abs_pct_error = (predicted - actual).abs() / actual
+
+    rows = pd.DataFrame({
+        "movie_name": df["movie_name"], "release_year": df["release_year"],
+        "actual_revenue": actual, "predicted_revenue": predicted.round(0),
+        "abs_pct_error": abs_pct_error.round(4),
+    })
+    for t in thresholds:
+        rows[f"within_{int(t * 100)}pct"] = abs_pct_error <= t
+
+    summary = {"n_movies": len(rows)}
+    for t in thresholds:
+        n_correct = int((abs_pct_error <= t).sum())
+        summary[f"within_{int(t * 100)}pct"] = {
+            "n_correct": n_correct,
+            "pct_correct": round(100 * n_correct / len(rows), 1),
+        }
+    summary["median_abs_pct_error"] = round(float(abs_pct_error.median()) * 100, 1)
+    return rows, summary
+
+
+def print_accuracy_report(summary: dict) -> None:
+    print("\n-- Full-corpus revenue prediction accuracy (5-fold out-of-fold GBR) --")
+    print(f"  Movies scored: {summary['n_movies']}")
+    print(f"  Median absolute % error: {summary['median_abs_pct_error']}%")
+    for key, val in summary.items():
+        if key.startswith("within_"):
+            pct = key.replace("within_", "").replace("pct", "")
+            print(f"  Predicted within +/-{pct}% of actual revenue: {val['n_correct']}/{summary['n_movies']} "
+                  f"({val['pct_correct']}%)")
+
+
+# ---------------------------------------------------------------------------
 # Calibrated factor table
 # ---------------------------------------------------------------------------
 
@@ -964,6 +1243,15 @@ def write_outputs(factor_table: list[dict], baseline: dict, model_metrics: dict,
     print(f"\nWrote {output_dir}/factor_impact_scores.json and .csv")
 
 
+def write_prediction_outputs(predictions: pd.DataFrame, summary: dict, output_dir: str) -> None:
+    os.makedirs(output_dir, exist_ok=True)
+    predictions.sort_values("abs_pct_error").to_csv(
+        os.path.join(output_dir, "movie_revenue_predictions.csv"), index=False)
+    with open(os.path.join(output_dir, "revenue_accuracy_summary.json"), "w") as f:
+        json.dump(summary, f, indent=2, default=float)
+    print(f"Wrote {output_dir}/movie_revenue_predictions.csv and revenue_accuracy_summary.json")
+
+
 # ---------------------------------------------------------------------------
 # Optional AuraLLM (Claude) sanity pass for prior-only factors
 # ---------------------------------------------------------------------------
@@ -1051,6 +1339,25 @@ def main() -> None:
 
     print_report(factor_table, baseline, model_metrics, len(train), len(test))
     write_outputs(factor_table, baseline, model_metrics, args.output_dir)
+
+    oof_pred_log = cross_validated_predictions(model_df, cols)
+    predictions, accuracy_summary = evaluate_full_corpus_accuracy(model_df, oof_pred_log)
+    print_accuracy_report(accuracy_summary)
+    write_prediction_outputs(predictions, accuracy_summary, args.output_dir)
+
+    print("\nComparing direct revenue-prediction models (Ridge / GBR / HistGBR / MLP neural net)...")
+    model_comparison = compare_models(model_df, cols)
+    print_model_comparison(model_comparison)
+
+    print("\nCalibrating factor min/max via MLP neural-net partial dependence, "
+          "then reconstructing revenue via Y = B0 * prod(1 + delta_i)...")
+    nn_factor_table = build_nn_calibrated_factor_table(model_df, cols)
+    formula_pred_log = formula_reconstruction_oof(model_df, cols)
+    formula_predictions, formula_summary = evaluate_full_corpus_accuracy(model_df, formula_pred_log)
+    print("\n-- Formula-based revenue reconstruction accuracy "
+          "(Y = B0 * prod(1+delta_i), MLP-calibrated deltas, out-of-fold) --")
+    print_accuracy_report(formula_summary)
+    write_nn_outputs(nn_factor_table, model_comparison, formula_predictions, formula_summary, args.output_dir)
 
     if args.use_llm:
         api_key = os.environ.get("ANTHROPIC_API_KEY")
