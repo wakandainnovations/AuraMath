@@ -12,7 +12,9 @@ import java.sql.ResultSet;
 
 /**
  * Periodically rebuilds {@code marketing_target_profiles} by re-running
- * {@link MarketingEnrichmentEngine#enrichAndSave()}.
+ * {@link MarketingEnrichmentEngine#enrichAndSave()}, then refreshes
+ * {@link UserEngagementRatingService}'s engagement_score_raw/engagement_rating columns on
+ * top of the rebuilt rows.
  *
  * The table is a snapshot: profiles only exist for authors that were present in the
  * source tables the last time enrichment ran. With no refresh it drifts stale, and
@@ -37,10 +39,14 @@ public class MarketingEnrichmentScheduler {
     private static final long ADVISORY_LOCK_KEY = 0x4D6B744565726368L;
 
     private final MarketingEnrichmentEngine engine;
+    private final UserEngagementRatingService engagementRatingService;
     private final DataSource dataSource; // owns the connection that holds the advisory lock
 
-    public MarketingEnrichmentScheduler(MarketingEnrichmentEngine engine, DataSource dataSource) {
+    public MarketingEnrichmentScheduler(MarketingEnrichmentEngine engine,
+                                         UserEngagementRatingService engagementRatingService,
+                                         DataSource dataSource) {
         this.engine = engine;
+        this.engagementRatingService = engagementRatingService;
         this.dataSource = dataSource;
     }
 
@@ -62,6 +68,10 @@ public class MarketingEnrichmentScheduler {
                 long start = System.currentTimeMillis();
                 log.info("Marketing enrichment refresh starting");
                 engine.enrichAndSave();
+                // Runs after enrichAndSave(), under the same advisory lock: engagement_rating is an
+                // UPDATE against existing marketing_target_profiles rows, so it depends on this
+                // run's enrichment having (re)populated them first.
+                engagementRatingService.recomputeAndPersist();
                 log.info("Marketing enrichment refresh complete in {} ms", System.currentTimeMillis() - start);
             } finally {
                 releaseAdvisoryLock(lockConn);

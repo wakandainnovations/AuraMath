@@ -24,10 +24,18 @@ public class EnrichmentController {
     @Autowired
     private ConflictBalanceService conflictBalanceService;
 
+    @Autowired
+    private UserEngagementRatingService userEngagementRatingService;
+
     @PostMapping("/run-enrichment")
     public ResponseEntity<String> runEnrichment() {
         marketingEnrichmentEngine.enrichAndSave();
         return ResponseEntity.ok("done");
+    }
+
+    @PostMapping("/run-engagement-rating")
+    public ResponseEntity<Map<String, Object>> runEngagementRating() {
+        return ResponseEntity.ok(userEngagementRatingService.recomputeAndPersist());
     }
 
     @PostMapping("/resolve-identities")
