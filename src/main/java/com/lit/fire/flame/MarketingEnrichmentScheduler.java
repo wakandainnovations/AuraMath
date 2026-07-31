@@ -28,6 +28,12 @@ import java.sql.ResultSet;
  * session-level Postgres advisory lock guards the run: when scaled to multiple
  * replicas only one rebuilds the shared table, the rest skip. Set the cron to
  * {@code -} to disable.
+ *
+ * {@link GraphPopulationService} runs last in the same pipeline: its USER node attributes
+ * pull engagement_rating/tribe_label from marketing_target_profiles, so it depends on this
+ * run's (re)computed values rather than getting its own cron/lock, mirroring how
+ * {@link UserEngagementRatingService} itself was folded into this same refresh() rather than
+ * scheduled separately.
  */
 @Service
 public class MarketingEnrichmentScheduler {
@@ -40,13 +46,16 @@ public class MarketingEnrichmentScheduler {
 
     private final MarketingEnrichmentEngine engine;
     private final UserEngagementRatingService engagementRatingService;
+    private final GraphPopulationService graphPopulationService;
     private final DataSource dataSource; // owns the connection that holds the advisory lock
 
     public MarketingEnrichmentScheduler(MarketingEnrichmentEngine engine,
                                          UserEngagementRatingService engagementRatingService,
+                                         GraphPopulationService graphPopulationService,
                                          DataSource dataSource) {
         this.engine = engine;
         this.engagementRatingService = engagementRatingService;
+        this.graphPopulationService = graphPopulationService;
         this.dataSource = dataSource;
     }
 
@@ -72,6 +81,9 @@ public class MarketingEnrichmentScheduler {
                 // UPDATE against existing marketing_target_profiles rows, so it depends on this
                 // run's enrichment having (re)populated them first.
                 engagementRatingService.recomputeAndPersist();
+                // Runs last: USER node attributes read the engagement_rating/tribe_label just
+                // (re)computed above.
+                graphPopulationService.recomputeAndPersist();
                 log.info("Marketing enrichment refresh complete in {} ms", System.currentTimeMillis() - start);
             } finally {
                 releaseAdvisoryLock(lockConn);

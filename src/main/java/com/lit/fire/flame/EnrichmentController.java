@@ -27,6 +27,9 @@ public class EnrichmentController {
     @Autowired
     private UserEngagementRatingService userEngagementRatingService;
 
+    @Autowired
+    private GraphPopulationService graphPopulationService;
+
     @PostMapping("/run-enrichment")
     public ResponseEntity<String> runEnrichment() {
         marketingEnrichmentEngine.enrichAndSave();
@@ -36,6 +39,11 @@ public class EnrichmentController {
     @PostMapping("/run-engagement-rating")
     public ResponseEntity<Map<String, Object>> runEngagementRating() {
         return ResponseEntity.ok(userEngagementRatingService.recomputeAndPersist());
+    }
+
+    @PostMapping("/run-graph-population")
+    public ResponseEntity<Map<String, Object>> runGraphPopulation() {
+        return ResponseEntity.ok(graphPopulationService.recomputeAndPersist());
     }
 
     @PostMapping("/resolve-identities")
