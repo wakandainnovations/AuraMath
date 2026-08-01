@@ -25,12 +25,16 @@ of REST endpoints that can be consumed by an ad-buying or campaign-planning serv
    - [Celebrity Marketing (`/api/marketing/celebrity`)](#5b-celebrity-marketing-api)
    - [Entity Report (`/api/marketing/entity-report`)](#5c-entity-report-api)
    - [Language Marketing (`/api/marketing/language`)](#5d-language-marketing-api)
+   - [Brand Evangelists (`/api/marketing/brand-evangelists`)](#5e-brand-evangelists-api)
+   - [Celebrity Analytics (`/api/analytics/celebrity`)](#5f-celebrity-analytics-api)
+   - [Narrative Novelty Scoring (`/api/marketing/narrative-novelty`)](#5g-narrative-novelty-scoring-api)
    - [Viral Seeds & Aspect Drivers (`/api/marketing`)](#6-viral-seeds--aspect-drivers)
    - [Top Spreaders (`/api/marketing/top-50-spreaders`)](#7-top-spreaders)
    - [Lookalike Discovery (`/api/marketing/find-lookalikes`)](#8-lookalike-discovery)
    - [Enrichment Admin (`/api/admin`)](#9-enrichment-admin-api)
    - [Diagnostic / Test (`/test`, `/api/test`)](#10-diagnostic--test-endpoints)
    - [Ask Engine (`/api/ask`)](#11-ask-engine-experimental)
+   - [User Graph (`/api/graph`)](#12-user-graph-api)
 7. [Common Models](#common-models)
 8. [Integration Recipes](#integration-recipes)
 9. [Errors](#errors)
@@ -100,6 +104,12 @@ The active LLM provider is selected with the `aura.ask.llm-provider` property (d
 Scheduled jobs (enabled via `@EnableScheduling` on `AuraMathApplication`):
 - `AuthorCategoryController.scheduledResync()` — re-runs `/api/marketing/users/sync` every
   24h, with a 5-minute startup delay.
+- `MarketingEnrichmentScheduler.refresh()` — re-runs `MarketingEnrichmentEngine.enrichAndSave()`
+  (same work as `POST /api/admin/run-enrichment`), then `UserEngagementRatingService` and
+  `GraphPopulationService`, on a cron (default `03:30` daily, UTC — configure via
+  `marketing.enrichment.cron` / `marketing.enrichment.zone`; set the cron to `-` to disable). A
+  Postgres session-level advisory lock guards the run so only one instance rebuilds the shared
+  tables when scaled to multiple replicas.
 
 ## Backing Data Model
 
@@ -593,6 +603,14 @@ The entity is identified by `managed_entities.id`; use any listing endpoint
 
 Both are public, consistent with the rest of `/api/marketing`.
 
+**`GET /api/marketing/entity-report/{entityId}/pdf`**
+
+Renders the identical shareable-report payload as a polished, sales-oriented PDF — the artefact
+handed to a prospect — via `EntityReportPdfRenderer`. Returns `Content-Type: application/pdf` with
+`Content-Disposition: inline` (opens directly in a browser) and a filename derived from the
+entity's name, e.g. `Taylor-Swift-intelligence-report.pdf`. Returns `404` with a plain-text body
+if the entity is unknown or has no scored history (same conditions as the JSON endpoints above).
+
 Sections in the response:
 
 | Section                    | What it tells the marketer                                             |
@@ -789,6 +807,186 @@ an empty `users` list, not an error.
 
 ---
 
+### 5e. Brand Evangelists API
+
+**`GET /api/marketing/brand-evangelists/{keyword}`**
+
+Intersects the global `author_categories` classification (see [Author Categorisation
+API](#4-author-categorisation-api)) with per-keyword post activity: returns every author already
+labelled `audience_classification = 'Brand Evangelist'` (positive tone, high branching ratio) who
+has also posted about `{keyword}` on any platform. The classification itself is not keyword-aware,
+so this endpoint does the intersection at query time via `EntityMarketingService.brandEvangelists`.
+
+An empty `evangelists` list is legitimate — it means no categorised evangelist has posted about
+this keyword yet (e.g. a new keyword, or `/api/marketing/users/sync` hasn't run).
+
+```json
+{
+  "keyword": "Avengers",
+  "totalEvangelists": 2,
+  "evangelists": [
+    {
+      "author": "janedoe",
+      "audienceClassification": "Brand Evangelist",
+      "influenceTier": "Amplifier",
+      "postingStyle": "Burst Poster",
+      "dominantTone": "positive",
+      "primaryPlatform": "x",
+      "branchingRatio": 0.67,
+      "totalPosts": 118,
+      "keywordPostCount": 14,
+      "keywordEngagement": 18234
+    }
+  ]
+}
+```
+
+Sorted by `branchingRatio` descending, then `keywordEngagement` descending.
+
+---
+
+### 5f. Celebrity Analytics API
+
+Predictive brand/endorsement analytics, active only for managed entities of type `CELEBRITY`.
+Implemented by the pure `CelebrityMetricsModel` fed with signals gathered by
+`CelebrityAnalyticsService` (Hawkes self-excitation and sentiment via `EntityIntelService`/
+`HawkesAuditService`; reach, engagement, fan-base size and advocate strength via
+`EntityMarketingService`) — the same aggregations the rest of the marketing stack uses, so these
+analytics never drift from the underlying intelligence.
+
+**`GET /api/analytics/celebrity`**
+
+Lists managed entities of type `CELEBRITY` with their tracked keyword sets — use this to discover
+valid `{entityId}` values.
+
+```json
+{
+  "entityType": "CELEBRITY",
+  "totalCelebrities": 14,
+  "celebrities": [
+    { "entityId": "33", "name": "Sai Dharam Tej", "keywords": ["SaiDharamTej", "saidharamtej"] }
+  ]
+}
+```
+
+**`GET /api/analytics/celebrity/{entityId}`**
+
+Full analytics payload for one celebrity. Returns `404` if the id is unknown or the entity is not
+of type `CELEBRITY`, or a `200` with a `message` (and `trackedKeywords`) if it has no scored post
+history yet.
+
+Sections in the response:
+
+| Section             | What it tells the marketer                                                          |
+|----------------------|--------------------------------------------------------------------------------------|
+| `celebrity`          | Tracked keywords, active platforms, total posts, fan base size, observation window.  |
+| `headlineMetrics`    | `predictedBrandValueUsd` (+ display string), `socialMediaReachValue`, `fanEngagementValue`, `endorsementScore` (0–100). |
+| `keyMetricsPercent`  | `socialMediaInfluence`, `brandPower`, `fanLoyalty`, `controversyRisk` — each 0–100 with a coarse band (`Very Low`…`Very High`). |
+| `reachBreakdown` / `engagementBreakdown` | Per-platform reach/engagement, same shape as the Genre/Party channel-strategy endpoints. |
+| `sentiment`          | Tone counts, net sentiment + label, sentiment volatility, negative-burst share.      |
+| `topAdvocates`       | Top 10 voices in the conversation (same shape as Entity Report's `topAdvocates`).    |
+| `scoreDrivers`       | The individual [0,1] sub-scores (`reachScore`, `viralityScore`, `advocacyScore`, …) that compose the key metrics. |
+| `model`              | The formulas, constants, and derived intermediate values used — fully transparent scoring. |
+| `interpretation`     | Plain-English narrative summary of the metrics.                                      |
+
+**Sample response (200) (abridged):**
+
+```json
+{
+  "generatedAt": "2026-06-06T18:30:11 IST",
+  "celebrity": {
+    "entityId": "33", "name": "Sai Dharam Tej", "type": "CELEBRITY",
+    "trackedKeywords": ["SaiDharamTej", "saidharamtej"],
+    "activePlatforms": ["x", "youtube"], "totalPosts": 940, "fanBaseSize": 1820,
+    "observationWindow": { "firstSeen": "2025-01-11T09:02:00 IST", "lastSeen": "2026-05-30T21:44:00 IST",
+      "observationSpanDays": 504.5, "averagePostsPerDay": 1.9 }
+  },
+  "headlineMetrics": {
+    "predictedBrandValueUsd": 1284000, "predictedBrandValueDisplay": "$1.3M",
+    "socialMediaReachValue": 982121, "fanEngagementValue": 213450, "endorsementScore": 71.4
+  },
+  "keyMetricsPercent": {
+    "socialMediaInfluence": { "score": 64.2, "band": "High" },
+    "brandPower":           { "score": 58.9, "band": "Moderate" },
+    "fanLoyalty":           { "score": 72.1, "band": "High" },
+    "controversyRisk":      { "score": 18.3, "band": "Low" }
+  },
+  "reachBreakdown":      { "total": 982121, "x": 704000, "youtube": 278121 },
+  "engagementBreakdown": { "total": 213450, "x": 160000, "youtube": 53450 },
+  "sentiment": { "positive": 612, "negative": 84, "neutral": 244,
+    "netSentiment": 0.56, "label": "Predominantly Positive", "volatility": 0.214, "negativeBurstShare": 0.05 },
+  "topAdvocates":  [ { "global_user_id": "@fanpage1", "hawkes_alpha": 0.91, "post_count": 22 } ],
+  "scoreDrivers":  { "reachScore": 0.71, "viralityScore": 0.64, "advocacyScore": 0.58, "...": "..." },
+  "model":         { "description": "Bounded, monotonic scoring model. ...", "formulas": { "...": "..." } },
+  "interpretation": [
+    "Sai Dharam Tej has a predicted brand value of $1.3M, driven by a high social-media reach value of 982,121 and 213,450 fan interactions.",
+    "Controversy Risk is low at 18% — a safe association for brand partners."
+  ]
+}
+```
+
+---
+
+### 5g. Narrative Novelty Scoring API
+
+Corpus-relative "High-Concept Narrative Novelty" scorer (`NarrativeNoveltyService`). A movie's
+novelty is its embedding cosine distance to its nearest neighbours among historical synopses in the
+same primary genre (so genre alone can't drive the score), rank-normalised against a leave-one-out
+reference distribution built from `movies_data_collection`, then rescaled into the fixed
+`[0.30, 0.45]` impact band assigned to this factor. Embeddings come from a local Ollama model —
+dense semantic vectors, so paraphrased synopses about a similar premise land close together rather
+than looking artificially "novel" for sharing no vocabulary. Sequels/remakes are detected by title
+pattern and penalised (`FRANCHISE_PENALTY = 0.7`) regardless of text distance.
+
+**`POST /api/marketing/narrative-novelty/score`**
+
+Scores any synopsis, including upcoming/unreleased titles not yet in the database.
+
+Request body:
+
+```json
+{ "movieName": "Untitled Thriller Project", "genre": "Thriller", "synopsis": "A detective races to..." }
+```
+
+`movieName` and `genre` are optional (`movieName` defaults to `"Untitled"`); `synopsis` is required
+— `400` with `{"error": "synopsis is required"}` if missing/blank.
+
+**`GET /api/marketing/narrative-novelty/lookup?movieName=<name>`**
+
+Scores a title already present in `movies_data_collection`, using its stored genre/synopsis.
+Returns `404` with `{"message": "No synopsis found for this movie_name"}` if no matching row has a
+synopsis.
+
+Both endpoints return the same shape:
+
+```json
+{
+  "movieName": "Untitled Thriller Project",
+  "primaryGenre": "thriller",
+  "genreFallback": false,
+  "genreGroupSize": 214,
+  "neighborsUsed": 10,
+  "franchiseDetected": false,
+  "rawNovelty": 0.412,
+  "percentile": 0.71,
+  "score": 0.407,
+  "nearestNeighbors": [
+    { "movieName": "The Silent Ledger", "similarity": 0.612 },
+    { "movieName": "Cold Case Protocol", "similarity": 0.588 }
+  ]
+}
+```
+
+`genreFallback: true` means fewer than 5 corpus titles shared the primary genre, so neighbours were
+drawn from the whole corpus instead. `score` is the final `[0.30, 0.45]`-banded value; `rawNovelty`
+and `percentile` are the intermediate corpus-relative figures.
+
+The underlying embedding corpus is rebuilt (and `narrative_novelty_score_v2`/`_raw_v2` persisted for
+every title) by `POST /api/admin/recompute-narrative-novelty` — see [Enrichment Admin
+API](#9-enrichment-admin-api).
+
+---
+
 ### 6. Viral Seeds & Aspect Drivers
 
 **`GET /api/marketing/viral-seeds?keyword=<kw>`**
@@ -947,9 +1145,49 @@ Errors:
 - `400 Bad Request` with body `"seedAuthorId is required"` if missing/blank.
 - `400 Bad Request` with the exception message if the discovery service rejects the input.
 
+**`GET /api/marketing/find-lookalikes/diff?seedAuthorId=<id>&limit=<n>`**
+
+Diagnostic comparison harness (not for production consumption): runs both the legacy L2-distance
+ranking (`findLookalikesL2Legacy`) and the current production block-wise method
+(`findLookalikes`) for the same seed and returns them side by side, plus rank movement for
+candidates present in both lists. `limit` defaults to `25`. Used for ongoing similarity-weight
+tuning — the legacy method's scores concentrate near `0.013` in this ~600-dim space and aren't
+meaningfully displayable on their own.
+
+```json
+{
+  "seedAuthorId": "u_182374",
+  "limit": 25,
+  "overlap_count": 14,
+  "overlap_fraction": 0.56,
+  "current_score_range": { "min": 0.011, "max": 0.017 },
+  "prototype_score_range": { "min": 0.42, "max": 0.93 },
+  "rank_movement_shared": [
+    { "global_user_id": "u_553120", "rank_current": 3, "rank_prototype": 1, "rank_delta": 2 }
+  ],
+  "current_top": [ { "global_user_id": "u_553120", "...": "..." } ],
+  "prototype_top": [ { "global_user_id": "u_553120", "similarity": 0.93 } ]
+}
+```
+
+Same `400` error contract as `/find-lookalikes` for a missing/blank `seedAuthorId`.
+
 ---
 
 ### 9. Enrichment Admin API
+
+All endpoints under `/api/admin` are synchronous, **long-running** recompute triggers — call them
+from a job runner or admin tool, not request-path code. All are `POST` with no request body.
+
+| Endpoint                                       | Recomputes                                                                    |
+|-------------------------------------------------|--------------------------------------------------------------------------------|
+| `POST /api/admin/run-enrichment`                 | `MarketingEnrichmentEngine.enrichAndSave()` — the entire `marketing_target_profiles` table (Hawkes α, MOI, tribes, genres). |
+| `POST /api/admin/run-engagement-rating`          | `UserEngagementRatingService` — corpus-relative `engagement_score_raw`/`engagement_rating` on `marketing_target_profiles`. |
+| `POST /api/admin/run-graph-population`           | `GraphPopulationService` — rebuilds `graph_nodes`/`graph_edges` (MOVIE/USER nodes, POSTED_ABOUT/RETWEETED edges) backing the [User Graph API](#12-user-graph-api). |
+| `POST /api/admin/resolve-identities`             | `CrossPlatformIdentityResolver` — (re)populates `user_identity_link` from every distinct author across `x_posts`/`youtube_comments`/`reddit_posts`/`instagram_posts`. |
+| `POST /api/admin/recompute-narrative-novelty`    | `NarrativeNoveltyService` — rebuilds the synopsis embedding corpus and persists `narrative_novelty_score_v2`/`_raw_v2`/`_franchise_flag` on `movies_data_collection`. Backs the [Narrative Novelty API](#5g-narrative-novelty-scoring-api). |
+| `POST /api/admin/recompute-narrative-novelty-v1` | Same algorithm as above, but persists into the legacy `narrative_novelty_score` column instead (no `_v2` suffix). |
+| `POST /api/admin/recompute-conflict-balance`     | `ConflictBalanceService` — corpus-relative `conflict_balance_score` on `movies_data_collection`, from Stanford CoreNLP per-sentence sentiment balance of each synopsis. |
 
 **`POST /api/admin/run-enrichment`**
 
@@ -958,6 +1196,10 @@ the entire `marketing_target_profiles` table. **Long-running** — call from a j
 or admin tool, not from request-path code.
 
 Response: `200 OK` with body `"done"`.
+
+The other six endpoints return `200 OK` with a JSON summary object (row counts and, where
+applicable, corpus-wide validation stats such as correlation against `revenue`/`imdb_rating`);
+`resolve-identities` returns `200 OK` with a plain-text `"inserted=<n>"` body.
 
 ---
 
@@ -1557,4 +1799,43 @@ Per-endpoint contracts:
   boot): `requests`, `answers`, `clarifications`, `errors`, `unsafeSqlRejections`, `executionTimeouts`,
   `llmFailures`. No Spring Boot Actuator / Micrometer dependency is added; the per-request detail lives
   in the audit log above.
+
+---
+
+### 12. User Graph API
+
+**`GET /api/graph/users?language=<language>&movie=<movieName>`**
+
+Filterable read API over the precomputed `graph_nodes`/`graph_edges` tables (populated by
+`GraphPopulationService`, see [Enrichment Admin API](#9-enrichment-admin-api)), returned in a
+`{nodes, edges}` shape directly consumable by graph-viz frontends (D3/Cytoscape/vis.js). Unlike the
+[Language Marketing API](#5d-language-marketing-api), this endpoint does not re-derive the
+mentions → managed_entities join — that join is already baked into the graph tables by the
+precompute step, so this is a direct read against the graph tables' own attributes/edges.
+
+Query params:
+
+| Name       | Required | Description                                                          |
+|------------|----------|-----------------------------------------------------------------------|
+| `language` | yes      | Matched against MOVIE node `attributes->>'language'` (case-insensitive substring). |
+| `movie`    | no       | Additionally filters MOVIE nodes by `attributes->>'name'` (case-insensitive substring). |
+
+Returns MOVIE nodes matching the filters, every USER node connected to them via a `POSTED_ABOUT`
+edge, and `RETWEETED` edges among that resolved user set. `404` if `language` matches zero MOVIE
+nodes at all; a `movie` filter that matches no titles for an otherwise-valid `language` returns
+`200` with empty `nodes`/`edges` instead.
+
+```json
+{
+  "nodes": [
+    { "id": 12, "type": "MOVIE", "attributes": { "managed_entity_id": 21, "name": "Vikram", "language": "Tamil" } },
+    { "id": 88, "type": "USER",  "attributes": { "global_user_id": "user-9f2c1e3a-...", "tribe_label": "Cinephile-Critic", "engagement_rating": 87.5 } }
+  ],
+  "edges": [
+    { "id": 401, "from": 88, "to": 12, "relationType": "POSTED_ABOUT", "weight": 6, "timestamp": "2026-04-12T17:05:30" },
+    { "id": 402, "from": 88, "to": 91, "relationType": "RETWEETED",    "weight": 2, "timestamp": "2026-04-13T09:11:00" }
+  ],
+  "summary": { "totalUsers": 1, "totalMovies": 1, "totalEdges": 2 }
+}
+```
 
