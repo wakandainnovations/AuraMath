@@ -27,6 +27,13 @@ import java.util.stream.Collectors;
  */
 public class AspectSentimentAnalyzer {
 
+    // Longest token accepted as an aspect. Real nouns never approach this; longer tokens are
+    // spam/garbage text with no whitespace (e.g. a giant hash-like blob) that CoreNLP still tags
+    // as a single NN token. aspect_drivers_agg has a composite PRIMARY KEY (keyword, platform,
+    // aspect), and Postgres btree index rows are capped at 8191 bytes — an oversized aspect here
+    // aborts the whole precompute batch insert.
+    private static final int MAX_ASPECT_LENGTH = 100;
+
     private final StanfordCoreNLP pipeline;
 
     public AspectSentimentAnalyzer() {
@@ -45,6 +52,7 @@ public class AspectSentimentAnalyzer {
                 String pos = token.get(CoreAnnotations.PartOfSpeechAnnotation.class);
                 if (pos != null && pos.startsWith("NN")) { // Noun (guard null POS tag)
                     String aspect = token.originalText().toLowerCase();
+                    if (aspect.length() > MAX_ASPECT_LENGTH) continue; // spam/garbage token, not a real noun
                     aspectSentiments.put(aspect, sentimentScore);
                 }
             }
