@@ -15,8 +15,10 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 /**
@@ -29,15 +31,23 @@ import java.util.stream.Collectors;
  * GROUP BY queries.
  *
  * Two tables are rebuilt each run:
- *   aspect_drivers_agg(keyword, platform, aspect, sentiment_sum, mention_count)
+ *   aspect_drivers_agg(keyword, platform, aspect, sentiment_sum, mention_count, distinct_authors)
  *       — one row per (source keyword, platform, aspect noun). sentiment_sum/mention_count are
  *         kept (rather than a precomputed average) so the endpoint can re-aggregate across every
  *         keyword its ILIKE substring matches, exactly reproducing the old per-request grouping.
+ *         distinct_authors is the count of distinct post authors that mentioned the aspect — kept
+ *         alongside mention_count so the ranking stage can require genuine author diversity, not
+ *         just post volume, before treating an aspect as a real strength/weakness (see class doc
+ *         on {@link AspectSentimentAnalyzer#analyzeAspectSentiment}: a handful of near-duplicate
+ *         posts from one thread or one bot/campaign account would otherwise be able to dominate
+ *         the ranking on mention_count alone).
  *   aspect_drivers_post_counts(keyword, platform, post_count)
  *       — posts considered per (keyword, platform); backs the response's totalPostsAnalyzed.
  *
  * Each post is annotated exactly once per run (capped to the MAX_POSTS_PER_PLATFORM most recent
- * posts per keyword per platform, matching the endpoint's historical limit). On any failure the
+ * posts per keyword per platform, matching the endpoint's historical limit) using
+ * {@link AspectSentimentAnalyzer#analyzeAspectSentiment}, which scores each aspect from its own
+ * sentence rather than copying the whole post's sentiment onto every noun. On any failure the
  * previously published tables are left untouched.
  */
 @Service
@@ -54,8 +64,12 @@ public class AspectDriversPrecomputer implements InitializingBean {
     private static final int FETCH_SIZE = 500;
 
     // Posts buffered before each parallel NLP flush. Bounds memory while giving the parallel
-    // stream enough work per flush to keep every core busy.
-    private static final int NLP_BATCH = 2000;
+    // stream enough work per flush to keep every core busy. Lower than before analyzeAspectSentiment
+    // added constituency parsing + neural sentiment scoring to this pipeline (see
+    // AspectSentimentAnalyzer): those annotators are far more memory-hungry per sentence than the
+    // original tokenize/pos-only pass, so the same batch size that was safe before could hold too
+    // many parse trees alive at once under parallelStream and exhaust the heap.
+    private static final int NLP_BATCH = 500;
 
     // Application-defined key for pg_advisory_lock so only one instance rebuilds at a time.
     // Arbitrary constant (ASCII "AspectDr"); just needs to be stable and unique to this job.
@@ -96,7 +110,11 @@ public class AspectDriversPrecomputer implements InitializingBean {
             jdbc.execute("CREATE TABLE IF NOT EXISTS aspect_drivers_agg (" +
                     "keyword TEXT NOT NULL, platform TEXT NOT NULL, aspect TEXT NOT NULL, " +
                     "sentiment_sum DOUBLE PRECISION NOT NULL, mention_count INTEGER NOT NULL, " +
+                    "distinct_authors INTEGER NOT NULL DEFAULT 0, " +
                     "PRIMARY KEY (keyword, platform, aspect))");
+            // Table may already exist from before distinct_authors was added; CREATE ... IF NOT
+            // EXISTS alone wouldn't add it to an already-existing table.
+            jdbc.execute("ALTER TABLE aspect_drivers_agg ADD COLUMN IF NOT EXISTS distinct_authors INTEGER NOT NULL DEFAULT 0");
             jdbc.execute("CREATE TABLE IF NOT EXISTS aspect_drivers_post_counts (" +
                     "keyword TEXT NOT NULL, platform TEXT NOT NULL, post_count INTEGER NOT NULL, " +
                     "PRIMARY KEY (keyword, platform))");
@@ -142,8 +160,14 @@ public class AspectDriversPrecomputer implements InitializingBean {
             } finally {
                 releaseAdvisoryLock(lockConn);
             }
-        } catch (Exception e) {
-            log.error("Aspect-drivers precompute failed; previously published tables left in place", e);
+        } catch (Throwable t) {
+            // Throwable, not Exception: a pathological post can make the parser exhaust the heap
+            // (OutOfMemoryError is an Error, not an Exception) partway through the scan. This is a
+            // scheduled job's outer boundary — the doc comment above promises a failed run leaves
+            // the previously published tables intact, which requires catching that too, not just
+            // letting it escape to Spring's generic scheduled-task error handler (which would log
+            // it but silently skip straight to the next scheduled run 24h later).
+            log.error("Aspect-drivers precompute failed; previously published tables left in place", t);
         }
     }
 
@@ -188,12 +212,15 @@ public class AspectDriversPrecomputer implements InitializingBean {
 
     /**
      * x_posts carries a numeric sentiment_score on a 1–100 scale (50 = neutral, 0 = invalid).
-     * Scores of 0 are excluded by the SQL filter; the raw value is passed through unchanged.
+     * Scores of 0 are excluded by the SQL filter — this is still used as a "did the primary
+     * pipeline consider this post valid" gate, even though the value itself is no longer used to
+     * score aspects (each aspect is scored from its own sentence by
+     * {@link AspectSentimentAnalyzer#analyzeAspectSentiment}, not this document-level number).
      */
     private void scanX(Accumulator acc) {
         String sql =
-                "SELECT keyword, text, sentiment_score FROM (" +
-                "  SELECT keyword, text, sentiment_score, " +
+                "SELECT keyword, text, sentiment_score, author FROM (" +
+                "  SELECT keyword, text, sentiment_score, author, " +
                 "         ROW_NUMBER() OVER (PARTITION BY keyword ORDER BY created_at DESC) AS rn " +
                 "  FROM x_posts WHERE keyword IS NOT NULL AND text IS NOT NULL" +
                 "    AND sentiment_score BETWEEN 1 AND 100" +
@@ -203,19 +230,20 @@ public class AspectDriversPrecomputer implements InitializingBean {
             String text = rs.getString("text");
             double raw = rs.getDouble("sentiment_score");
             if (rs.wasNull() || raw < 1.0 || raw > 100.0) return; // 0 = invalid; valid range is [1, 100]
-            acc.add(keyword, "x", text, raw);
+            acc.add(keyword, "x", text, rs.getString("author"));
         }, MAX_POSTS_PER_PLATFORM);
     }
 
     /**
-     * youtube / reddit / instagram store a sentiment_category string instead of a numeric score.
-     * {@code titleCol} is non-null only for reddit, whose title is concatenated with the body.
+     * youtube / reddit / instagram store a sentiment_category string instead of a numeric score;
+     * a non-null category is used the same way as x_posts's valid-score gate above. {@code titleCol}
+     * is non-null only for reddit, whose title is concatenated with the body.
      */
     private void scanCategoryPlatform(Accumulator acc, String platform, String table,
                                       String textCol, String titleCol, String orderCol) {
-        String selectCols = (titleCol != null ? titleCol + ", " : "") + textCol + ", sentiment_category, keyword";
+        String selectCols = (titleCol != null ? titleCol + ", " : "") + textCol + ", sentiment_category, keyword, author";
         String sql =
-                "SELECT keyword, " + (titleCol != null ? titleCol + ", " : "") + textCol + ", sentiment_category FROM (" +
+                "SELECT keyword, " + (titleCol != null ? titleCol + ", " : "") + textCol + ", sentiment_category, author FROM (" +
                 "  SELECT " + selectCols + ", " +
                 "         ROW_NUMBER() OVER (PARTITION BY keyword ORDER BY " + orderCol + " DESC) AS rn " +
                 "  FROM " + table + " WHERE keyword IS NOT NULL AND sentiment_category IS NOT NULL" +
@@ -225,8 +253,7 @@ public class AspectDriversPrecomputer implements InitializingBean {
             String text = titleCol != null
                     ? combine(rs.getString(titleCol), rs.getString(textCol))
                     : rs.getString(textCol);
-            double score = categoryToScore(rs.getString("sentiment_category"));
-            acc.add(keyword, platform, text, score);
+            acc.add(keyword, platform, text, rs.getString("author"));
         }, MAX_POSTS_PER_PLATFORM);
     }
 
@@ -239,48 +266,78 @@ public class AspectDriversPrecomputer implements InitializingBean {
     private final class Accumulator {
         // (keyword|platform) -> aspect -> [sentiment_sum, mention_count]
         final Map<String, Map<String, double[]>> agg = new HashMap<>();
+        // (keyword|platform) -> aspect -> distinct authors who mentioned it. Kept separately from
+        // agg (rather than folded into a running count) since a Set is the only way to de-duplicate
+        // an author across posts/batches.
+        final Map<String, Map<String, Set<String>>> authorsByAspect = new HashMap<>();
         // (keyword|platform) -> posts considered
         final Map<String, Integer> postCounts = new HashMap<>();
         // Posts awaiting annotation in the current batch.
         private final List<Post> buffer = new ArrayList<>(NLP_BATCH);
 
         /** Counts every row the capped query returned (matching the old rows.size()); blanks add no aspects. */
-        void add(String keyword, String platform, String text, double score) {
+        void add(String keyword, String platform, String text, String author) {
             if (keyword == null) return;
             String key = keyword + KEY_SEP + platform;
             postCounts.merge(key, 1, Integer::sum);
             if (text == null || text.isBlank()) return;
-            buffer.add(new Post(key, text, score));
+            buffer.add(new Post(key, text, author));
             if (buffer.size() >= NLP_BATCH) flush();
         }
 
-        /** Annotates the buffered posts in parallel, then folds the nouns into the running sums. */
+        /**
+         * Annotates the buffered posts in parallel, then folds the aspects into the running sums.
+         * Real-world social-media text occasionally produces a pathological CoreNLP parse — a
+         * post with no sentence-ending punctuation can hand the parser one huge "sentence"
+         * (OutOfMemoryError), or an unusual token/punctuation pattern can build a degenerate,
+         * deeply-nested tree during sentiment binarization (StackOverflowError) — either of which
+         * previously crashed this entire scheduled run over a single bad post. One post's analysis
+         * failing is now isolated and skipped (logged once at WARN, not per-occurrence) rather than
+         * losing the whole batch; catching Throwable (not just Exception) is deliberate since both
+         * failure modes seen so far are Errors.
+         */
         void flush() {
             if (buffer.isEmpty()) return;
-            List<Map.Entry<String, Map<String, Double>>> annotated = buffer.parallelStream()
-                    .map(p -> Map.entry(p.key(), analyzer.analyze(p.text(), p.score())))
+            List<AnnotatedPost> annotated = buffer.parallelStream()
+                    .map(p -> {
+                        try {
+                            return new AnnotatedPost(p.key(), p.author(), analyzer.analyzeAspectSentiment(p.text()));
+                        } catch (Throwable t) {
+                            log.warn("Skipping one post during aspect analysis (key={}): {}: {}",
+                                    p.key(), t.getClass().getSimpleName(), t.getMessage());
+                            return new AnnotatedPost(p.key(), p.author(), Map.of());
+                        }
+                    })
                     .collect(Collectors.toList());
-            for (Map.Entry<String, Map<String, Double>> e : annotated) {
-                Map<String, double[]> target = agg.computeIfAbsent(e.getKey(), k -> new HashMap<>());
-                for (Map.Entry<String, Double> a : e.getValue().entrySet()) {
+            for (AnnotatedPost ap : annotated) {
+                Map<String, double[]> target = agg.computeIfAbsent(ap.key(), k -> new HashMap<>());
+                Map<String, Set<String>> authorTarget = authorsByAspect.computeIfAbsent(ap.key(), k -> new HashMap<>());
+                for (Map.Entry<String, Double> a : ap.aspects().entrySet()) {
                     double[] sums = target.computeIfAbsent(a.getKey(), k -> new double[2]);
                     sums[0] += a.getValue();
                     sums[1] += 1;
+                    if (ap.author() != null) {
+                        authorTarget.computeIfAbsent(a.getKey(), k -> new HashSet<>()).add(ap.author());
+                    }
                 }
             }
             buffer.clear();
         }
     }
 
-    private record Post(String key, String text, double score) {}
+    private record Post(String key, String text, String author) {}
+    private record AnnotatedPost(String key, String author, Map<String, Double> aspects) {}
 
     /** Atomically swaps in the freshly computed aggregates. */
     private void publish(Accumulator acc) {
         List<Object[]> aggRows = new ArrayList<>();
         for (Map.Entry<String, Map<String, double[]>> group : acc.agg.entrySet()) {
             String[] kp = splitKey(group.getKey());
+            Map<String, Set<String>> authorsForGroup = acc.authorsByAspect.getOrDefault(group.getKey(), Map.of());
             for (Map.Entry<String, double[]> a : group.getValue().entrySet()) {
-                aggRows.add(new Object[]{kp[0], kp[1], a.getKey(), a.getValue()[0], (int) a.getValue()[1]});
+                int distinctAuthors = authorsForGroup.getOrDefault(a.getKey(), Set.of()).size();
+                aggRows.add(new Object[]{
+                        kp[0], kp[1], a.getKey(), a.getValue()[0], (int) a.getValue()[1], distinctAuthors});
             }
         }
         List<Object[]> countRows = new ArrayList<>();
@@ -293,7 +350,7 @@ public class AspectDriversPrecomputer implements InitializingBean {
             jdbc.update("TRUNCATE TABLE aspect_drivers_agg");
             jdbc.update("TRUNCATE TABLE aspect_drivers_post_counts");
             batchInsert("INSERT INTO aspect_drivers_agg" +
-                    "(keyword, platform, aspect, sentiment_sum, mention_count) VALUES (?, ?, ?, ?, ?)", aggRows);
+                    "(keyword, platform, aspect, sentiment_sum, mention_count, distinct_authors) VALUES (?, ?, ?, ?, ?, ?)", aggRows);
             batchInsert("INSERT INTO aspect_drivers_post_counts" +
                     "(keyword, platform, post_count) VALUES (?, ?, ?)", countRows);
         });
@@ -308,17 +365,6 @@ public class AspectDriversPrecomputer implements InitializingBean {
     private static String[] splitKey(String key) {
         int sep = key.indexOf(KEY_SEP);
         return new String[]{key.substring(0, sep), key.substring(sep + 1)};
-    }
-
-    /** Maps a sentiment category to a 1–100 score (50 = neutral, 0 = invalid/unknown). */
-    private static double categoryToScore(String category) {
-        if (category == null) return 0.0;
-        return switch (category.toLowerCase()) {
-            case "positive" -> 75.0;
-            case "negative" -> 25.0;
-            case "neutral"  -> 50.0;
-            default         -> 0.0;
-        };
     }
 
     private static String combine(String a, String b) {

@@ -29,6 +29,12 @@ public class ViralSeedController {
     // Filters out nouns that appear too rarely to be statistically meaningful.
     private static final int MIN_ASPECT_MENTIONS = 3;
 
+    // Minimum number of DISTINCT authors that must mention an aspect before it appears in the
+    // response — a floor MIN_ASPECT_MENTIONS alone can't provide, since a single viral thread or
+    // campaign/bot account can rack up many posts from one voice. Required in addition to
+    // MIN_ASPECT_MENTIONS, and drives the shrinkage term below in place of raw mention count.
+    private static final int MIN_ASPECT_AUTHORS = 3;
+
     // Per-platform post cap fed into the NLP pipeline. Keeps response times bounded
     // on large datasets without skewing results (most-recent posts are most relevant).
     private static final int MAX_POSTS_PER_PLATFORM = 1000;
@@ -288,27 +294,32 @@ public class ViralSeedController {
                 "WHERE " + keywordPredicate + " GROUP BY platform",
                 rs -> { postCounts.put(rs.getString("platform"), rs.getInt("c")); }, args);
 
-        // Aspect aggregates per platform: aspect → [sentiment_sum, mention_count].
-        // SUM() merges the per-keyword rows for every keyword the predicate matches.
+        // Aspect aggregates per platform: aspect → [sentiment_sum, mention_count, distinct_authors].
+        // SUM() merges the per-keyword rows for every keyword the predicate matches. Summing
+        // distinct_authors across keywords can double-count an author who posted under more than
+        // one matched keyword — an acceptable approximation since it only feeds a floor threshold,
+        // not the ranking itself.
         Map<String, Map<String, double[]>> byPlatformAgg = new HashMap<>();
         jdbcTemplate.query(
-                "SELECT platform, aspect, SUM(sentiment_sum) AS s, SUM(mention_count) AS n " +
+                "SELECT platform, aspect, SUM(sentiment_sum) AS s, SUM(mention_count) AS n, SUM(distinct_authors) AS a " +
                 "FROM aspect_drivers_agg WHERE " + keywordPredicate + " GROUP BY platform, aspect",
                 rs -> {
                     double[] acc = byPlatformAgg
                             .computeIfAbsent(rs.getString("platform"), k -> new HashMap<>())
-                            .computeIfAbsent(rs.getString("aspect"), k -> new double[2]);
+                            .computeIfAbsent(rs.getString("aspect"), k -> new double[3]);
                     acc[0] += rs.getDouble("s");
                     acc[1] += rs.getLong("n");
+                    acc[2] += rs.getLong("a");
                 }, args);
 
         // Overall view: merge every platform's aspect aggregates by summing sums and counts.
         Map<String, double[]> overallAspects = new HashMap<>();
         for (Map<String, double[]> platformAspects : byPlatformAgg.values()) {
             for (Map.Entry<String, double[]> e : platformAspects.entrySet()) {
-                double[] acc = overallAspects.computeIfAbsent(e.getKey(), k -> new double[2]);
+                double[] acc = overallAspects.computeIfAbsent(e.getKey(), k -> new double[3]);
                 acc[0] += e.getValue()[0];
                 acc[1] += e.getValue()[1];
+                acc[2] += e.getValue()[2];
             }
         }
 
@@ -345,9 +356,12 @@ public class ViralSeedController {
 
     /**
      * Aggregates a precomputed aspect map into Strengths and Weaknesses lists.
-     * Each entry maps an aspect to [sentiment_sum, mention_count]; averageSentiment is
-     * sentiment_sum / mention_count. Aspects mentioned fewer than MIN_ASPECT_MENTIONS times
-     * are dropped. Each list is sorted by absolute sentiment (strongest first).
+     * Each entry maps an aspect to [sentiment_sum, mention_count, distinct_authors];
+     * averageSentiment is sentiment_sum / mention_count. Aspects mentioned fewer than
+     * MIN_ASPECT_MENTIONS times, or by fewer than MIN_ASPECT_AUTHORS distinct authors, are
+     * dropped — the author floor exists because mention_count alone can't tell a genuine
+     * consensus apart from one viral thread or campaign/bot account posting many times. Each
+     * list is sorted by impact score (strongest first).
      */
     private Map<String, Object> buildStrengthsWeaknesses(Map<String, double[]> aspectMap) {
         List<Map<String, Object>> strengths  = new ArrayList<>();
@@ -356,18 +370,23 @@ public class ViralSeedController {
         for (Map.Entry<String, double[]> e : aspectMap.entrySet()) {
             double sum = e.getValue()[0];
             long n = (long) e.getValue()[1];
-            if (n < MIN_ASPECT_MENTIONS) continue;
+            long authors = (long) e.getValue()[2];
+            if (n < MIN_ASPECT_MENTIONS || authors < MIN_ASPECT_AUTHORS) continue;
 
             double avg = sum / n;
             if (avg == 0.0) continue; // 0 = invalid marker; skip aspects where all posts were invalid
 
-            // Shrinkage toward neutral (50) so a low-volume outlier can't outrank a high-volume consensus.
-            double impact = 50.0 + (avg - 50.0) * n / (n + MIN_ASPECT_MENTIONS);
+            // Shrinkage toward neutral (50) so a low-author-diversity outlier can't outrank a
+            // broad consensus. Driven by distinct authors rather than raw mention count, since
+            // author count is what actually distinguishes "many people agree" from "one account
+            // posted a lot" — mention count alone can't tell those apart.
+            double impact = 50.0 + (avg - 50.0) * authors / (authors + MIN_ASPECT_AUTHORS);
 
             Map<String, Object> item = new LinkedHashMap<>();
             item.put("aspect",           e.getKey());
             item.put("averageSentiment", round3(avg));
             item.put("postsMentioning",  n);
+            item.put("distinctAuthors",  authors);
             item.put("impactScore",      round3(impact));
 
             if (avg > 50.0)      strengths.add(item);
