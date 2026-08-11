@@ -3,7 +3,6 @@ package com.lit.fire.flame;
 import com.google.gson.Gson;
 import com.google.gson.reflect.TypeToken;
 import com.lit.fire.flame.GenreClassifier.GenreLabel;
-import com.lit.fire.flame.models.UniversalPost;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.ResponseEntity;
@@ -35,6 +34,10 @@ public class GenreMarketingAPI {
     // signal (e.g. more than one minimally-engaged post with above-neutral sentiment).
     private static final double GENRE_INTEREST_THRESHOLD = 1.0;
     private static final int    SUPER_SPREADER_LIMIT     = 50;
+
+    // Default reach/post_count for a platform with no genre_channel_reach_agg row (genre never
+    // matched, or the precomputer hasn't run yet) — matches the old live-scan's implicit zero.
+    private static final long[] ZERO_REACH = {0L, 0L};
 
     private static final Type GENRE_MAP_TYPE = new TypeToken<Map<String, Double>>() {}.getType();
 
@@ -233,10 +236,9 @@ public class GenreMarketingAPI {
     // dashboard can render copy like "Horror fans are 3x more active on
     // Reddit than Instagram."
     //
-    // Genre membership is decided in-memory by GenreClassifier — every post
-    // is built into a UniversalPost (with platform-specific metadata so the
-    // Reddit-title weighting and Instagram media-type boosts apply) and
-    // accepted only if the classifier returns the requested genre.
+    // Genre membership is decided in-memory by GenreClassifier, same as before, but now run once
+    // by ChannelReachPrecomputer on a schedule rather than per request — this endpoint just reads
+    // the resulting genre_channel_reach_agg aggregate.
     //
     // Reach proxy (matches GenreInterestProfiler):
     //   X        → views_count
@@ -246,10 +248,11 @@ public class GenreMarketingAPI {
     // -------------------------------------------------------------------------
     @GetMapping("/{genre}/channel-strategy")
     public ResponseEntity<Map<String, Object>> channelStrategy(@PathVariable String genre) {
-        long[] xStats         = classifyTable("x_posts",          genre);
-        long[] youtubeStats   = classifyTable("youtube_comments", genre);
-        long[] redditStats    = classifyTable("reddit_posts",     genre);
-        long[] instagramStats = classifyTable("instagram_posts",  genre);
+        Map<String, long[]> byPlatform = genreReachByPlatform(genre);
+        long[] xStats         = byPlatform.getOrDefault("x",         ZERO_REACH);
+        long[] youtubeStats   = byPlatform.getOrDefault("youtube",   ZERO_REACH);
+        long[] redditStats    = byPlatform.getOrDefault("reddit",    ZERO_REACH);
+        long[] instagramStats = byPlatform.getOrDefault("instagram", ZERO_REACH);
 
         Long audienceSize = jdbc.queryForObject(
                 "SELECT COUNT(*) FROM marketing_target_profiles WHERE top_movie_genres::text ILIKE ?",
@@ -329,86 +332,19 @@ public class GenreMarketingAPI {
     }
 
     /**
-     * Streams every row of {@code table} through {@link GenreClassifier} and
-     * returns {@code [reach, matchedPostCount]} for posts the classifier
-     * tagged with {@code genre}. Reach uses the per-platform proxy.
+     * Reads precomputed per-platform reach for {@code genre} from {@code genre_channel_reach_agg}
+     * (kept fresh by {@link ChannelReachPrecomputer}), instead of scanning and classifying all 4
+     * platform tables live on every request.
      */
-    private long[] classifyTable(String table, String genre) {
-        long[] acc = new long[]{0L, 0L};   // [reach, matchedCount]
-
-        switch (table) {
-            case "x_posts" -> jdbc.query(
-                    "SELECT id, text, keyword, COALESCE(views_count, 0) AS metric " +
-                    "FROM x_posts",
-                    rs -> {
-                        Map<String, Object> meta = new HashMap<>();
-                        meta.put("keyword", rs.getString("keyword"));
-                        UniversalPost post = new UniversalPost(
-                                rs.getString("id"), null, rs.getString("text"),
-                                null, "x_posts", meta);
-                        if (matchesGenre(post, genre)) {
-                            acc[0] += rs.getLong("metric");
-                            acc[1] += 1;
-                        }
-                    });
-            case "youtube_comments" -> jdbc.query(
-                    "SELECT id, text, keyword, COALESCE(likes_count, 0) AS metric " +
-                    "FROM youtube_comments",
-                    rs -> {
-                        Map<String, Object> meta = new HashMap<>();
-                        meta.put("keyword", rs.getString("keyword"));
-                        UniversalPost post = new UniversalPost(
-                                rs.getString("id"), null, rs.getString("text"),
-                                null, "youtube_comments", meta);
-                        if (matchesGenre(post, genre)) {
-                            acc[0] += rs.getLong("metric");
-                            acc[1] += 1;
-                        }
-                    });
-            case "reddit_posts" -> jdbc.query(
-                    "SELECT id, title, text, keyword, COALESCE(num_comments, 0) AS metric " +
-                    "FROM reddit_posts",
-                    rs -> {
-                        String title = rs.getString("title") == null ? "" : rs.getString("title");
-                        String body  = rs.getString("text")  == null ? "" : rs.getString("text");
-                        Map<String, Object> meta = new HashMap<>();
-                        meta.put("keyword", rs.getString("keyword"));
-                        meta.put("title",   title);
-                        UniversalPost post = new UniversalPost(
-                                rs.getString("id"), null, (title + " " + body).trim(),
-                                null, "reddit_posts", meta);
-                        if (matchesGenre(post, genre)) {
-                            acc[0] += rs.getLong("metric");
-                            acc[1] += 1;
-                        }
-                    });
-            case "instagram_posts" -> jdbc.query(
-                    "SELECT id, text, keyword, media_type, COALESCE(like_count, 0) AS metric " +
-                    "FROM instagram_posts",
-                    rs -> {
-                        Map<String, Object> meta = new HashMap<>();
-                        meta.put("keyword",    rs.getString("keyword"));
-                        meta.put("media_type", rs.getString("media_type"));
-                        UniversalPost post = new UniversalPost(
-                                rs.getString("id"), null, rs.getString("text"),
-                                null, "instagram_posts", meta);
-                        if (matchesGenre(post, genre)) {
-                            acc[0] += rs.getLong("metric");
-                            acc[1] += 1;
-                        }
-                    });
-            default -> throw new IllegalArgumentException("Unknown table: " + table);
-        }
-        return acc;
-    }
-
-    private boolean matchesGenre(UniversalPost post, String genre) {
-        for (GenreLabel label : classifier.classifyPost(post)) {
-            if (genre.equalsIgnoreCase(label.genre())) {
-                return true;
-            }
-        }
-        return false;
+    private Map<String, long[]> genreReachByPlatform(String genre) {
+        Map<String, long[]> byPlatform = new HashMap<>();
+        jdbc.query("SELECT platform, reach, post_count FROM genre_channel_reach_agg WHERE genre = LOWER(?)",
+                rs -> {
+                    byPlatform.put(rs.getString("platform"),
+                            new long[]{rs.getLong("reach"), rs.getLong("post_count")});
+                },
+                genre);
+        return byPlatform;
     }
 
     private static Map<String, Object> channelEntry(String platform, long reach, long postCount) {

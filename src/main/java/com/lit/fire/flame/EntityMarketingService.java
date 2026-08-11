@@ -7,6 +7,7 @@ import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -32,6 +33,10 @@ public class EntityMarketingService {
 
     @Autowired private JdbcTemplate jdbc;
     private final Gson gson = new Gson();
+
+    // Default reach/post_count for a platform with no channel_reach_agg row (keyword never
+    // seen, or the precomputer hasn't run yet) — matches the old live-scan's implicit zero.
+    private static final long[] ZERO_REACH = {0L, 0L};
 
     /** Sigmoid; safe against overflow on large negative inputs. */
     private static double sigmoid(double x) {
@@ -252,10 +257,11 @@ public class EntityMarketingService {
 
     /** Per-platform reach for {@code keyword} with relative-strength ratios. */
     public Map<String, Object> channelStrategy(String keyword, String entityLabel) {
-        long[] x         = reachForTable("x_posts",          "views_count",  keyword);
-        long[] youtube   = reachForTable("youtube_comments", "likes_count",  keyword);
-        long[] reddit    = reachForTable("reddit_posts",     "num_comments", keyword);
-        long[] instagram = reachForTable("instagram_posts",  "like_count",   keyword);
+        Map<String, long[]> byPlatform = reachByPlatformFromAgg(keyword);
+        long[] x         = byPlatform.getOrDefault("x",         ZERO_REACH);
+        long[] youtube   = byPlatform.getOrDefault("youtube",   ZERO_REACH);
+        long[] reddit    = byPlatform.getOrDefault("reddit",    ZERO_REACH);
+        long[] instagram = byPlatform.getOrDefault("instagram", ZERO_REACH);
 
         List<Map<String, Object>> channels = new ArrayList<>();
         channels.add(channelEntry("X",         x[0],         x[1]));
@@ -500,12 +506,22 @@ public class EntityMarketingService {
         return body;
     }
 
-    private long[] reachForTable(String table, String reachColumn, String keyword) {
-        String sql = "SELECT COALESCE(SUM(" + reachColumn + "), 0)::bigint AS reach, " +
-                     "       COUNT(*)::bigint                              AS post_count " +
-                     "FROM " + table + " WHERE keyword ILIKE ?";
-        Map<String, Object> row = jdbc.queryForMap(sql, keyword);
-        return new long[]{ toLong(row.get("reach")), toLong(row.get("post_count")) };
+    /**
+     * Reads precomputed per-platform reach for {@code keyword} from {@code channel_reach_agg}
+     * (kept fresh by {@link ChannelReachPrecomputer}), instead of scanning all 4 platform tables
+     * live on every request. {@code keyword = LOWER(?)} matches how the precomputer stores the
+     * column (LOWER(keyword)) — reproducing the old {@code keyword ILIKE ?}'s case-insensitive
+     * equality on an unwildcarded pattern.
+     */
+    private Map<String, long[]> reachByPlatformFromAgg(String keyword) {
+        Map<String, long[]> byPlatform = new HashMap<>();
+        jdbc.query("SELECT platform, reach, post_count FROM channel_reach_agg WHERE keyword = LOWER(?)",
+                rs -> {
+                    byPlatform.put(rs.getString("platform"),
+                            new long[]{rs.getLong("reach"), rs.getLong("post_count")});
+                },
+                keyword);
+        return byPlatform;
     }
 
     private static Map<String, Object> channelEntry(String platform, long reach, long postCount) {
