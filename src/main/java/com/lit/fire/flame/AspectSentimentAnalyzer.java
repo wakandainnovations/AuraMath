@@ -66,6 +66,16 @@ public class AspectSentimentAnalyzer {
             "PERSON", "ORGANIZATION", "LOCATION", "MISC", "GPE", "FACILITY", "TITLE", "COUNTRY",
             "NATIONALITY", "CITY", "STATE_OR_PROVINCE");
 
+    // Most social posts are a paragraph or two, but some (long-form Reddit posts especially) run
+    // to tens of thousands of characters — hundreds of individually well-formed sentences, each
+    // well under parse.maxlen, so that guard never triggers. Running full constituency parsing +
+    // neural sentiment on every one of those sentences makes a single such post cost hundreds of
+    // times what a typical post costs; AspectDriversPrecomputer's parallelStream can have several
+    // of these in flight at once, and that was enough to exhaust the JVM heap even though no
+    // individual sentence was pathological. The aspects mentioned in the opening of a long post are
+    // as representative as any other for this purpose, so truncate rather than analyzing it whole.
+    private static final int MAX_INPUT_CHARS = 4000;
+
     private final StanfordCoreNLP pipeline;
 
     public AspectSentimentAnalyzer() {
@@ -138,6 +148,7 @@ public class AspectSentimentAnalyzer {
      */
     public Map<String, Double> analyzeAspectSentiment(String text) {
         Map<String, double[]> sums = new HashMap<>(); // aspect -> [sentimentSum, occurrences]
+        if (text.length() > MAX_INPUT_CHARS) text = text.substring(0, MAX_INPUT_CHARS);
         Annotation document = new Annotation(text);
         pipeline.annotate(document);
 

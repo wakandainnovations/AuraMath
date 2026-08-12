@@ -59,4 +59,21 @@ class AspectSentimentAnalyzerTest {
                     "hashtag/handle leaked through as an aspect: " + aspect);
         }
     }
+
+    @Test
+    void boundsRuntimeOnVeryLongWellFormedPosts() {
+        // Long-form posts (tens of thousands of characters, hundreds of individually normal
+        // sentences) previously drove analyzeAspectSentiment to full-parse+sentiment-score every
+        // sentence, which under AspectDriversPrecomputer's parallel batches was enough to exhaust
+        // the JVM heap even though no single sentence exceeded parse.maxlen. This just needs to
+        // return, not hang/OOM, on an input far past the truncation threshold.
+        StringBuilder longPost = new StringBuilder();
+        for (int i = 0; i < 2000; i++) {
+            longPost.append("The story was great and the acting was wonderful today. ");
+        }
+
+        Map<String, Double> aspects = analyzer.analyzeAspectSentiment(longPost.toString());
+
+        assertTrue(aspects.containsKey("story"), "expected aspects from the (truncated) input: " + aspects);
+    }
 }
