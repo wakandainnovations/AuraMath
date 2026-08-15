@@ -230,15 +230,18 @@ public class EntityMarketingService {
                 ") " +
                 "SELECT ac.author, ac.audience_classification, ac.influence_tier, ac.posting_style, " +
                 "       ac.dominant_tone, ac.primary_platform, ac.branching_ratio, ac.total_posts, " +
-                "       pu.post_count, pu.total_engagement " +
+                "       pu.post_count, pu.total_engagement, m.platform_handles " +
                 "FROM per_user pu " +
                 "JOIN author_categories ac ON ac.author = pu.global_user_id " +
+                "LEFT JOIN marketing_target_profiles m ON m.global_user_id = ac.author " +
                 "WHERE ac.audience_classification = 'Movie Buff' " +
                 "ORDER BY ac.branching_ratio DESC NULLS LAST, pu.total_engagement DESC";
 
         List<Map<String, Object>> rows = jdbc.queryForList(sql, keyword, keyword, keyword, keyword);
         List<Map<String, Object>> out = new ArrayList<>(rows.size());
         for (Map<String, Object> row : rows) {
+            Object platformHandles = JsonbUtil.asTree(row.get("platform_handles"), gson);
+
             Map<String, Object> entry = new LinkedHashMap<>();
             entry.put("author",                  row.get("author"));
             entry.put("audienceClassification",  row.get("audience_classification"));
@@ -250,9 +253,33 @@ public class EntityMarketingService {
             entry.put("totalPosts",              toLong(row.get("total_posts")));
             entry.put("keywordPostCount",        toLong(row.get("post_count")));
             entry.put("keywordEngagement",       toLong(row.get("total_engagement")));
+            entry.put("platformHandles",         platformHandles);
+            entry.put("profileUrl",              extractProfileUrl(platformHandles));
             out.add(entry);
         }
         return out;
+    }
+
+    /**
+     * Picks the primary platform's profile_url out of a parsed platform_handles tree
+     * (mirrors TopSpreadersController#extractProfileUrl). Null when the author hasn't
+     * been through MarketingEnrichmentEngine yet (no marketing_target_profiles row) or
+     * has no recorded profile_url.
+     */
+    private static String extractProfileUrl(Object platformHandlesTree) {
+        if (!(platformHandlesTree instanceof Map<?, ?> root)) {
+            return null;
+        }
+        if (!(root.get("by_platform") instanceof Map<?, ?> byPlatform) || byPlatform.isEmpty()) {
+            return null;
+        }
+        Object primary = root.get("primary_platform");
+        Object entryObj = primary instanceof String s ? byPlatform.get(s) : byPlatform.values().iterator().next();
+        if (!(entryObj instanceof Map<?, ?> entry)) {
+            return null;
+        }
+        Object url = entry.get("profile_url");
+        return (url instanceof String s && !s.isBlank()) ? s : null;
     }
 
     /** Per-platform reach for {@code keyword} with relative-strength ratios. */
