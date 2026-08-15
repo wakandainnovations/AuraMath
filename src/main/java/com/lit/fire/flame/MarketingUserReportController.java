@@ -565,7 +565,7 @@ public class MarketingUserReportController {
         if ("negative".equals(tone))
             return "Active Critic — expresses dissatisfaction publicly. Engage carefully to convert to advocate.";
         if ("positive".equals(tone) && br >= 0.7)
-            return "Brand Evangelist — enthusiastic, high-reach advocate. Priority for ambassador programs.";
+            return "Movie Buff — enthusiastic, high-reach advocate. Priority for ambassador programs.";
         if ("positive".equals(tone))
             return "Positive Engager — supportive and consistent. Good candidate for loyalty programs.";
         return "Neutral Informer — shares factual content without strong emotional bias. Useful for awareness campaigns.";

@@ -12,34 +12,34 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Keyword-scoped brand evangelists.
+ * Keyword-scoped movie buffs.
  *
- * Returns the authors classified as "Brand Evangelist" (positive tone, high
+ * Returns the authors classified as "Movie Buff" (positive tone, high
  * branching ratio — see {@code MarketingUserReportController.audienceType}) who
  * have also posted about {@code keyword}. The classification lives in the global
  * {@code author_categories} table and is not keyword-aware, so the work of
  * intersecting it with per-keyword post activity is done in
- * {@link EntityMarketingService#brandEvangelists(String)}.
+ * {@link EntityMarketingService#movieBuffs(String)}.
  *
- * An empty {@code evangelists} list is legitimate: it means no categorised
- * evangelist has posted about this keyword (e.g. the keyword is new, or
+ * An empty {@code movieBuffs} list is legitimate: it means no categorised
+ * movie buff has posted about this keyword (e.g. the keyword is new, or
  * {@code /api/marketing/users/sync} has not run to populate author_categories).
  */
 @RestController
 @RequestMapping("/api/marketing")
-public class BrandEvangelistController {
+public class MovieBuffController {
 
     @Autowired
     private EntityMarketingService marketing;
 
-    @GetMapping("/brand-evangelists/{keyword}")
-    public ResponseEntity<Map<String, Object>> getBrandEvangelists(@PathVariable String keyword) {
-        List<Map<String, Object>> evangelists = marketing.brandEvangelists(keyword);
+    @GetMapping("/movie-buffs/{keyword}")
+    public ResponseEntity<Map<String, Object>> getMovieBuffs(@PathVariable String keyword) {
+        List<Map<String, Object>> movieBuffs = marketing.movieBuffs(keyword);
 
         Map<String, Object> resp = new LinkedHashMap<>();
-        resp.put("keyword",          keyword);
-        resp.put("totalEvangelists", evangelists.size());
-        resp.put("evangelists",      evangelists);
+        resp.put("keyword",        keyword);
+        resp.put("totalMovieBuffs", movieBuffs.size());
+        resp.put("movieBuffs",     movieBuffs);
         return ResponseEntity.ok(resp);
     }
 }

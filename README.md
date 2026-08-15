@@ -25,7 +25,7 @@ of REST endpoints that can be consumed by an ad-buying or campaign-planning serv
    - [Celebrity Marketing (`/api/marketing/celebrity`)](#5b-celebrity-marketing-api)
    - [Entity Report (`/api/marketing/entity-report`)](#5c-entity-report-api)
    - [Language Marketing (`/api/marketing/language`)](#5d-language-marketing-api)
-   - [Brand Evangelists (`/api/marketing/brand-evangelists`)](#5e-brand-evangelists-api)
+   - [Movie Buffs (`/api/marketing/movie-buffs`)](#5e-movie-buffs-api)
    - [Celebrity Analytics (`/api/analytics/celebrity`)](#5f-celebrity-analytics-api)
    - [Narrative Novelty Scoring (`/api/marketing/narrative-novelty`)](#5g-narrative-novelty-scoring-api)
    - [Viral Seeds & Aspect Drivers (`/api/marketing`)](#6-viral-seeds--aspect-drivers)
@@ -232,7 +232,7 @@ Sections in the response:
 | `topicIntelligence`        | Per-keyword breakdown: tone distribution, dominant tone, average excitation spike, excitation profile. |
 | `marketingRecommendations` | Primary channel, best posting hour window, campaign type, audience classification, content strategy, plain-English actionable advice. |
 | `redFlags`                 | Risk list (severity: LOW / MEDIUM / HIGH).                            |
-| `opportunityFlags`         | Specific openings (e.g. `Brand Evangelist`, `Keyword Anchor Window`). |
+| `opportunityFlags`         | Specific openings (e.g. `Movie Buff`, `Keyword Anchor Window`). |
 
 **Empty-history response (200):**
 
@@ -305,7 +305,7 @@ List categorised authors. All query params optional — combine as needed.
 
 | Param                    | Example value         |
 |--------------------------|----------------------|
-| `audienceClassification` | `Brand Evangelist`   |
+| `audienceClassification` | `Movie Buff`         |
 | `influenceTier`          | `Viral Node`         |
 | `postingStyle`           | `Power Burst Poster` |
 | `dominantTone`           | `positive`           |
@@ -315,7 +315,7 @@ Response:
 
 ```json
 {
-  "filtersApplied": { "audience_classification": "Brand Evangelist" },
+  "filtersApplied": { "audience_classification": "Movie Buff" },
   "totalUsers": 3,
   "users": [ { "author": "janedoe", "influence_tier": "Amplifier", "..." } ]
 }
@@ -328,7 +328,7 @@ filter dropdowns in a UI.
 
 ```json
 {
-  "audience_classification": ["Brand Evangelist", "Critical Power Influencer", "Neutral Informer"],
+  "audience_classification": ["Movie Buff", "Critical Power Influencer", "Neutral Informer"],
   "influence_tier":          ["Viral Node", "Amplifier", "Participant", "Observer"],
   "posting_style":           ["Steady Poster", "Burst Poster", "Power Burst Poster"],
   "dominant_tone":           ["positive", "negative", "neutral"],
@@ -807,27 +807,27 @@ an empty `users` list, not an error.
 
 ---
 
-### 5e. Brand Evangelists API
+### 5e. Movie Buffs API
 
-**`GET /api/marketing/brand-evangelists/{keyword}`**
+**`GET /api/marketing/movie-buffs/{keyword}`**
 
 Intersects the global `author_categories` classification (see [Author Categorisation
 API](#4-author-categorisation-api)) with per-keyword post activity: returns every author already
-labelled `audience_classification = 'Brand Evangelist'` (positive tone, high branching ratio) who
+labelled `audience_classification = 'Movie Buff'` (positive tone, high branching ratio) who
 has also posted about `{keyword}` on any platform. The classification itself is not keyword-aware,
-so this endpoint does the intersection at query time via `EntityMarketingService.brandEvangelists`.
+so this endpoint does the intersection at query time via `EntityMarketingService.movieBuffs`.
 
-An empty `evangelists` list is legitimate — it means no categorised evangelist has posted about
+An empty `movieBuffs` list is legitimate — it means no categorised movie buff has posted about
 this keyword yet (e.g. a new keyword, or `/api/marketing/users/sync` hasn't run).
 
 ```json
 {
   "keyword": "Avengers",
-  "totalEvangelists": 2,
-  "evangelists": [
+  "totalMovieBuffs": 2,
+  "movieBuffs": [
     {
       "author": "janedoe",
-      "audienceClassification": "Brand Evangelist",
+      "audienceClassification": "Movie Buff",
       "influenceTier": "Amplifier",
       "postingStyle": "Burst Poster",
       "dominantTone": "positive",
@@ -1585,7 +1585,7 @@ A "burst" requires ≥ `HawkesAuditService.CLUSTER_MIN` posts within `CLUSTER_WI
 |------------------------|--------------------------------|
 | negative + BR ≥ 0.7    | `Critical Power Influencer`    |
 | negative + BR < 0.7    | `Active Critic`                |
-| positive + BR ≥ 0.7    | `Brand Evangelist`             |
+| positive + BR ≥ 0.7    | `Movie Buff`                   |
 | positive + BR < 0.7    | `Positive Engager`             |
 | neutral / fallback     | `Neutral Informer`             |
 

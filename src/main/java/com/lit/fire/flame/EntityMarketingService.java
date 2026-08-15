@@ -204,13 +204,13 @@ public class EntityMarketingService {
     }
 
     /**
-     * Authors classified as "Brand Evangelist" in {@code author_categories} who have
+     * Authors classified as "Movie Buff" in {@code author_categories} who have
      * also posted about {@code keyword}. The classification is global (per-author,
      * not keyword-scoped), so we intersect it with the per-keyword post activity to
-     * surface the evangelists relevant to this campaign, ranked by branching ratio
+     * surface the movie buffs relevant to this campaign, ranked by branching ratio
      * (amplification potential) and then by their engagement on the keyword.
      */
-    public List<Map<String, Object>> brandEvangelists(String keyword) {
+    public List<Map<String, Object>> movieBuffs(String keyword) {
         String sql =
                 "WITH per_post AS (" +
                 "  SELECT author AS global_user_id, COALESCE(views_count, 0)::bigint AS engagement " +
@@ -233,7 +233,7 @@ public class EntityMarketingService {
                 "       pu.post_count, pu.total_engagement " +
                 "FROM per_user pu " +
                 "JOIN author_categories ac ON ac.author = pu.global_user_id " +
-                "WHERE ac.audience_classification = 'Brand Evangelist' " +
+                "WHERE ac.audience_classification = 'Movie Buff' " +
                 "ORDER BY ac.branching_ratio DESC NULLS LAST, pu.total_engagement DESC";
 
         List<Map<String, Object>> rows = jdbc.queryForList(sql, keyword, keyword, keyword, keyword);

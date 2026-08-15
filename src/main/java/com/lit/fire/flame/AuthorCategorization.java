@@ -10,7 +10,7 @@ import java.time.LocalDateTime;
 public class AuthorCategorization {
 
     public String        author;
-    public String        audienceClassification; // e.g. "Brand Evangelist"
+    public String        audienceClassification; // e.g. "Movie Buff"
     public String        influenceTier;          // e.g. "Viral Node"
     public String        postingStyle;           // e.g. "Power Burst Poster"
     public String        dominantTone;           // positive / neutral / negative

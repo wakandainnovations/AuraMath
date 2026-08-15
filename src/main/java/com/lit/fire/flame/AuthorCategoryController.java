@@ -30,7 +30,7 @@ public class AuthorCategoryController {
     // Returns the persisted categorisation for every author matching the
     // (optional) filter set.  Examples:
     //   /api/marketing/users
-    //   /api/marketing/users?audienceClassification=Brand%20Evangelist
+    //   /api/marketing/users?audienceClassification=Movie%20Buff
     //   /api/marketing/users?influenceTier=Viral%20Node&dominantTone=positive
     // -------------------------------------------------------------------------
 
