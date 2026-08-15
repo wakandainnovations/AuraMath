@@ -146,7 +146,9 @@ public class AspectDriversPrecomputer implements InitializingBean {
      * The heavy NLP scan runs outside any write transaction; only the final truncate-and-insert
      * publish step is transactional, so a failure mid-scan leaves the live tables intact.
      */
-    @Scheduled(initialDelay = 60_000L, fixedRate = 24L * 60 * 60 * 1000)
+    // Temporarily disabled while diagnosing the recurring OutOfMemoryError this job's CoreNLP
+    // scan has been causing (see AspectSentimentAnalyzer's MAX_INPUT_CHARS history). Re-add
+    // @Scheduled(initialDelay = 60_000L, fixedRate = 24L * 60 * 60 * 1000) once confirmed safe.
     public void refresh() {
         // The advisory lock is session-scoped, so it must be acquired and released on the same
         // physical connection — hold one open for the duration rather than going through JdbcTemplate.
