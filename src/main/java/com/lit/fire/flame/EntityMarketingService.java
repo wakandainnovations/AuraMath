@@ -203,61 +203,161 @@ public class EntityMarketingService {
         return out;
     }
 
+    // A "Power Burst Poster" whose branching_ratio sits at/near the Hawkes MLE's upper
+    // optimizer bound (see HawkesAuditService.estimateHawkes) got there because its posts
+    // are fired in near-simultaneous rapid-fire clusters, not because of genuine audience
+    // amplification — that requires an actual audience, which near-zero engagement rules
+    // out. Below this per-post engagement average, treat the pattern as bot-like.
+    private static final double BOT_BRANCHING_RATIO_FLOOR    = 0.99;
+    private static final double BOT_AVG_ENGAGEMENT_CEILING   = 20.0;
+
+    // author_categories only categorises authors with > AuthorCategoryRepository.MIN_POSTS
+    // total posts (its Hawkes fit needs repeat posting history to converge) — a one-off
+    // poster whose single post went viral never qualifies, no matter its reach. That
+    // threshold is a deliberate, cross-endpoint marketing rule, so it stays untouched
+    // globally; movieBuffs() alone bypasses it by also admitting high-reach authors who
+    // never made it into author_categories, gated on a lightweight inline tone check
+    // (mean sentiment_score on THIS keyword's posts, same >75 threshold as
+    // HawkesAuditService.AuditEntry#tone) so we don't recommend outreach to critics.
+    private static final double UNCATEGORIZED_POSITIVE_TONE_THRESHOLD = 75.0;
+
     /**
-     * Authors classified as "Movie Buff" in {@code author_categories} who have
-     * also posted about {@code keyword}. The classification is global (per-author,
-     * not keyword-scoped), so we intersect it with the per-keyword post activity to
-     * surface the movie buffs relevant to this campaign, ranked by branching ratio
-     * (amplification potential) and then by their engagement on the keyword.
+     * Authors classified as "Movie Buff" in {@code author_categories} who have also posted
+     * about {@code keyword}, PLUS authors never categorised at all (too few total posts to
+     * clear {@link AuthorCategoryRepository#MIN_POSTS}) whose posts about this keyword still
+     * skew positive and drew real engagement — see {@link #UNCATEGORIZED_POSITIVE_TONE_THRESHOLD}.
+     * Both groups are ranked together by their actual engagement on the keyword
+     * (views/likes/comments — the real proxy for audience reach) and then by branching
+     * ratio as a tiebreaker (uncategorised authors have no branching ratio, so they sort
+     * after categorised ties with the same engagement).
+     *
+     * branching_ratio is fit on an author's OWN post-timing history (self-excitation,
+     * see HawkesAuditService) and is unrelated to audience size. A short burst of
+     * near-simultaneous posts — even from a low-follower account with near-zero views —
+     * can drive its Hawkes MLE to the optimizer's upper bound (branching_ratio == 1.0,
+     * the theoretical max), tying it with dozens of similarly bursty, low-reach authors.
+     * Sorting by branching_ratio first previously let those degenerate ties outrank
+     * authors with substantially higher real engagement, so it must stay secondary.
+     *
+     * A movie is typically tagged with more than one keyword variant (e.g. "Toxic" and
+     * "ToxicTheMovie" both point at the same {@code entity_keywords} row) — matching only
+     * the caller's literal string would silently miss posts filed under a sibling variant,
+     * so the full variant set for the entity is resolved first via {@link #resolveKeywordVariants}.
      */
-    public List<Map<String, Object>> movieBuffs(String keyword) {
+    /** Result of {@link #movieBuffs(String)}: the recommendable list plus what got filtered out and why. */
+    public static class MovieBuffsResult {
+        public final List<Map<String, Object>> movieBuffs;
+        public final List<Map<String, Object>> suspectedBots;
+        MovieBuffsResult(List<Map<String, Object>> movieBuffs, List<Map<String, Object>> suspectedBots) {
+            this.movieBuffs    = movieBuffs;
+            this.suspectedBots = suspectedBots;
+        }
+    }
+
+    public MovieBuffsResult movieBuffs(String keyword) {
+        List<String> keywords = resolveKeywordVariants(keyword);
+        String in = placeholders(keywords.size());
         String sql =
                 "WITH per_post AS (" +
-                "  SELECT author AS global_user_id, COALESCE(views_count, 0)::bigint AS engagement " +
-                "  FROM x_posts          WHERE keyword ILIKE ? AND author IS NOT NULL AND author <> '' " +
+                "  SELECT author AS global_user_id, COALESCE(views_count, 0)::bigint AS engagement, " +
+                "         CASE WHEN sentiment_score BETWEEN 1 AND 100 THEN sentiment_score END AS valid_sentiment " +
+                "  FROM x_posts          WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' " +
                 "  UNION ALL " +
-                "  SELECT author, COALESCE(likes_count, 0)::bigint " +
-                "  FROM youtube_comments WHERE keyword ILIKE ? AND author IS NOT NULL AND author <> '' " +
+                "  SELECT author, COALESCE(likes_count, 0)::bigint, " +
+                "         CASE WHEN sentiment_score BETWEEN 1 AND 100 THEN sentiment_score END " +
+                "  FROM youtube_comments WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' " +
                 "  UNION ALL " +
-                "  SELECT author, COALESCE(num_comments, 0)::bigint " +
-                "  FROM reddit_posts     WHERE keyword ILIKE ? AND author IS NOT NULL AND author <> '' " +
+                "  SELECT author, COALESCE(num_comments, 0)::bigint, " +
+                "         CASE WHEN sentiment_score BETWEEN 1 AND 100 THEN sentiment_score END " +
+                "  FROM reddit_posts     WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' " +
                 "  UNION ALL " +
-                "  SELECT author, COALESCE(like_count, 0)::bigint " +
-                "  FROM instagram_posts  WHERE keyword ILIKE ? AND author IS NOT NULL AND author <> '' " +
+                "  SELECT author, COALESCE(like_count, 0)::bigint, " +
+                "         CASE WHEN sentiment_score BETWEEN 1 AND 100 THEN sentiment_score END " +
+                "  FROM instagram_posts  WHERE LOWER(keyword) IN (" + in + ") AND author IS NOT NULL AND author <> '' " +
                 "), per_user AS (" +
-                "  SELECT global_user_id, COUNT(*) AS post_count, SUM(engagement) AS total_engagement " +
+                "  SELECT global_user_id, COUNT(*) AS post_count, SUM(engagement) AS total_engagement, " +
+                "         AVG(valid_sentiment) AS avg_sentiment " +
                 "  FROM per_post GROUP BY global_user_id " +
                 ") " +
-                "SELECT ac.author, ac.audience_classification, ac.influence_tier, ac.posting_style, " +
-                "       ac.dominant_tone, ac.primary_platform, ac.branching_ratio, ac.total_posts, " +
+                "SELECT pu.global_user_id AS author, ac.audience_classification, ac.influence_tier, " +
+                "       ac.posting_style, ac.dominant_tone, ac.primary_platform, ac.branching_ratio, " +
+                "       ac.total_posts, ac.author IS NOT NULL AS categorized, pu.avg_sentiment, " +
                 "       pu.post_count, pu.total_engagement, m.platform_handles " +
                 "FROM per_user pu " +
-                "JOIN author_categories ac ON ac.author = pu.global_user_id " +
-                "LEFT JOIN marketing_target_profiles m ON m.global_user_id = ac.author " +
+                "LEFT JOIN author_categories ac ON ac.author = pu.global_user_id " +
+                "LEFT JOIN marketing_target_profiles m ON m.global_user_id = pu.global_user_id " +
                 "WHERE ac.audience_classification = 'Movie Buff' " +
-                "ORDER BY ac.branching_ratio DESC NULLS LAST, pu.total_engagement DESC";
+                "   OR (ac.author IS NULL AND pu.avg_sentiment > " + UNCATEGORIZED_POSITIVE_TONE_THRESHOLD + ") " +
+                "ORDER BY pu.total_engagement DESC, ac.branching_ratio DESC NULLS LAST";
 
-        List<Map<String, Object>> rows = jdbc.queryForList(sql, keyword, keyword, keyword, keyword);
-        List<Map<String, Object>> out = new ArrayList<>(rows.size());
+        List<Map<String, Object>> rows = jdbc.queryForList(sql, repeatLowered(keywords, 4));
+        List<Map<String, Object>> out  = new ArrayList<>(rows.size());
+        List<Map<String, Object>> bots = new ArrayList<>();
         for (Map<String, Object> row : rows) {
+            long    postCount      = toLong(row.get("post_count"));
+            long    engagement     = toLong(row.get("total_engagement"));
+            boolean categorized    = Boolean.TRUE.equals(row.get("categorized"));
+            double  branchingRatio = toDouble(row.get("branching_ratio"));
+            String  postingStyle   = (String) row.get("posting_style");
+            double  avgEngagement  = postCount == 0 ? 0.0 : (double) engagement / postCount;
+            boolean suspectedBot   = "Power Burst Poster".equals(postingStyle)
+                    && branchingRatio >= BOT_BRANCHING_RATIO_FLOOR
+                    && avgEngagement < BOT_AVG_ENGAGEMENT_CEILING;
+
             Object platformHandles = JsonbUtil.asTree(row.get("platform_handles"), gson);
 
             Map<String, Object> entry = new LinkedHashMap<>();
             entry.put("author",                  row.get("author"));
-            entry.put("audienceClassification",  row.get("audience_classification"));
+            entry.put("categorized",              categorized);
+            entry.put("audienceClassification",  categorized
+                    ? row.get("audience_classification")
+                    : "Movie Buff (uncategorized — high reach)");
             entry.put("influenceTier",           row.get("influence_tier"));
-            entry.put("postingStyle",            row.get("posting_style"));
-            entry.put("dominantTone",            row.get("dominant_tone"));
+            entry.put("postingStyle",            postingStyle);
+            entry.put("dominantTone",            categorized ? row.get("dominant_tone") : "positive");
             entry.put("primaryPlatform",         row.get("primary_platform"));
-            entry.put("branchingRatio",          toDouble(row.get("branching_ratio")));
-            entry.put("totalPosts",              toLong(row.get("total_posts")));
-            entry.put("keywordPostCount",        toLong(row.get("post_count")));
-            entry.put("keywordEngagement",       toLong(row.get("total_engagement")));
+            entry.put("branchingRatio",          categorized ? branchingRatio : null);
+            entry.put("totalPosts",              row.get("total_posts") != null ? toLong(row.get("total_posts")) : null);
+            entry.put("keywordPostCount",        postCount);
+            entry.put("keywordEngagement",       engagement);
             entry.put("platformHandles",         platformHandles);
             entry.put("profileUrl",              extractProfileUrl(platformHandles));
-            out.add(entry);
+            if (!categorized) {
+                entry.put("note", "Bypassed author_categories (fewer than "
+                        + AuthorCategoryRepository.MIN_POSTS + " total posts to run the full Hawkes audit on) — "
+                        + "included on keyword reach and positive tone alone.");
+            }
+
+            // Rapid-fire, near-zero-reach posting — not useful for outreach, so it's kept out of
+            // the recommendable list but still surfaced (labelled) rather than silently dropped.
+            // Only applies to categorised authors — bypass admissions have no branching_ratio/
+            // posting_style (never ran through HawkesAuditService) so this check can't fire for them.
+            if (suspectedBot) {
+                entry.put("suspectedBotReason",
+                        String.format("%d posts, branching ratio %.2f (Hawkes MLE ceiling), "
+                                + "only %.1f avg engagement/post — rapid self-posting, not real reach",
+                                postCount, branchingRatio, avgEngagement));
+                bots.add(entry);
+            } else {
+                out.add(entry);
+            }
         }
-        return out;
+        return new MovieBuffsResult(out, bots);
+    }
+
+    /**
+     * Expands {@code keyword} to every keyword variant registered for the same entity in
+     * {@code entity_keywords} (e.g. "Toxic" and "ToxicTheMovie" both map to entity 116), so
+     * posts filed under any variant are picked up. Falls back to the literal keyword when it
+     * isn't a registered entity keyword at all (ad hoc/non-entity lookups keep working as before).
+     */
+    private List<String> resolveKeywordVariants(String keyword) {
+        List<String> variants = jdbc.queryForList(
+                "SELECT DISTINCT ek2.keyword FROM entity_keywords ek1 " +
+                "JOIN entity_keywords ek2 ON ek2.entity_id = ek1.entity_id " +
+                "WHERE LOWER(ek1.keyword) = LOWER(?)",
+                String.class, keyword);
+        return variants.isEmpty() ? List.of(keyword) : variants;
     }
 
     /**
