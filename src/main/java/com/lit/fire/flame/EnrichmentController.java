@@ -30,6 +30,9 @@ public class EnrichmentController {
     @Autowired
     private GraphPopulationService graphPopulationService;
 
+    @Autowired
+    private VmiComputationService vmiComputationService;
+
     @PostMapping("/run-enrichment")
     public ResponseEntity<String> runEnrichment() {
         marketingEnrichmentEngine.enrichAndSave();
@@ -66,5 +69,10 @@ public class EnrichmentController {
     @PostMapping("/recompute-conflict-balance")
     public ResponseEntity<Map<String, Object>> recomputeConflictBalance() {
         return ResponseEntity.ok(conflictBalanceService.recomputeAndPersist());
+    }
+
+    @PostMapping("/run-vmi-computation")
+    public ResponseEntity<Map<String, Object>> runVmiComputation() {
+        return ResponseEntity.ok(vmiComputationService.recomputeAndPersist());
     }
 }
