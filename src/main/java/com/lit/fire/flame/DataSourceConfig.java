@@ -1,11 +1,11 @@
 package com.lit.fire.flame;
 
 import com.fasterxml.jackson.core.JsonGenerator;
+import com.zaxxer.hikari.HikariDataSource;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.jackson.Jackson2ObjectMapperBuilderCustomizer;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.jdbc.datasource.DriverManagerDataSource;
 
 import javax.sql.DataSource;
 import java.io.InputStream;
@@ -27,10 +27,19 @@ public class DataSourceConfig {
             e.printStackTrace();
         }
 
-        DriverManagerDataSource dataSource = new DriverManagerDataSource();
-        dataSource.setUrl(dbProperties.getProperty("db.url", "jdbc:postgresql://localhost:5432/aura"));
+        // Was a plain DriverManagerDataSource, which opens a brand-new physical connection per
+        // JDBC call and closes it right after. Fine for a single occasional query, but any bulk
+        // per-row write loop (e.g. UserEngagementRatingService's per-user UPDATE loop over tens
+        // of thousands of marketing_target_profiles rows) opens/closes connections fast enough to
+        // exhaust ephemeral ports mid-run and fail with "connection attempt failed". HikariCP is
+        // already a transitive dependency via spring-boot-starter-jdbc.
+        HikariDataSource dataSource = new HikariDataSource();
+        dataSource.setJdbcUrl(dbProperties.getProperty("db.url", "jdbc:postgresql://localhost:5432/aura"));
         dataSource.setUsername(dbProperties.getProperty("db.user", "postgres"));
         dataSource.setPassword(dbProperties.getProperty("db.password", "postgres"));
+        // hawkesIntensityCalculator() below checks out and permanently holds one connection for
+        // the application's lifetime, so the pool is sized with that pinned connection in mind.
+        dataSource.setMaximumPoolSize(15);
 
         return dataSource;
     }
