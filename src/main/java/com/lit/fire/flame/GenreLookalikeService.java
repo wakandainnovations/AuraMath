@@ -268,7 +268,9 @@ public class GenreLookalikeService {
         return a.dotProduct(b) / (normA * normB);
     }
 
-    private static String normalize(String raw) {
+    // Package-private (not private) so BehaviorFeatureComputationService can normalize authors the
+    // same way when resolving them against user_identity_link, instead of duplicating this regex.
+    static String normalize(String raw) {
         if (raw == null) {
             return "";
         }

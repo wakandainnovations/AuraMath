@@ -63,6 +63,9 @@ public class VmiComputationService {
     @Autowired
     private JdbcTemplate jdbc;
 
+    @Autowired
+    private BehaviorFeatureComputationService behaviorFeatureComputationService;
+
     private void ensureSchema() {
         jdbc.execute("CREATE TABLE IF NOT EXISTS entity_daily_vmi (" +
                 "entity_id BIGINT NOT NULL, " +
@@ -351,6 +354,20 @@ public class VmiComputationService {
             log.info("VMI computation complete in {} ms: {}", System.currentTimeMillis() - start, summary);
         } catch (Exception e) {
             log.error("VMI computation failed", e);
+            return;
+        }
+
+        // Runs immediately after VMI in the same cycle (not its own cron): behavior features read
+        // entity_daily_vmi's day_index alignment as a prerequisite, so they only make sense once VMI
+        // has (re)computed it, same dependency style as GraphPopulationService riding
+        // MarketingEnrichmentScheduler's cron after UserEngagementRatingService.
+        try {
+            long start = System.currentTimeMillis();
+            log.info("Behavior feature computation starting");
+            Map<String, Object> summary = behaviorFeatureComputationService.recomputeAndPersist();
+            log.info("Behavior feature computation complete in {} ms: {}", System.currentTimeMillis() - start, summary);
+        } catch (Exception e) {
+            log.error("Behavior feature computation failed", e);
         }
     }
 }

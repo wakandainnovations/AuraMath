@@ -33,6 +33,9 @@ public class EnrichmentController {
     @Autowired
     private VmiComputationService vmiComputationService;
 
+    @Autowired
+    private BehaviorFeatureComputationService behaviorFeatureComputationService;
+
     @PostMapping("/run-enrichment")
     public ResponseEntity<String> runEnrichment() {
         marketingEnrichmentEngine.enrichAndSave();
@@ -74,5 +77,10 @@ public class EnrichmentController {
     @PostMapping("/run-vmi-computation")
     public ResponseEntity<Map<String, Object>> runVmiComputation() {
         return ResponseEntity.ok(vmiComputationService.recomputeAndPersist());
+    }
+
+    @PostMapping("/run-behavior-feature-computation")
+    public ResponseEntity<Map<String, Object>> runBehaviorFeatureComputation() {
+        return ResponseEntity.ok(behaviorFeatureComputationService.recomputeAndPersist());
     }
 }
