@@ -71,11 +71,13 @@ public class LanguageMarketingAPI {
         }, language);
 
         Map<String, Map<String, Object>> enrichByUser = fetchEnrichment(new ArrayList<>(mentionsByUser.keySet()));
+        Map<String, Map<String, Object>> causalLiftByUser = fetchCausalLiftScores(new ArrayList<>(mentionsByUser.keySet()));
 
         List<Map<String, Object>> users = new ArrayList<>();
         for (Map.Entry<String, Set<Object>> entry : mentionsByUser.entrySet()) {
             String globalUserId = entry.getKey();
             Map<String, Object> enrich = enrichByUser.getOrDefault(globalUserId, Map.of());
+            Map<String, Object> causalLift = causalLiftByUser.getOrDefault(globalUserId, Map.of());
 
             Map<String, Object> row = new LinkedHashMap<>();
             row.put("global_user_id",            globalUserId);
@@ -84,6 +86,9 @@ public class LanguageMarketingAPI {
             row.put("engagement_rating",          enrich.get("engagement_rating"));
             row.put("tribe_label",                enrich.get("tribe_label"));
             row.put("platform_handles",           JsonbUtil.asTree(enrich.get("platform_handles"), gson));
+            row.put("causal_lift_score",          causalLift.get("causal_lift_score"));
+            row.put("n_qualifying_events",        causalLift.get("n_qualifying_events"));
+            row.put("confidence",                 causalLift.get("confidence"));
             users.add(row);
         }
 
@@ -157,11 +162,13 @@ public class LanguageMarketingAPI {
         }, language, movieName);
 
         Map<String, Map<String, Object>> enrichByUser = fetchEnrichment(new ArrayList<>(mentionsByUser.keySet()));
+        Map<String, Map<String, Object>> causalLiftByUser = fetchCausalLiftScores(new ArrayList<>(mentionsByUser.keySet()));
 
         List<Map<String, Object>> users = new ArrayList<>();
         for (Map.Entry<String, Set<Object>> entry : mentionsByUser.entrySet()) {
             String globalUserId = entry.getKey();
             Map<String, Object> enrich = enrichByUser.getOrDefault(globalUserId, Map.of());
+            Map<String, Object> causalLift = causalLiftByUser.getOrDefault(globalUserId, Map.of());
             Map<Object, Integer> sentimentMentions = sentimentByUser.getOrDefault(globalUserId, Map.of());
 
             Map<String, Object> row = new LinkedHashMap<>();
@@ -171,6 +178,9 @@ public class LanguageMarketingAPI {
             row.put("engagement_rating",          enrich.get("engagement_rating"));
             row.put("tribe_label",                enrich.get("tribe_label"));
             row.put("platform_handles",           JsonbUtil.asTree(enrich.get("platform_handles"), gson));
+            row.put("causal_lift_score",          causalLift.get("causal_lift_score"));
+            row.put("n_qualifying_events",        causalLift.get("n_qualifying_events"));
+            row.put("confidence",                 causalLift.get("confidence"));
             row.put("mentions_on_this_movie",     sentimentMentions.size());
             row.put("average_sentiment_score",    averageOf(sentimentMentions.values()));
             users.add(row);
@@ -205,6 +215,20 @@ public class LanguageMarketingAPI {
             index.put(rs.getString("normalized_author"), rs.getString("global_user_id"));
         });
         return index;
+    }
+
+    /** LEFT JOIN semantics: a user with no user_causal_lift_scores row yet is simply absent from the map. */
+    private Map<String, Map<String, Object>> fetchCausalLiftScores(List<String> globalUserIds) {
+        if (globalUserIds.isEmpty()) return Map.of();
+        String placeholders = globalUserIds.stream().map(x -> "?").collect(Collectors.joining(","));
+        String sql = "SELECT global_user_id, causal_lift_score, n_qualifying_events, confidence " +
+                     "FROM user_causal_lift_scores WHERE global_user_id IN (" + placeholders + ")";
+        List<Map<String, Object>> rows = jdbc.queryForList(sql, globalUserIds.toArray());
+        Map<String, Map<String, Object>> result = new HashMap<>();
+        for (Map<String, Object> row : rows) {
+            result.put((String) row.get("global_user_id"), row);
+        }
+        return result;
     }
 
     private Map<String, Map<String, Object>> fetchEnrichment(List<String> globalUserIds) {

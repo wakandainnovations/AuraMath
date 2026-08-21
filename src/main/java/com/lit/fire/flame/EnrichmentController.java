@@ -36,6 +36,9 @@ public class EnrichmentController {
     @Autowired
     private BehaviorFeatureComputationService behaviorFeatureComputationService;
 
+    @Autowired
+    private UserCausalLiftScoreService userCausalLiftScoreService;
+
     @PostMapping("/run-enrichment")
     public ResponseEntity<String> runEnrichment() {
         marketingEnrichmentEngine.enrichAndSave();
@@ -82,5 +85,10 @@ public class EnrichmentController {
     @PostMapping("/run-behavior-feature-computation")
     public ResponseEntity<Map<String, Object>> runBehaviorFeatureComputation() {
         return ResponseEntity.ok(behaviorFeatureComputationService.recomputeAndPersist());
+    }
+
+    @PostMapping("/run-causal-lift-scoring")
+    public ResponseEntity<Map<String, Object>> runCausalLiftScoring() {
+        return ResponseEntity.ok(userCausalLiftScoreService.recomputeAndPersist());
     }
 }

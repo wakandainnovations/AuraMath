@@ -66,6 +66,9 @@ public class VmiComputationService {
     @Autowired
     private BehaviorFeatureComputationService behaviorFeatureComputationService;
 
+    @Autowired
+    private UserCausalLiftScoreService userCausalLiftScoreService;
+
     private void ensureSchema() {
         jdbc.execute("CREATE TABLE IF NOT EXISTS entity_daily_vmi (" +
                 "entity_id BIGINT NOT NULL, " +
@@ -368,6 +371,21 @@ public class VmiComputationService {
             log.info("Behavior feature computation complete in {} ms: {}", System.currentTimeMillis() - start, summary);
         } catch (Exception e) {
             log.error("Behavior feature computation failed", e);
+            return;
+        }
+
+        // Runs last in the same cycle, after both its dependencies (entity_daily_vmi and
+        // entity_daily_behavior_features) are fresh: causal lift scoring reads entity_daily_vmi's
+        // cumulative_engagement_volume trend directly and needs entity_daily_behavior_features'
+        // day_index alignment/prerequisite check to hold, same chaining style as this method's own
+        // relationship to MarketingEnrichmentScheduler.refresh().
+        try {
+            long start = System.currentTimeMillis();
+            log.info("Causal lift scoring starting");
+            Map<String, Object> summary = userCausalLiftScoreService.recomputeAndPersist();
+            log.info("Causal lift scoring complete in {} ms: {}", System.currentTimeMillis() - start, summary);
+        } catch (Exception e) {
+            log.error("Causal lift scoring failed", e);
         }
     }
 }
