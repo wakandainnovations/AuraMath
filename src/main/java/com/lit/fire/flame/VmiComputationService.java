@@ -341,6 +341,18 @@ public class VmiComputationService {
     }
 
     /**
+     * Full day-by-day VMI series for an entity, ordered by day_index - the read path behind
+     * {@code GET /api/marketing/entity/{entityId}/vmi}. Empty when the entity has no
+     * entity_daily_vmi rows yet (never computed, or no tracked mentions).
+     */
+    public List<Map<String, Object>> series(long entityId) {
+        return jdbc.queryForList(
+                "SELECT day_index, daily_engagement_volume, cohort_zscore, cumulative_engagement_volume " +
+                "FROM entity_daily_vmi WHERE entity_id = ? ORDER BY day_index",
+                entityId);
+    }
+
+    /**
      * Runs 15 minutes after {@link MarketingEnrichmentScheduler}'s 03:30 UTC refresh and 30
      * minutes before {@link ChannelReachPrecomputer}'s 04:15 UTC run (staggered the same way
      * that job offsets from MarketingEnrichmentScheduler), so this doesn't stack CPU load with
