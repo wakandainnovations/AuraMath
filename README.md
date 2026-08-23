@@ -1086,9 +1086,9 @@ posts returns zero counts with empty strengths/weaknesses.
 
 ### 7. Top Spreaders
 
-**`GET /api/marketing/top-50-spreaders/{keyword}`**
+**`GET /api/marketing/top-50-spreaders/{keyword}[?platform=<platform>]`**
 
-Top 50 authors on **X** for posts matching `{keyword}` in the last 90 days, ranked by
+Top 50 authors for posts matching `{keyword}` in the last 90 days, ranked by
 **Viral Potential Score**:
 
 ```
@@ -1098,8 +1098,26 @@ VPS = (likes + 3 × comments) × (1 + α)
 Engagement count rewards authors whose audience actively reacts (not just passive viewers).
 The `(1 + α)` factor lets Hawkes infectivity boost bursty cascade-starters without zeroing
 out high-engagement organic spreaders whose cadence fits α ≈ 0. Comments are weighted 3×
-likes (more user effort, stronger sharing signal). Requires at least 2 matching posts per
-author.
+likes (more user effort, stronger sharing signal).
+
+By default the ranking is computed across all four tracked platforms combined — **X**,
+**YouTube**, **Reddit**, and **Instagram**. Pass `platform` (case-insensitive) to restrict
+the ranking to a single platform instead:
+
+| `platform` value | Source table        |
+|-------------------|----------------------|
+| `x`               | `x_posts`            |
+| `youtube`         | `youtube_comments`   |
+| `reddit`          | `reddit_posts`       |
+| `instagram`       | `instagram_posts`    |
+
+An unrecognized `platform` value returns `400 Bad Request` with a body listing the valid
+options, e.g.:
+
+```
+GET /api/marketing/top-50-spreaders/Coolie?platform=tiktok
+→ 400 "Unknown platform 'tiktok'. Must be one of: x, youtube, reddit, instagram"
+```
 
 ```json
 [

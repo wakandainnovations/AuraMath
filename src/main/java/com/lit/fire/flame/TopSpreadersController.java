@@ -6,10 +6,12 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.sql.Timestamp;
@@ -45,6 +47,32 @@ public class TopSpreadersController {
     private HawkesIntensityCalculator hawkesIntensityCalculator;
 
     /**
+     * Per-platform member of the {@code combined_posts} UNION, keyed by the same short
+     * platform names used elsewhere (e.g. {@link PlatformHandlesBuilder#shortPlatformName}) so
+     * the {@code platform} query param matches the rest of the API. Each value has exactly one
+     * {@code ?} placeholder for the keyword ILIKE filter.
+     */
+    private static final Map<String, String> PLATFORM_SELECTS = new LinkedHashMap<>();
+    static {
+        PLATFORM_SELECTS.put("x",
+                "SELECT id, author, COALESCE(views_count, 0) AS views_count, COALESCE(likes_count, 0) AS likes_count, " +
+                "COALESCE(comment_count, 0) AS comment_count, sentiment_score, created_at, 'x_posts' AS platform " +
+                "FROM x_posts WHERE keyword ILIKE ?");
+        PLATFORM_SELECTS.put("youtube",
+                "SELECT id, author, 0 AS views_count, COALESCE(likes_count, 0) AS likes_count, " +
+                "COALESCE(reply_count, 0) AS comment_count, sentiment_score, published_at AS created_at, 'youtube_comments' AS platform " +
+                "FROM youtube_comments WHERE keyword ILIKE ?");
+        PLATFORM_SELECTS.put("reddit",
+                "SELECT id, author, 0 AS views_count, COALESCE(score, 0) AS likes_count, " +
+                "COALESCE(num_comments, 0) AS comment_count, sentiment_score, created_at, 'reddit_posts' AS platform " +
+                "FROM reddit_posts WHERE keyword ILIKE ?");
+        PLATFORM_SELECTS.put("instagram",
+                "SELECT id, author, 0 AS views_count, COALESCE(like_count, 0) AS likes_count, " +
+                "COALESCE(comments_count, 0) AS comment_count, sentiment_score, timestamp AS created_at, 'instagram_posts' AS platform " +
+                "FROM instagram_posts WHERE keyword ILIKE ?");
+    }
+
+    /**
      * Returns the top 50 authors across X, YouTube, Reddit, and Instagram for posts matching
      * {keyword} in the last 90 days, ranked by Viral Potential Score:
      *
@@ -74,26 +102,31 @@ public class TopSpreadersController {
      * marketing_target_profiles.platform_handles, so a consumer can identify who the
      * author actually is — plus the full platform_handles breakdown per platform. Both are
      * null when the author hasn't been through MarketingEnrichmentEngine yet.
+     *
+     * By default the ranking is computed across all four platforms combined. Pass
+     * {@code ?platform=x|youtube|reddit|instagram} (case-insensitive, same short names used in
+     * platform_handles) to restrict the ranking to a single platform instead; an unrecognized
+     * value returns 400.
      */
     @GetMapping("/top-50-spreaders/{keyword}")
-    public List<Map<String, Object>> getTopSpreaders(@PathVariable String keyword) {
+    public ResponseEntity<?> getTopSpreaders(@PathVariable String keyword,
+                                              @RequestParam(required = false) String platform) {
+        List<String> selects;
+        if (platform == null || platform.isBlank()) {
+            selects = new ArrayList<>(PLATFORM_SELECTS.values());
+        } else {
+            String select = PLATFORM_SELECTS.get(platform.toLowerCase(Locale.ROOT));
+            if (select == null) {
+                return ResponseEntity.badRequest().body(
+                        "Unknown platform '" + platform + "'. Must be one of: " +
+                        String.join(", ", PLATFORM_SELECTS.keySet()));
+            }
+            selects = List.of(select);
+        }
+
         String sql =
                 "WITH combined_posts AS (" +
-                "  SELECT id, author, COALESCE(views_count, 0) AS views_count, COALESCE(likes_count, 0) AS likes_count, " +
-                "         COALESCE(comment_count, 0) AS comment_count, sentiment_score, created_at, 'x_posts' AS platform " +
-                "  FROM x_posts WHERE keyword ILIKE ? " +
-                "  UNION ALL " +
-                "  SELECT id, author, 0 AS views_count, COALESCE(likes_count, 0) AS likes_count, " +
-                "         COALESCE(reply_count, 0) AS comment_count, sentiment_score, published_at AS created_at, 'youtube_comments' AS platform " +
-                "  FROM youtube_comments WHERE keyword ILIKE ? " +
-                "  UNION ALL " +
-                "  SELECT id, author, 0 AS views_count, COALESCE(score, 0) AS likes_count, " +
-                "         COALESCE(num_comments, 0) AS comment_count, sentiment_score, created_at, 'reddit_posts' AS platform " +
-                "  FROM reddit_posts WHERE keyword ILIKE ? " +
-                "  UNION ALL " +
-                "  SELECT id, author, 0 AS views_count, COALESCE(like_count, 0) AS likes_count, " +
-                "         COALESCE(comments_count, 0) AS comment_count, sentiment_score, timestamp AS created_at, 'instagram_posts' AS platform " +
-                "  FROM instagram_posts WHERE keyword ILIKE ? " +
+                String.join(" UNION ALL ", selects) +
                 ") " +
                 "SELECT id, author, views_count, likes_count, comment_count, sentiment_score, created_at, platform " +
                 "FROM combined_posts " +
@@ -102,7 +135,8 @@ public class TopSpreadersController {
                 "AND sentiment_score BETWEEN 1 AND 100";
 
         String likeKeyword = "%" + keyword + "%";
-        List<Map<String, Object>> rows = jdbcTemplate.queryForList(sql, likeKeyword, likeKeyword, likeKeyword, likeKeyword);
+        Object[] params = selects.stream().map(s -> (Object) likeKeyword).toArray();
+        List<Map<String, Object>> rows = jdbcTemplate.queryForList(sql, params);
 
         Map<String, List<Map<String, Object>>> postsByAuthor = rows.stream()
                 .filter(r -> r.get("author") != null)
@@ -117,7 +151,7 @@ public class TopSpreadersController {
                 .collect(Collectors.toList());
 
         attachProfileLinks(ranked);
-        return ranked;
+        return ResponseEntity.ok(ranked);
     }
 
     /**
