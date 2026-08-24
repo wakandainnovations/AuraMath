@@ -7,6 +7,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
 
 import javax.annotation.PostConstruct;
+import java.util.List;
 
 @Repository
 public class MarketingInsightsRepository {
@@ -88,5 +89,21 @@ public class MarketingInsightsRepository {
                 topMovieGenresJson,
                 peakActivityTimes,
                 moiScore);
+    }
+
+    /**
+     * Upserts only {@code platform_handles} for a batch of authors, leaving every other column
+     * (tribe_label, influence_rank, moi_score, ...) untouched on conflict and NULL on a fresh
+     * insert. Used by {@link PlatformHandlesRefreshService}, which — unlike the full
+     * {@link MarketingEnrichmentEngine} run — only needs to keep profile-URL/handle attribution
+     * current and has no tribe/genre/influence data to write.
+     */
+    public void batchUpsertPlatformHandles(List<Object[]> globalUserIdAndHandles) {
+        String sql = "INSERT INTO " + TABLE_MARKETING_TARGET_PROFILES + " (" +
+                COLUMN_GLOBAL_USER_ID + ", " + COLUMN_PLATFORM_HANDLES + ") " +
+                "VALUES (?, ?::jsonb) " +
+                "ON CONFLICT (" + COLUMN_GLOBAL_USER_ID + ") DO UPDATE SET " +
+                COLUMN_PLATFORM_HANDLES + " = EXCLUDED." + COLUMN_PLATFORM_HANDLES;
+        jdbcTemplate.batchUpdate(sql, globalUserIdAndHandles);
     }
 }

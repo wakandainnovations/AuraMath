@@ -16,6 +16,9 @@ public class EnrichmentController {
     private MarketingEnrichmentEngine marketingEnrichmentEngine;
 
     @Autowired
+    private PlatformHandlesRefreshService platformHandlesRefreshService;
+
+    @Autowired
     private CrossPlatformIdentityResolver crossPlatformIdentityResolver;
 
     @Autowired
@@ -43,6 +46,16 @@ public class EnrichmentController {
     public ResponseEntity<String> runEnrichment() {
         marketingEnrichmentEngine.enrichAndSave();
         return ResponseEntity.ok("done");
+    }
+
+    /**
+     * Refreshes only platform_handles/profile_url — cheap (no NLP, no Hawkes fit), safe to run
+     * far more often than the full /run-enrichment to close the attribution gap for authors
+     * ingested since the last full run. See {@link PlatformHandlesRefreshService}.
+     */
+    @PostMapping("/run-platform-handles-refresh")
+    public ResponseEntity<Map<String, Object>> runPlatformHandlesRefresh() {
+        return ResponseEntity.ok(platformHandlesRefreshService.recomputeAndPersist());
     }
 
     @PostMapping("/run-engagement-rating")

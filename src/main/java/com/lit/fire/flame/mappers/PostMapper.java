@@ -5,6 +5,7 @@ import org.springframework.stereotype.Service;
 
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Timestamp;
 import java.time.LocalDateTime;
 import java.util.HashMap;
 import java.util.Map;
@@ -22,11 +23,18 @@ public class PostMapper {
         };
     }
 
+    // A handful of rows (e.g. test fixtures) have a NULL timestamp column; callers that sort/
+    // bucket by timestamp already null-check it (see MarketingEnrichmentEngine's peak-activity
+    // and platform-handles builders), so map it through as null rather than throwing.
+    private static LocalDateTime toLocalDateTime(Timestamp ts) {
+        return ts == null ? null : ts.toLocalDateTime();
+    }
+
     private UniversalPost mapXPost(ResultSet rs) throws SQLException {
         String postId = rs.getString("id");
         String authorId = rs.getString("author");
         String content = rs.getString("text");
-        LocalDateTime timestamp = rs.getTimestamp("created_at").toLocalDateTime();
+        LocalDateTime timestamp = toLocalDateTime(rs.getTimestamp("created_at"));
         String platform = "x_posts";
 
         Map<String, Object> metadata = new HashMap<>();
@@ -44,7 +52,7 @@ public class PostMapper {
         String postId = rs.getString("id");
         String authorId = rs.getString("author");
         String content = rs.getString("text");
-        LocalDateTime timestamp = rs.getTimestamp("published_at").toLocalDateTime();
+        LocalDateTime timestamp = toLocalDateTime(rs.getTimestamp("published_at"));
         String platform = "youtube_comments";
 
         Map<String, Object> metadata = new HashMap<>();
@@ -61,7 +69,7 @@ public class PostMapper {
         String postId = rs.getString("id");
         String authorId = rs.getString("author");
         String content = rs.getString("title") + " " + rs.getString("text");
-        LocalDateTime timestamp = rs.getTimestamp("created_at").toLocalDateTime();
+        LocalDateTime timestamp = toLocalDateTime(rs.getTimestamp("created_at"));
         String platform = "reddit_posts";
 
         Map<String, Object> metadata = new HashMap<>();
@@ -79,7 +87,7 @@ public class PostMapper {
         String postId = rs.getString("id");
         String authorId = rs.getString("author");
         String content = rs.getString("text");
-        LocalDateTime timestamp = rs.getTimestamp("timestamp").toLocalDateTime();
+        LocalDateTime timestamp = toLocalDateTime(rs.getTimestamp("timestamp"));
         String platform = "instagram_posts";
 
         Map<String, Object> metadata = new HashMap<>();
