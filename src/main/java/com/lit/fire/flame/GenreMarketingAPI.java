@@ -3,6 +3,7 @@ package com.lit.fire.flame;
 import com.google.gson.Gson;
 import com.google.gson.reflect.TypeToken;
 import com.lit.fire.flame.GenreClassifier.GenreLabel;
+import com.lit.fire.flame.models.UniversalPost;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.ResponseEntity;
@@ -10,14 +11,18 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.lang.reflect.Type;
+import java.sql.Timestamp;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 /**
@@ -40,6 +45,13 @@ public class GenreMarketingAPI {
     private static final long[] ZERO_REACH = {0L, 0L};
 
     private static final Type GENRE_MAP_TYPE = new TypeToken<Map<String, Double>>() {}.getType();
+
+    // Genre membership isn't a stored column (see ChannelReachPrecomputer), so the /posts
+    // endpoint classifies live against the most recent posts per platform rather than every
+    // row ever posted — same cap AspectDriversPrecomputer/ViralSeedController use for
+    // unbounded per-request scans.
+    private static final int GENRE_SCAN_CAP = 1000;
+    private static final Set<String> KNOWN_PLATFORMS = Set.of("x", "youtube", "reddit", "instagram");
 
     @Autowired private JdbcTemplate            jdbc;
     @Autowired private GenreClassifier         classifier;
@@ -65,6 +77,58 @@ public class GenreMarketingAPI {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("totalGenres", genres.size());
         body.put("genres", genres);
+        return ResponseEntity.ok(body);
+    }
+
+    // -------------------------------------------------------------------------
+    // GET /api/marketing/genre/{genre}/posts
+    //
+    // Individual posts classified into {genre}, newest first. Genre membership has no
+    // stored column, so this classifies live via GenreClassifier against the
+    // GENRE_SCAN_CAP most recent posts per platform (same live-scan-with-a-cap approach
+    // AspectDriversPrecomputer/ViralSeedController use elsewhere), then paginates the
+    // in-memory matches with limit/offset. totalPosts reflects matches within the scanned
+    // window, not the full historical corpus.
+    // -------------------------------------------------------------------------
+    @GetMapping("/{genre}/posts")
+    public ResponseEntity<?> posts(@PathVariable String genre,
+                                    @RequestParam(required = false) String platform,
+                                    @RequestParam(defaultValue = "50") int limit,
+                                    @RequestParam(defaultValue = "0") int offset) {
+        if (limit < 1 || limit > 200) {
+            return ResponseEntity.badRequest().body("limit must be between 1 and 200");
+        }
+        List<String> platforms;
+        if (platform == null || platform.isBlank()) {
+            platforms = List.of("x", "youtube", "reddit", "instagram");
+        } else {
+            String normalized = platform.toLowerCase(Locale.ROOT);
+            if (!KNOWN_PLATFORMS.contains(normalized)) {
+                return ResponseEntity.badRequest().body(
+                        "Unknown platform '" + platform + "'. Must be one of: x, youtube, reddit, instagram");
+            }
+            platforms = List.of(normalized);
+        }
+
+        List<Map<String, Object>> matches = new ArrayList<>();
+        if (platforms.contains("x"))         scanGenrePosts(matches, genre, "x_posts",          "x",         "created_at",   "views_count");
+        if (platforms.contains("youtube"))   scanGenrePosts(matches, genre, "youtube_comments",  "youtube",   "published_at", "likes_count");
+        if (platforms.contains("reddit"))    scanGenrePosts(matches, genre, "reddit_posts",      "reddit",    "created_at",   "num_comments");
+        if (platforms.contains("instagram")) scanGenrePosts(matches, genre, "instagram_posts",   "instagram", "timestamp",    "like_count");
+
+        matches.sort((a, b) -> compareCreatedAtDesc(a.get("createdAt"), b.get("createdAt")));
+
+        int total = matches.size();
+        int from  = Math.min(offset, total);
+        int to    = Math.min(offset + limit, total);
+
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("genre",      genre);
+        body.put("limit",      limit);
+        body.put("offset",     offset);
+        body.put("totalPosts", total);
+        body.put("scanNote",   "classified live against the " + GENRE_SCAN_CAP + " most recent posts per platform");
+        body.put("posts",      matches.subList(from, to));
         return ResponseEntity.ok(body);
     }
 
@@ -300,6 +364,66 @@ public class GenreMarketingAPI {
     // -------------------------------------------------------------------------
     // helpers
     // -------------------------------------------------------------------------
+
+    /**
+     * Streams the GENRE_SCAN_CAP most recent rows of {@code table}, classifies each through
+     * {@link GenreClassifier}, and appends matches for {@code genre} (case-insensitive) to
+     * {@code out}. Mirrors ChannelReachPrecomputer#scanForGenreReach's UniversalPost mapping,
+     * but keeps the individual post instead of only folding it into an aggregate.
+     */
+    private void scanGenrePosts(List<Map<String, Object>> out, String genre, String table,
+                                 String shortPlatform, String tsColumn, String metricColumn) {
+        boolean hasTitle = table.equals("reddit_posts");
+        boolean hasMediaType = table.equals("instagram_posts");
+        String sql = "SELECT id, author, text, permalink, sentiment_score, sentiment_category, keyword" +
+                (hasTitle ? ", title" : "") +
+                (hasMediaType ? ", media_type" : "") +
+                ", " + tsColumn + " AS created_at, COALESCE(" + metricColumn + ", 0) AS metric " +
+                "FROM " + table + " ORDER BY " + tsColumn + " DESC NULLS LAST LIMIT ?";
+
+        jdbc.query(sql, rs -> {
+            Map<String, Object> meta = new HashMap<>();
+            meta.put("keyword", rs.getString("keyword"));
+            String content = rs.getString("text");
+            if (hasTitle) {
+                String title = rs.getString("title") == null ? "" : rs.getString("title");
+                String body = content == null ? "" : content;
+                meta.put("title", title);
+                content = (title + " " + body).trim();
+            }
+            if (hasMediaType) {
+                meta.put("media_type", rs.getString("media_type"));
+            }
+
+            UniversalPost post = new UniversalPost(rs.getString("id"), rs.getString("author"), content, null, table, meta);
+            for (GenreLabel label : classifier.classifyPost(post)) {
+                if (label.genre().equalsIgnoreCase(genre)) {
+                    Map<String, Object> entry = new LinkedHashMap<>();
+                    entry.put("platform",          shortPlatform);
+                    entry.put("postId",            rs.getString("id"));
+                    entry.put("author",            rs.getString("author"));
+                    entry.put("content",           content);
+                    entry.put("permalink",         rs.getString("permalink"));
+                    entry.put("createdAt",         rs.getTimestamp("created_at"));
+                    entry.put("sentimentScore",    rs.getObject("sentiment_score"));
+                    entry.put("sentimentCategory", rs.getString("sentiment_category"));
+                    entry.put("engagementMetric",  rs.getLong("metric"));
+                    entry.put("genreScore",        label.weight());
+                    out.add(entry);
+                    break; // one entry per post even if classifyPost somehow yields the genre twice
+                }
+            }
+        }, GENRE_SCAN_CAP);
+    }
+
+    private static int compareCreatedAtDesc(Object a, Object b) {
+        Timestamp ta = a instanceof Timestamp t ? t : null;
+        Timestamp tb = b instanceof Timestamp t ? t : null;
+        if (ta == null && tb == null) return 0;
+        if (ta == null) return 1;
+        if (tb == null) return -1;
+        return tb.compareTo(ta);
+    }
 
     private Double extractGenreScore(Map<String, Object> row, String genre) {
         String json = JsonbUtil.asJsonString(row.get("top_movie_genres"));

@@ -380,6 +380,45 @@ valid `{genre}` path values for the three endpoints below.
 }
 ```
 
+**`GET /api/marketing/genre/{genre}/posts[?platform=<platform>&limit=<n>&offset=<n>]`**
+
+Individual posts classified into `{genre}`, newest first — unlike the endpoints below, this
+returns the actual post records instead of aggregated audience/spreader stats. Genre membership
+has no stored column, so matches are computed live with `GenreClassifier` against the 1000 most
+recent posts per platform (same live-scan-with-a-cap approach used elsewhere for unbounded
+per-request scans); `totalPosts` reflects matches within that scanned window, not the full
+historical corpus.
+
+| Param      | Type    | Default | Description                                                   |
+|------------|---------|---------|-----------------------------------------------------------------|
+| `platform` | string  | —       | Restrict to one of `x` / `youtube` / `reddit` / `instagram`. `400` on an unrecognized value. |
+| `limit`    | integer | `50`    | Page size, 1–200. `400` outside that range.                    |
+| `offset`   | integer | `0`     | Rows to skip, applied after sorting newest-first.               |
+
+```json
+{
+  "genre": "horror",
+  "limit": 50,
+  "offset": 0,
+  "totalPosts": 214,
+  "scanNote": "classified live against the 1000 most recent posts per platform",
+  "posts": [
+    {
+      "platform": "reddit",
+      "postId": "18f2a91",
+      "author": "janedoe",
+      "content": "This new horror movie had the whole theater screaming...",
+      "permalink": "https://reddit.com/r/movies/comments/18f2a91",
+      "createdAt": "2026-05-15T22:43:00.000+00:00",
+      "sentimentScore": 78.0,
+      "sentimentCategory": "positive",
+      "engagementMetric": 211,
+      "genreScore": 3.0
+    }
+  ]
+}
+```
+
 **`GET /api/marketing/genre/{genre}/potential-viewers`**
 
 Users whose `top_movie_genres[{genre}]` > `1.0`, sorted by predicted conversion probability
@@ -504,6 +543,43 @@ are sorted by `p_conv = sigmoid(affinity_score * influence_rank)`.
 }
 ```
 
+**`GET /api/marketing/party/{party}/posts[?platform=<platform>&limit=<n>&offset=<n>]`**
+
+Individual posts (not aggregated stats) whose `keyword` column matches `{party}`, newest first.
+Reads straight from the four source tables (`x_posts`, `youtube_comments`, `reddit_posts`,
+`instagram_posts`) with the same `keyword ILIKE` case-insensitive match `potential-voters` uses.
+`totalPosts` is the full match count across all platforms, not just the current page.
+
+| Param      | Type    | Default | Description                                                   |
+|------------|---------|---------|-----------------------------------------------------------------|
+| `platform` | string  | —       | Restrict to one of `x` / `youtube` / `reddit` / `instagram`. `400` on an unrecognized value. |
+| `limit`    | integer | `50`    | Page size, 1–200. `400` outside that range.                    |
+| `offset`   | integer | `0`     | Rows to skip, applied after sorting newest-first.               |
+
+```json
+{
+  "party": "DMK",
+  "limit": 50,
+  "offset": 0,
+  "totalPosts": 312,
+  "posts": [
+    {
+      "platform": "x",
+      "postId": "1782934012",
+      "author": "@stalin_official",
+      "content": "DMK's welfare schemes have transformed lives across Tamil Nadu...",
+      "permalink": "https://x.com/stalin_official/status/1782934012",
+      "createdAt": "2026-05-15T22:43:00.000+00:00",
+      "sentimentScore": 82.0,
+      "sentimentCategory": "positive",
+      "likes": 4102,
+      "comments": 318,
+      "views": 182034
+    }
+  ]
+}
+```
+
 **`GET /api/marketing/party/{party}/super-spreaders`**
 
 Top **50** users who posted about `{party}`, ranked by Hawkes α
@@ -568,6 +644,11 @@ Audience and spreaders are renamed `fans` / `superFans`.
 
 Same shape as `/party/{party}/potential-voters` — `voters` is renamed to `fans`,
 `totalVoters` to `totalFans`. All other fields identical.
+
+**`GET /api/marketing/celebrity/{celebrity}/posts[?platform=<platform>&limit=<n>&offset=<n>]`**
+
+Same shape and query params as [`/party/{party}/posts`](#5a-political-marketing-api) — individual
+post records matching the celebrity keyword, newest first, with `party` replaced by `celebrity`.
 
 **`GET /api/marketing/celebrity/{celebrity}/super-fans`**
 
@@ -723,6 +804,43 @@ Sections in the response:
 
 Flat-JSON endpoint for the language-affinity audience of language-tagged movies. The
 `{language}` path parameter is case-insensitive (e.g. `tamil`, `Tamil`, `TAMIL`).
+
+**`GET /api/marketing/language/{language}/posts[?platform=<platform>&limit=<n>&offset=<n>]`**
+
+Individual posts (not aggregated per-user stats) for `MOVIE` entities tagged with `{language}`,
+newest first. Reads straight off the `mentions` table joined to `mention_entities`/
+`managed_entities` — `mentions.content`/`permalink` already hold the post text and link per row,
+so unlike `/users` below this needs no lookup back into the four platform tables or
+`user_identity_link`. `platform` here filters on `mentions.platform` (case-insensitive), which is
+stored uppercase (`X`/`YOUTUBE`/`REDDIT`/`INSTAGRAM`) but accepts either case.
+
+| Param      | Type    | Default | Description                                                   |
+|------------|---------|---------|-----------------------------------------------------------------|
+| `platform` | string  | —       | Restrict to one platform (case-insensitive).                    |
+| `limit`    | integer | `50`    | Page size, 1–200. `400` outside that range.                    |
+| `offset`   | integer | `0`     | Rows to skip, applied after sorting newest-first.               |
+
+```json
+{
+  "language": "Tamil",
+  "limit": 50,
+  "offset": 0,
+  "totalPosts": 148,
+  "posts": [
+    {
+      "platform": "X",
+      "postId": 91423,
+      "author": "@filmy_fan",
+      "content": "Vikram is a masterclass in action filmmaking, Tamil cinema at its best!",
+      "permalink": "https://x.com/filmy_fan/status/91423",
+      "createdAt": "2026-05-15T22:43:00.000+00:00",
+      "sentimentScore": 84.0,
+      "sentimentCategory": "positive",
+      "movie": "Vikram"
+    }
+  ]
+}
+```
 
 **`GET /api/marketing/language/{language}/users`**
 

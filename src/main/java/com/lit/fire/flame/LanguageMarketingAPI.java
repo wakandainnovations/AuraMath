@@ -7,6 +7,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.ArrayList;
@@ -34,6 +35,73 @@ public class LanguageMarketingAPI {
 
     @Autowired private JdbcTemplate jdbc;
     private final Gson gson = new Gson();
+
+    // -------------------------------------------------------------------------
+    // GET /api/marketing/language/{language}/posts
+    //
+    // Individual posts (mentions rows) for MOVIE entities in {language}, newest first.
+    // Unlike /users above, this reads straight off `mentions` — content/permalink are
+    // already stored there per-post, so no join back to the 4 platform tables is needed.
+    // -------------------------------------------------------------------------
+    @GetMapping("/{language}/posts")
+    public ResponseEntity<?> posts(@PathVariable String language,
+                                    @RequestParam(required = false) String platform,
+                                    @RequestParam(defaultValue = "50") int limit,
+                                    @RequestParam(defaultValue = "0") int offset) {
+        if (limit < 1 || limit > 200) {
+            return ResponseEntity.badRequest().body("limit must be between 1 and 200");
+        }
+        boolean hasPlatform = platform != null && !platform.isBlank();
+        String platformClause = hasPlatform ? " AND LOWER(m.platform) = LOWER(?)" : "";
+
+        String countSql =
+            "SELECT COUNT(DISTINCT m.id) FROM mentions m " +
+            "JOIN mention_entities me_j ON me_j.mention_id = m.id " +
+            "JOIN managed_entities me ON me.id = me_j.managed_entity_id " +
+            "WHERE me.type = 'MOVIE' AND me.language ILIKE ?" + platformClause;
+
+        String pageSql =
+            "SELECT DISTINCT m.id, m.platform, m.author, m.content, m.permalink, m.post_date, " +
+            "       m.sentiment_score, m.sentiment_category, me.name AS movie_name " +
+            "FROM mentions m " +
+            "JOIN mention_entities me_j ON me_j.mention_id = m.id " +
+            "JOIN managed_entities me ON me.id = me_j.managed_entity_id " +
+            "WHERE me.type = 'MOVIE' AND me.language ILIKE ?" + platformClause +
+            " ORDER BY m.post_date DESC NULLS LAST LIMIT ? OFFSET ?";
+
+        List<Object> countParams = new ArrayList<>();
+        countParams.add(language);
+        if (hasPlatform) countParams.add(platform);
+        Long total = jdbc.queryForObject(countSql, Long.class, countParams.toArray());
+
+        List<Object> pageParams = new ArrayList<>(countParams);
+        pageParams.add(limit);
+        pageParams.add(offset);
+        List<Map<String, Object>> rows = jdbc.queryForList(pageSql, pageParams.toArray());
+
+        List<Map<String, Object>> posts = new ArrayList<>(rows.size());
+        for (Map<String, Object> row : rows) {
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("platform",          row.get("platform"));
+            entry.put("postId",            row.get("id"));
+            entry.put("author",            row.get("author"));
+            entry.put("content",           row.get("content"));
+            entry.put("permalink",         row.get("permalink"));
+            entry.put("createdAt",         row.get("post_date"));
+            entry.put("sentimentScore",    row.get("sentiment_score"));
+            entry.put("sentimentCategory", row.get("sentiment_category"));
+            entry.put("movie",             row.get("movie_name"));
+            posts.add(entry);
+        }
+
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("language",   language);
+        body.put("limit",      limit);
+        body.put("offset",     offset);
+        body.put("totalPosts", total == null ? 0L : total);
+        body.put("posts",      posts);
+        return ResponseEntity.ok(body);
+    }
 
     // -------------------------------------------------------------------------
     // GET /api/marketing/language/{language}/users

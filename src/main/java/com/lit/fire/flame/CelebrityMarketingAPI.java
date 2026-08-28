@@ -5,6 +5,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.LinkedHashMap;
@@ -48,6 +49,28 @@ public class CelebrityMarketingAPI {
         body.put("scoringModel", "p_conv = 1 / (1 + exp(-(affinity_score * influence_rank)))");
         body.put("totalFans",    fans.size());
         body.put("fans",         fans);
+        return ResponseEntity.ok(body);
+    }
+
+    // GET /api/marketing/celebrity/{celebrity}/posts
+    @GetMapping("/{celebrity}/posts")
+    public ResponseEntity<?> posts(@PathVariable String celebrity,
+                                    @RequestParam(required = false) String platform,
+                                    @RequestParam(defaultValue = "50") int limit,
+                                    @RequestParam(defaultValue = "0") int offset) {
+        if (limit < 1 || limit > 200) {
+            return ResponseEntity.badRequest().body("limit must be between 1 and 200");
+        }
+        Map<String, Object> result = service.postsForKeyword(celebrity, platform, limit, offset);
+        if (result == null) {
+            return ResponseEntity.badRequest().body(
+                    "Unknown platform '" + platform + "'. Must be one of: x, youtube, reddit, instagram");
+        }
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("celebrity", celebrity);
+        body.put("limit",     limit);
+        body.put("offset",    offset);
+        body.putAll(result);
         return ResponseEntity.ok(body);
     }
 

@@ -10,6 +10,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 /**
@@ -112,6 +113,86 @@ public class EntityMarketingService {
             }
         } catch (Exception ignored) {}
         return List.of();
+    }
+
+    // -------------------------------------------------------------------------
+    // Raw posts for a keyword across all 4 platforms (party/celebrity posts endpoints).
+    // Unlike aggregateByUser() below, this returns individual post rows rather than
+    // per-author aggregates. keyword ILIKE ? (no wildcards) matches the same
+    // case-insensitive equality semantics used everywhere else in this class.
+    // -------------------------------------------------------------------------
+    private static final Map<String, String> POST_SELECTS = new LinkedHashMap<>();
+    static {
+        POST_SELECTS.put("x",
+                "SELECT id, author, text AS content, permalink, sentiment_score, sentiment_category, created_at, " +
+                "COALESCE(likes_count, 0) AS likes, COALESCE(comment_count, 0) AS comments, COALESCE(views_count, 0) AS views, " +
+                "'x' AS platform FROM x_posts WHERE keyword ILIKE ?");
+        POST_SELECTS.put("youtube",
+                "SELECT id, author, text AS content, permalink, sentiment_score, sentiment_category, published_at AS created_at, " +
+                "COALESCE(likes_count, 0) AS likes, COALESCE(reply_count, 0) AS comments, 0 AS views, " +
+                "'youtube' AS platform FROM youtube_comments WHERE keyword ILIKE ?");
+        POST_SELECTS.put("reddit",
+                "SELECT id, author, (COALESCE(title, '') || ' ' || COALESCE(text, '')) AS content, permalink, sentiment_score, sentiment_category, created_at, " +
+                "COALESCE(score, 0) AS likes, COALESCE(num_comments, 0) AS comments, 0 AS views, " +
+                "'reddit' AS platform FROM reddit_posts WHERE keyword ILIKE ?");
+        POST_SELECTS.put("instagram",
+                "SELECT id, author, text AS content, permalink, sentiment_score, sentiment_category, timestamp AS created_at, " +
+                "COALESCE(like_count, 0) AS likes, COALESCE(comments_count, 0) AS comments, 0 AS views, " +
+                "'instagram' AS platform FROM instagram_posts WHERE keyword ILIKE ?");
+    }
+
+    /**
+     * Posts across all 4 platforms whose {@code keyword} column matches {@code keyword}
+     * (case-insensitive), newest first. {@code platform} optionally restricts to one of
+     * the short names used elsewhere ({@code x/youtube/reddit/instagram}); an unrecognized
+     * value returns {@code null} so the caller can respond 400. Paginated via limit/offset;
+     * {@code totalPosts} in the result is the full match count, not just the page size.
+     */
+    public Map<String, Object> postsForKeyword(String keyword, String platform, int limit, int offset) {
+        List<String> selects;
+        if (platform == null || platform.isBlank()) {
+            selects = new ArrayList<>(POST_SELECTS.values());
+        } else {
+            String select = POST_SELECTS.get(platform.toLowerCase(Locale.ROOT));
+            if (select == null) {
+                return null;
+            }
+            selects = List.of(select);
+        }
+
+        String union = String.join(" UNION ALL ", selects);
+        Object[] likeParams = selects.stream().map(s -> (Object) keyword).toArray();
+
+        Long total = jdbc.queryForObject("SELECT COUNT(*) FROM (" + union + ") combined", Long.class, likeParams);
+
+        String pageSql = "SELECT * FROM (" + union + ") combined ORDER BY created_at DESC NULLS LAST LIMIT ? OFFSET ?";
+        Object[] pageParams = new Object[likeParams.length + 2];
+        System.arraycopy(likeParams, 0, pageParams, 0, likeParams.length);
+        pageParams[likeParams.length] = limit;
+        pageParams[likeParams.length + 1] = offset;
+        List<Map<String, Object>> rows = jdbc.queryForList(pageSql, pageParams);
+
+        List<Map<String, Object>> posts = new ArrayList<>(rows.size());
+        for (Map<String, Object> row : rows) {
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("platform",          row.get("platform"));
+            entry.put("postId",            row.get("id"));
+            entry.put("author",            row.get("author"));
+            entry.put("content",           row.get("content"));
+            entry.put("permalink",         row.get("permalink"));
+            entry.put("createdAt",         row.get("created_at"));
+            entry.put("sentimentScore",    row.get("sentiment_score"));
+            entry.put("sentimentCategory", row.get("sentiment_category"));
+            entry.put("likes",             row.get("likes"));
+            entry.put("comments",          row.get("comments"));
+            entry.put("views",             row.get("views"));
+            posts.add(entry);
+        }
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("totalPosts", total == null ? 0L : total);
+        result.put("posts", posts);
+        return result;
     }
 
     // -------------------------------------------------------------------------
