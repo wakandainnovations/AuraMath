@@ -1210,13 +1210,25 @@ Top 50 authors for posts matching `{keyword}` in the last 90 days, ranked by
 **Viral Potential Score**:
 
 ```
-VPS = (likes + 3 × comments) × (1 + α)
+VPS = (likes + 3 × comments) × (1 + α) × reach_multiplier
 ```
 
 Engagement count rewards authors whose audience actively reacts (not just passive viewers).
 The `(1 + α)` factor lets Hawkes infectivity boost bursty cascade-starters without zeroing
 out high-engagement organic spreaders whose cadence fits α ≈ 0. Comments are weighted 3×
 likes (more user effort, stronger sharing signal).
+
+`reach_multiplier` folds in raw audience size (`total_views`) on a log scale —
+`1 + log10(1 + views) / 10` — so that among authors with comparable engagement, the one
+actually reaching more people ranks higher (e.g. ~300k views is a ~1.55× boost, not a
+300000× one). It's `1.0` (neutral) for YouTube/Reddit/Instagram authors, since those
+platforms don't track views and shouldn't be penalized for a signal that was never collected.
+
+Authors need at least `top-spreaders.min-posts` matching posts (default 1) **and** a
+strictly positive VPS to be ranked — an author with a single comment and no recorded
+likes/replies (common on `youtube_comments`, where those columns are frequently null) scores
+exactly 0 and is dropped rather than filling out the list when a keyword's qualifying pool is
+thin. Ties break on `total_views` then author name, so results are deterministic.
 
 By default the ranking is computed across all four tracked platforms combined — **X**,
 **YouTube**, **Reddit**, and **Instagram**. Pass `platform` (case-insensitive) to restrict
@@ -1241,8 +1253,9 @@ GET /api/marketing/top-50-spreaders/Coolie?platform=tiktok
 [
   {
     "author": "janedoe",
-    "viral_potential_score": 759.0,
+    "viral_potential_score": 1061.0,
     "alpha": 0.0,
+    "reach_multiplier": 1.398,
     "engagement_count": 759.0,
     "total_likes": 666,
     "total_comments": 31,

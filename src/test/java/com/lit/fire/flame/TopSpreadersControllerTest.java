@@ -54,10 +54,14 @@ public class TopSpreadersControllerTest {
     }
 
     private static Map<String, Object> post(String author, String platform, long likes, long comments) {
+        return post(author, platform, likes, comments, 0L);
+    }
+
+    private static Map<String, Object> post(String author, String platform, long likes, long comments, long views) {
         Map<String, Object> row = new HashMap<>();
         row.put("id", "1");
         row.put("author", author);
-        row.put("views_count", 0L);
+        row.put("views_count", views);
         row.put("likes_count", likes);
         row.put("comment_count", comments);
         row.put("sentiment_score", 60.0);
@@ -153,5 +157,44 @@ public class TopSpreadersControllerTest {
         assertFalse(jdbc.lastSql.contains("FROM youtube_comments"));
         assertFalse(jdbc.lastSql.contains("FROM reddit_posts"));
         assertFalse(jdbc.lastSql.contains("FROM instagram_posts"));
+    }
+
+    @Test
+    public void authorsWithZeroEngagementAreExcludedFromTheRanking() {
+        RecordingJdbcTemplate jdbc = new RecordingJdbcTemplate();
+        // "ghost" has a single qualifying comment but no likes/replies recorded (common for
+        // youtube_comments, where those columns are frequently null and COALESCE'd to 0) — a
+        // score of exactly 0 must not fill out the list when few authors otherwise qualify.
+        jdbc.combinedPostsRows = List.of(
+                post("ghost", "youtube_comments", 0, 0),
+                post("real-spreader", "x_posts", 50, 10));
+        TopSpreadersController controller = newController(jdbc);
+
+        ResponseEntity<?> resp = controller.getTopSpreaders("Coolie", null);
+
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> body = (List<Map<String, Object>>) resp.getBody();
+        assertEquals(1, body.size(), "zero-VPS author must be dropped, not just ranked last");
+        assertEquals("real-spreader", body.get(0).get("author"));
+    }
+
+    @Test
+    public void tiesInViralPotentialScoreBreakOnViewsThenAuthorName() {
+        RecordingJdbcTemplate jdbc = new RecordingJdbcTemplate();
+        // Identical engagement (and thus identical alpha=0 VPS before any reach multiplier
+        // divides them apart) — "zed" has more views so must rank first, deterministically,
+        // rather than depending on HashMap iteration order.
+        jdbc.combinedPostsRows = List.of(
+                post("alice", "reddit_posts", 10, 0, 0),
+                post("zed", "reddit_posts", 10, 0, 100_000));
+        TopSpreadersController controller = newController(jdbc);
+
+        ResponseEntity<?> resp = controller.getTopSpreaders("Coolie", null);
+
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> body = (List<Map<String, Object>>) resp.getBody();
+        assertEquals(2, body.size());
+        assertEquals("zed", body.get(0).get("author"), "higher reach must win an engagement tie");
+        assertEquals("alice", body.get(1).get("author"));
     }
 }

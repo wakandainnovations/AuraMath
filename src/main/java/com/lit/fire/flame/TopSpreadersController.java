@@ -76,15 +76,24 @@ public class TopSpreadersController {
      * Returns the top 50 authors across X, YouTube, Reddit, and Instagram for posts matching
      * {keyword} in the last 90 days, ranked by Viral Potential Score:
      *
-     *   VPS = (likes + 3 × comments) × (1 + α)
+     *   VPS = (likes + 3 × comments) × (1 + α) × reach_multiplier
      *
      * The engagement count rewards authors whose audience actively reacts (not just passive
      * viewers), and the (1 + α) factor lets Hawkes infectivity boost bursty cascade-starters
      * without zeroing out high-engagement organic spreaders whose post cadence fits α ≈ 0.
+     * reach_multiplier folds in raw audience size (views) on a log scale — see scoreAuthor —
+     * so that, among authors with comparable engagement, the one actually reaching more people
+     * ranks higher; it stays neutral (1.0) for platforms that don't track views so those authors
+     * aren't penalized for a signal that was never collected.
      *
      * Comments are weighted 3× likes because they require materially more user effort and
      * correlate more strongly with downstream sharing. Authors need at least
-     * {@code top-spreaders.min-posts} matching posts (default 1) to be ranked.
+     * {@code top-spreaders.min-posts} matching posts (default 1) AND a strictly positive VPS to
+     * be ranked — zero-engagement authors (e.g. a single comment with no likes/replies recorded)
+     * are dropped rather than filling out the list when a keyword's qualifying pool is thin.
+     * Ties (including among excluded zero-score authors, moot now, and any real tie in VPS) break
+     * on total_views then author name, so the result is deterministic rather than depending on
+     * HashMap iteration order.
      *
      * average_sentiment_score is included so the team avoids seeding with high-influence detractors.
      *
@@ -142,11 +151,18 @@ public class TopSpreadersController {
                 .filter(r -> r.get("author") != null)
                 .collect(Collectors.groupingBy(r -> (String) r.get("author")));
 
+        Comparator<Map<String, Object>> byScoreThenReachDesc = Comparator
+                .comparingDouble((Map<String, Object> r) -> (double) r.get("viral_potential_score"))
+                .thenComparingLong(r -> ((Number) r.get("total_views")).longValue())
+                .reversed()
+                .thenComparing(r -> (String) r.get("author"));
+
         List<Map<String, Object>> ranked = postsByAuthor.entrySet().stream()
                 .filter(entry -> entry.getValue().size() >= minPosts)
                 .map(entry -> scoreAuthorSafely(entry.getKey(), entry.getValue()))
                 .filter(Objects::nonNull)
-                .sorted(Comparator.comparingDouble((Map<String, Object> r) -> (double) r.get("viral_potential_score")).reversed())
+                .filter(r -> (double) r.get("viral_potential_score") > 0.0)
+                .sorted(byScoreThenReachDesc)
                 .limit(TOP_N)
                 .collect(Collectors.toList());
 
@@ -248,10 +264,17 @@ public class TopSpreadersController {
 
         double alpha = hawkesIntensityCalculator.estimateParameters(universalPosts.stream()).alpha;
 
+        // Neutral (1.0) when views aren't tracked for this platform, so those authors are never
+        // penalized relative to X authors for a signal that was never collected. When views are
+        // present, a log scale rewards bigger reach without letting one viral outlier's raw view
+        // count swamp the engagement signal (e.g. 300k views -> ~1.55x, not 300000x).
+        double reachMultiplier = totalViews > 0 ? 1.0 + Math.log10(1.0 + totalViews) / 10.0 : 1.0;
+
         Map<String, Object> record = new LinkedHashMap<>();
         record.put("author", author);
-        record.put("viral_potential_score", engagementCount * (1.0 + alpha));
+        record.put("viral_potential_score", engagementCount * (1.0 + alpha) * reachMultiplier);
         record.put("alpha", alpha);
+        record.put("reach_multiplier", reachMultiplier);
         record.put("engagement_count", engagementCount);
         record.put("total_likes", totalLikes);
         record.put("total_comments", totalComments);
