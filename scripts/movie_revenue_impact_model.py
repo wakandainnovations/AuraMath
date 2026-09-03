@@ -278,24 +278,24 @@ def get_connection(args: argparse.Namespace):
     )
 
 
-MOVIES_SQL = """
-    SELECT movie_name, release_date, language, country, genre, genres, directors,
-           budget, revenue, runtime_mins, imdb_rating, rating_10,
-           gdp_usd_billions, inflation_rate_pct,
-           trailer_release_date, teaser_release_date, first_song_release_date,
-           trailer_days_to_release, teaser_days_to_release, song_days_to_release,
-           trailer_views, teaser_views, trailer_comments, teaser_comments,
-           conflict_balance_score, narrative_novelty_score
-    FROM movies_data_collection
-    WHERE revenue >= %(min_revenue)s
-      AND budget > %(min_budget)s
-      AND left(release_date, 4) ~ '^[0-9]{4}$'
-      AND left(release_date, 4)::int > %(min_year)s
-      AND (
-            language = ANY(%(indian_languages)s)
-            OR btrim(country) = 'India'
-          )
-"""
+# Columns the model would like to read. Several of these (`genres`, `imdb_rating`,
+# `conflict_balance_score`, `narrative_novelty_score`) do not exist on the live
+# `movies_data_collection` table today -- load_movies() below queries
+# information_schema.columns at startup and only SELECTs whichever of these
+# actually exist, then backfills the rest as an all-NaN column so every
+# downstream reader (dedupe_movies's _completeness score, build_measurable_features's
+# conflict_balance/narrative_novelty fallbacks, etc.) degrades to "no signal"
+# instead of crashing -- and stays that way automatically if the schema drifts
+# again later, without another hand-fix here.
+WANTED_MOVIE_COLUMNS = [
+    "movie_name", "release_date", "language", "country", "genre", "genres", "directors",
+    "budget", "revenue", "runtime_mins", "imdb_rating", "rating_10",
+    "gdp_usd_billions", "inflation_rate_pct",
+    "trailer_release_date", "teaser_release_date", "first_song_release_date",
+    "trailer_days_to_release", "teaser_days_to_release", "song_days_to_release",
+    "trailer_views", "teaser_views", "trailer_comments", "teaser_comments",
+    "conflict_balance_score", "narrative_novelty_score",
+]
 
 ACTORS_SQL = """
     SELECT actor_name, movie_name, release_date, language, genre, director,
@@ -304,14 +304,54 @@ ACTORS_SQL = """
 """
 
 
-def load_movies(conn, min_year: int, min_budget: int, min_revenue: int) -> pd.DataFrame:
+def fetch_existing_columns(conn, table_name: str) -> set[str]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = %s",
+            (table_name,),
+        )
+        return {row[0] for row in cur.fetchall()}
+
+
+def build_movies_sql(available_cols: list[str], restrict_to_india: bool) -> str:
+    select_cols = ", ".join(available_cols)
+    # `restrict_to_india=False` (the `global`/`all` --market modes) keeps every row
+    # passing the budget/revenue/year floors regardless of language/country --
+    # this is what stops the script from throwing away the ~9,033 usable
+    # non-Indian rows that used to be hard-filtered out here unconditionally.
+    where_market = (
+        "\n      AND (language = ANY(%(indian_languages)s) OR btrim(country) = 'India')"
+        if restrict_to_india else ""
+    )
+    return f"""
+        SELECT {select_cols}
+        FROM movies_data_collection
+        WHERE revenue >= %(min_revenue)s
+          AND budget > %(min_budget)s
+          AND left(release_date, 4) ~ '^[0-9]{{4}}$'
+          AND left(release_date, 4)::int > %(min_year)s{where_market}
+    """
+
+
+def load_movies(conn, min_year: int, min_budget: int, min_revenue: int,
+                 restrict_to_india: bool) -> pd.DataFrame:
+    existing = fetch_existing_columns(conn, "movies_data_collection")
+    available_cols = [c for c in WANTED_MOVIE_COLUMNS if c in existing]
+    missing_cols = [c for c in WANTED_MOVIE_COLUMNS if c not in existing]
+    if missing_cols:
+        print(f"Note: movies_data_collection is missing column(s) {missing_cols}; "
+              f"treating them as always-NaN rather than failing the query.")
+
+    sql = build_movies_sql(available_cols, restrict_to_india)
     df = pd.read_sql(
-        MOVIES_SQL, conn,
+        sql, conn,
         params={
             "min_budget": min_budget, "min_year": min_year, "min_revenue": min_revenue,
             "indian_languages": list(INDIAN_LANGUAGES),
         },
     )
+    for col in missing_cols:
+        df[col] = np.nan
     return df
 
 
@@ -380,13 +420,22 @@ def franchise_stem(name: str) -> str:
 
 
 def primary_genre(genre_value: Optional[str]) -> str:
-    if not genre_value or not str(genre_value).strip():
+    if pd.isna(genre_value) or not str(genre_value).strip():
         return "unknown"
     return str(genre_value).split(",")[0].strip().lower()
 
 
 def is_indian_language_field(language_value) -> bool:
     return bool(language_value) and bool(INDIAN_LANGUAGE_PATTERN.search(str(language_value)))
+
+
+def is_india_market_row(language_value, country_value) -> bool:
+    """Same predicate MOVIES_SQL used to use as a hard row filter -- now used as a
+    per-row market tag instead, so a pooled global/all corpus can tell an Indian
+    release from a non-Indian one without dropping the non-Indian rows."""
+    if is_indian_language_field(language_value):
+        return True
+    return isinstance(country_value, str) and country_value.strip() == "India"
 
 
 def name_tokens(name) -> set[str]:
@@ -651,6 +700,12 @@ NEGATIVE_DIRECTION_FACTORS = {"star_overexposure", "excessive_runtime", "box_off
 
 def build_measurable_features(df: pd.DataFrame, actors_by_movie: dict, actors_by_actor: dict) -> pd.DataFrame:
     feats = pd.DataFrame(index=df.index)
+    # These four raw signals encode an Indian festival/exam/IPL/summer-vacation
+    # calendar; on a pooled global/all corpus, applying them to a Japanese or US
+    # release would be wrong, not just imprecise, so they're masked to NaN (which
+    # percentile_into_band below resolves to the neutral band midpoint) for any
+    # row that isn't an Indian-market release.
+    india_mask = df["market_is_india"] == 1
 
     feats["conflict_balance"] = df["conflict_balance_score"]
     feats["conflict_balance"] = feats["conflict_balance"].fillna((0.25 + 0.35) / 2)
@@ -675,19 +730,19 @@ def build_measurable_features(df: pd.DataFrame, actors_by_movie: dict, actors_by
     feats["first_single_timing"] = percentile_into_band(song_raw, 0.15, 0.25)
     feats["_song_coverage_n"] = song_raw.notna().sum()
 
-    holiday_raw = compute_holiday_window_raw(df)
+    holiday_raw = compute_holiday_window_raw(df).where(india_mask)
     feats["holiday_release_window"] = percentile_into_band(holiday_raw, 0.40, 0.60)
 
     clash_raw = compute_clash_raw(df)
     feats["box_office_clashes"] = percentile_into_band(-clash_raw, -0.35, -0.20)
 
-    exam_raw = compute_exam_season_raw(df)
+    exam_raw = compute_exam_season_raw(df).where(india_mask)
     feats["exam_schedules"] = percentile_into_band(-exam_raw, -0.25, -0.15)
 
-    ipl_raw = compute_ipl_season_raw(df)
+    ipl_raw = compute_ipl_season_raw(df).where(india_mask)
     feats["ipl_sporting_events"] = percentile_into_band(-ipl_raw, -0.20, -0.10)
 
-    summer_raw = compute_summer_window_raw(df)
+    summer_raw = compute_summer_window_raw(df).where(india_mask)
     feats["summer_vacation_window"] = percentile_into_band(summer_raw, 0.25, 0.35)
 
     return feats
@@ -697,11 +752,18 @@ def build_measurable_features(df: pd.DataFrame, actors_by_movie: dict, actors_by
 # Full feature assembly
 # ---------------------------------------------------------------------------
 
-def assemble_features(df: pd.DataFrame, actors: pd.DataFrame) -> pd.DataFrame:
+def assemble_features(df: pd.DataFrame, actors: pd.DataFrame, apply_india_filter: bool = True) -> pd.DataFrame:
     df = df.copy()
     df["ln_revenue"] = np.log(df["revenue"].astype(float))
     df["primary_genre"] = df["genre"].map(primary_genre)
     df["primary_genre"] = df["primary_genre"].where(df["primary_genre"] != "unknown", df["genres"].map(primary_genre))
+
+    # Per-row market tag (not gated by apply_india_filter -- it's needed on both
+    # the india-only and pooled corpora): used both as a model feature so a pooled
+    # model can learn market-specific baselines, and to gate the India-specific
+    # calendar heuristics in build_measurable_features below.
+    df["market_is_india"] = df.apply(
+        lambda r: 1 if is_india_market_row(r.get("language"), r.get("country")) else 0, axis=1)
 
     stems = df["movie_name"].map(franchise_stem)
     stem_counts = stems.value_counts()
@@ -741,7 +803,13 @@ def assemble_features(df: pd.DataFrame, actors: pd.DataFrame) -> pd.DataFrame:
     df["director_resolved"] = df.apply(lambda r: lookup_director(r["movie_name"], r["release_year"]) or r["directors"], axis=1)
     df["director_key"] = df["director_resolved"].fillna("").str.strip().str.lower().replace("", np.nan)
 
-    df = filter_non_indian_productions(df, actors)
+    if apply_india_filter:
+        # Only meaningful (and only run) when this row set was already restricted
+        # to the Indian market at the SQL level (--market india) -- it drops rows
+        # that matched only via the country='India' fallback but have no
+        # Indian-language directing credit. On a pooled global/all corpus this
+        # would wrongly discard genuine non-Indian productions, so it's skipped.
+        df = filter_non_indian_productions(df, actors)
 
     df["r_director"] = compute_historical_anchor(df, "director_key")
     df["r_concept"] = compute_historical_anchor(df, "primary_genre")
@@ -777,6 +845,13 @@ def prepare_model_frame(df: pd.DataFrame) -> pd.DataFrame:
 
 def feature_columns(df: pd.DataFrame) -> list[str]:
     cols = list(BASELINE_ANCHOR_COLS)
+    # Not folded into BASELINE_ANCHOR_COLS: those feed the Y = B0 * prod(1+delta_i)
+    # formula's B0 term specifically, and market shouldn't change that formula's
+    # meaning. It's still part of every direct predictive model's feature set
+    # (compare_models/fit_predictive_model), which is what lets a pooled model
+    # learn market-specific baselines.
+    if "market_is_india" in df.columns:
+        cols.append("market_is_india")
     for key in MEASURABLE_KEYS:
         c = delta_regressor_col(key)
         if c in df.columns:
@@ -899,6 +974,8 @@ def cross_validated_predictions_for(df: pd.DataFrame, cols: list[str], model_nam
 
 
 def compare_models(df: pd.DataFrame, cols: list[str]) -> dict:
+    if len(df) < CV_FOLDS * 2:
+        return {"error": f"insufficient rows for {CV_FOLDS}-fold CV: n={len(df)}"}
     results = {}
     for name in MODEL_FACTORIES:
         pred_log = cross_validated_predictions_for(df, cols, name)
@@ -909,6 +986,9 @@ def compare_models(df: pd.DataFrame, cols: list[str]) -> dict:
 
 def print_model_comparison(results: dict) -> None:
     print("\n-- Direct revenue-prediction model comparison (5-fold out-of-fold) --")
+    if "error" in results:
+        print(f"  skipped: {results['error']}")
+        return
     print(f"  {'model':16s} {'median |%err|':>14s} {'within 20%':>13s} {'within 30%':>13s} {'within 50%':>13s}")
     for name, s in results.items():
         n = s["n_movies"]
@@ -916,6 +996,55 @@ def print_model_comparison(results: dict) -> None:
               f"{s['within_20pct']['n_correct']:>5d}/{n:<5d} ({s['within_20pct']['pct_correct']:>5.1f}%) "
               f"{s['within_30pct']['n_correct']:>5d}/{n:<5d} "
               f"{s['within_50pct']['n_correct']:>5d}/{n:<5d}")
+
+
+# ---------------------------------------------------------------------------
+# Feature 0 (4): india-only-as-today vs. pooled-global vs. per-market comparison
+# ---------------------------------------------------------------------------
+# Runs unconditionally on every invocation, independent of --market, so the
+# effect of Feature 0's fix (pooling in the ~9,033 non-Indian rows the script
+# used to hard-drop) is always visible in output/model_comparison.json's diff --
+# not just when a particular --market flag happens to be passed for the rest
+# of the pipeline.
+
+def run_market_comparison(movies_raw_all: pd.DataFrame, actors: pd.DataFrame) -> dict:
+    print("\nRunning india-only / pooled-global / per-market model comparison (Feature 0)...")
+
+    india_mask_raw = movies_raw_all.apply(
+        lambda r: is_india_market_row(r.get("language"), r.get("country")), axis=1)
+    india_raw = movies_raw_all[india_mask_raw].reset_index(drop=True)
+
+    def run_one(raw: pd.DataFrame, apply_india_filter: bool) -> dict:
+        deduped = dedupe_movies(raw)
+        assembled = assemble_features(deduped, actors, apply_india_filter=apply_india_filter)
+        model_df = prepare_model_frame(assembled)
+        cols = feature_columns(model_df)
+        return compare_models(model_df, cols)
+
+    # (a) India-only, exactly today's pipeline (SQL-level India restriction +
+    # the director-based filter_non_indian_productions pass) -- the fixed
+    # baseline every other number in this comparison is measured against.
+    per_market_india = run_one(india_raw, apply_india_filter=True)
+
+    # (b) Every market pooled together, with the market_is_india feature letting
+    # the model learn a market-specific baseline instead of assuming India and
+    # the US behave the same.
+    pooled_deduped = dedupe_movies(movies_raw_all)
+    pooled_assembled = assemble_features(pooled_deduped, actors, apply_india_filter=False)
+    pooled_model_df = prepare_model_frame(pooled_assembled)
+    pooled_cols = feature_columns(pooled_model_df)
+    pooled_global = compare_models(pooled_model_df, pooled_cols)
+
+    # (c) Two fully separate per-market models, split from the same pooled data
+    # so (b) and (c) are directly comparable on identical rows/features.
+    other_split = pooled_model_df[pooled_model_df["market_is_india"] == 0]
+    per_market_other = compare_models(other_split, pooled_cols)
+
+    return {
+        "pooled_global": pooled_global,
+        "per_market_india": per_market_india,
+        "per_market_other": per_market_other,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1304,6 +1433,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min-budget", type=int, default=MIN_BUDGET_USD)
     p.add_argument("--min-revenue", type=int, default=MIN_REVENUE_USD)
     p.add_argument("--output-dir", default="./output")
+    p.add_argument("--market", choices=["india", "global", "all"], default="all",
+                    help="Row set for the primary training pipeline (bootstrap calibration, "
+                         "factor table, single-model report, movie_revenue_predictions.csv): "
+                         "'india' replicates the historical Indian-only-market filtering; "
+                         "'global'/'all' pool every market (same behavior for both) with a "
+                         "market_is_india feature. The india-only-vs-pooled-global-vs-"
+                         "per-market model comparison in model_comparison.json always runs "
+                         "regardless of this flag.")
     p.add_argument("--use-llm", action="store_true", help="Ask AuraLLM (Claude) for qualitative commentary on prior-only factors")
     return p.parse_args()
 
@@ -1314,18 +1451,32 @@ def main() -> None:
     print(f"Connecting to postgresql://{args.db_user}@{args.db_host}:{args.db_port}/{args.db_name} ...")
     conn = get_connection(args)
     try:
-        movies_raw = load_movies(conn, args.min_year, args.min_budget, args.min_revenue)
+        # Always load every market at the SQL level (restrict_to_india=False) --
+        # the india-only row set (for --market india, and for the fixed baseline
+        # half of the market comparison below) is derived from this in Python via
+        # is_india_market_row, rather than round-tripping the DB a second time.
+        movies_raw_all = load_movies(conn, args.min_year, args.min_budget, args.min_revenue,
+                                      restrict_to_india=False)
         actors_raw = load_actor_credits(conn)
     finally:
         conn.close()
-    print(f"Loaded {len(movies_raw)} raw movie rows, {len(actors_raw)} actor-credit rows.")
-
-    movies = dedupe_movies(movies_raw)
-    print(f"Deduped to {len(movies)} distinct (movie, release year) entities.")
+    print(f"Loaded {len(movies_raw_all)} raw movie rows (all markets), {len(actors_raw)} actor-credit rows.")
 
     actors = build_actor_features(actors_raw)
 
-    full = assemble_features(movies, actors)
+    if args.market == "india":
+        india_mask_raw = movies_raw_all.apply(
+            lambda r: is_india_market_row(r.get("language"), r.get("country")), axis=1)
+        primary_raw = movies_raw_all[india_mask_raw].reset_index(drop=True)
+        apply_india_filter = True
+    else:
+        primary_raw = movies_raw_all
+        apply_india_filter = False
+
+    movies = dedupe_movies(primary_raw)
+    print(f"Deduped to {len(movies)} distinct (movie, release year) entities (--market {args.market}).")
+
+    full = assemble_features(movies, actors, apply_india_filter=apply_india_filter)
     model_df = prepare_model_frame(full)
 
     train, test = time_based_split(model_df)
@@ -1348,6 +1499,17 @@ def main() -> None:
     print("\nComparing direct revenue-prediction models (Ridge / GBR / HistGBR / MLP neural net)...")
     model_comparison = compare_models(model_df, cols)
     print_model_comparison(model_comparison)
+
+    # Feature 0 (4): india-only-as-today vs. pooled-global vs. per-market, always
+    # computed and written under new keys so the improvement (or lack of it) from
+    # pooling markets is visible in model_comparison.json's diff every run,
+    # regardless of what --market was passed for the primary pipeline above.
+    market_comparison = run_market_comparison(movies_raw_all, actors)
+    model_comparison.update(market_comparison)
+    print("\n-- India-only (today) vs. pooled-global vs. per-market comparison --")
+    for label in ("per_market_india", "pooled_global", "per_market_other"):
+        print(f"\n[{label}]")
+        print_model_comparison(market_comparison[label])
 
     print("\nCalibrating factor min/max via MLP neural-net partial dependence, "
           "then reconstructing revenue via Y = B0 * prod(1 + delta_i)...")
