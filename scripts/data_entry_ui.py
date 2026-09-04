@@ -15,6 +15,13 @@ never entered directly -- they're recomputed on save from the two dates
 (release_date minus trailer/teaser/first_song release date), so they can
 never drift out of sync with what you actually typed in.
 
+Scoped to India-market rows only (an India-only model is the current goal --
+see chat), using the exact same predicate `movie_revenue_impact_model.py`'s
+`--market india` flag uses (`is_india_market_row`: an Indian-language value,
+OR `country == 'India'`) -- not a separately-invented definition, so what
+gets filled in here is exactly the row set the India-only model will
+actually train on.
+
 Requirements
 ------------
     pip install flask psycopg2-binary
@@ -41,11 +48,19 @@ import psycopg2.extras
 from flask import Flask, redirect, render_template_string, request, url_for
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from movie_revenue_impact_model import parse_release_date  # noqa: E402 -- reuse the model's own date parser
+from movie_revenue_impact_model import INDIAN_LANGUAGES, parse_release_date  # noqa: E402
 
 app = Flask(__name__)
 DB_ARGS: dict = {}
 PAGE_SIZE = 50
+
+# Same predicate as is_india_market_row() in movie_revenue_impact_model.py
+# (Indian-language value, OR country == 'India'), expressed as SQL so
+# COUNT/ORDER BY/LIMIT all run at the DB level instead of pulling 393k+ rows
+# into Python to filter -- built from the shared INDIAN_LANGUAGES set rather
+# than a second hand-maintained list, so the two can't drift apart.
+INDIA_MARKET_SQL = "(language ~* %s OR country = 'India')"
+INDIA_MARKET_PARAM = r"\y(" + "|".join(sorted(INDIAN_LANGUAGES)) + r")\y"
 
 # ---------------------------------------------------------------------------
 # Field catalogue -- every one of these is read by movie_revenue_impact_model.py
@@ -136,7 +151,7 @@ def movie_completeness(row: dict) -> tuple[int, int]:
 # ---------------------------------------------------------------------------
 
 LIST_TEMPLATE = """
-<!doctype html><html><head><title>Movie data entry</title>
+<!doctype html><html><head><title>Indian movie data entry</title>
 <style>
  body { font-family: -apple-system, Helvetica, Arial, sans-serif; margin: 2rem; color: #1a1a1a; background: #fafafa; }
  h1 { font-size: 1.3rem; }
@@ -155,7 +170,7 @@ LIST_TEMPLATE = """
  .pager a { margin-right: 12px; }
  .badge { font-size: 0.75rem; color: #888; }
 </style></head><body>
-<h1>Movie data entry ({{ total }} movies, ordered latest &rarr; oldest)</h1>
+<h1>Indian movie data entry ({{ total }} India-market movies, ordered latest &rarr; oldest)</h1>
 <div class="controls">
   <form method="get">
     <input type="text" name="q" placeholder="Search movie name..." value="{{ q }}">
@@ -288,8 +303,8 @@ def list_movies():
     incomplete = request.args.get("incomplete") == "1"
     page = max(0, int(request.args.get("page", 0) or 0))
 
-    where = []
-    params: list = []
+    where = [INDIA_MARKET_SQL]
+    params: list = [INDIA_MARKET_PARAM]
     if q:
         where.append("movie_name ILIKE %s")
         params.append(f"%{q}%")
