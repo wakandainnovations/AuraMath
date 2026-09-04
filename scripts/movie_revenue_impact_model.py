@@ -11,6 +11,15 @@ business team supplied (Categories 1-7).
 Requirements
 ------------
     pip install pandas numpy scikit-learn psycopg2-binary scipy
+    pip install xgboost lightgbm catboost shap joblib
+
+The second line (Feature 8) is optional-but-recommended: xgboost/lightgbm/
+catboost extend the model comparison beyond sklearn's own GBR/HistGBR/MLP,
+and shap powers the per-factor/per-movie explanation step. Each of the four
+is imported defensively -- a missing one is skipped with a printed warning
+rather than crashing the whole run, so `compare_models()` and the SHAP step
+still work (with a smaller candidate set / a documented partial-dependence
+fallback) on a host that hasn't installed them yet.
 
 Usage
 -----
@@ -56,15 +65,17 @@ import json
 import os
 import re
 import sys
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Callable, Optional
 
+import joblib
 import numpy as np
 import pandas as pd
 import psycopg2
 import psycopg2.extras
 from sklearn.ensemble import (
     GradientBoostingClassifier, GradientBoostingRegressor, HistGradientBoostingRegressor,
+    StackingRegressor,
 )
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import (
@@ -73,6 +84,35 @@ from sklearn.metrics import (
 from sklearn.model_selection import KFold
 from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler
+
+# Feature 8: xgboost/lightgbm/catboost/shap are new, heavier optional
+# dependencies, unlike everything above -- imported defensively so a host
+# that hasn't run `pip install xgboost lightgbm catboost shap` yet still gets
+# a working (smaller) model comparison and a graceful SHAP fallback instead
+# of an import-time crash. `_OPTIONAL_DEPENDENCY_IMPORT_ERRORS` is surfaced
+# in main()'s startup log so a missing package is a visible warning, not a
+# silently smaller candidate set.
+_OPTIONAL_DEPENDENCY_IMPORT_ERRORS: dict[str, str] = {}
+try:
+    from xgboost import XGBRegressor
+except ImportError as _exc:  # pragma: no cover -- exercised only when xgboost isn't installed
+    XGBRegressor = None
+    _OPTIONAL_DEPENDENCY_IMPORT_ERRORS["xgboost"] = str(_exc)
+try:
+    from lightgbm import LGBMRegressor
+except ImportError as _exc:  # pragma: no cover
+    LGBMRegressor = None
+    _OPTIONAL_DEPENDENCY_IMPORT_ERRORS["lightgbm"] = str(_exc)
+try:
+    from catboost import CatBoostRegressor
+except ImportError as _exc:  # pragma: no cover
+    CatBoostRegressor = None
+    _OPTIONAL_DEPENDENCY_IMPORT_ERRORS["catboost"] = str(_exc)
+try:
+    import shap
+except ImportError as _exc:  # pragma: no cover
+    shap = None
+    _OPTIONAL_DEPENDENCY_IMPORT_ERRORS["shap"] = str(_exc)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from connectors.schema import movie_entity_key  # noqa: E402
@@ -1566,13 +1606,29 @@ def fit_predictive_model(train: pd.DataFrame, test: pd.DataFrame, cols: list[str
 # ---------------------------------------------------------------------------
 # Multi-model comparison, including a neural network (MLPRegressor)
 # ---------------------------------------------------------------------------
-# On ~1,400 rows and ~19 features a neural net is not guaranteed to beat a tree
-# ensemble -- MLPs generally want much more data than tabular gradient boosting
-# does to earn their extra flexibility. So this fits several candidates with the
-# identical out-of-fold protocol and lets the accuracy numbers pick the winner,
-# rather than assuming the neural net is "the accurate way" a priori.
+# On ~1,436 India-only rows and ~19 features, MLPRegressor is the *worst* of
+# the four sklearn-only candidates tried (37.7% within 50% of actual revenue,
+# median abs % error 66.4%), behind GradientBoostingRegressor (49.4%/51.1%,
+# the winner), HistGradientBoostingRegressor (49.2%/50.7%), and Ridge
+# (46.1%/54.4%) -- see output/model_comparison.json. That's a normal outcome
+# for a small-n, mostly-numeric tabular problem: tree ensembles generally win
+# there, and NNs need either much more data or structure trees can't exploit
+# (learned entity embeddings, not just more depth on the current
+# one-hot/target-encoded architecture) to earn an edge. Feature 8 (this
+# block) adds three more tree-based candidates -- xgboost/lightgbm/catboost
+# are the de facto standard for exactly this problem shape and routinely beat
+# sklearn's own GBR/HistGBR -- rather than tuning the MLP further. Once
+# Feature 0 grows the corpus to ~11k pooled rows and Features 5/6/7 add more
+# categorical/relational structure (director, lead actor, genre, language),
+# revisit with a small Keras/PyTorch MLP that *embeds* those high-cardinality
+# categoricals as learned low-dimensional vectors instead of one-hot/target-
+# encoding them -- that is the specific place NNs tend to earn an edge over
+# trees on this kind of data, not a re-run of today's architecture on more
+# rows. So this fits every candidate with the identical out-of-fold protocol
+# and lets the accuracy numbers pick the winner, rather than assuming any one
+# model (neural net included) is "the accurate way" a priori.
 
-MODEL_FACTORIES = {
+MODEL_FACTORIES: dict[str, Callable[[], object]] = {
     "ridge": lambda: Ridge(alpha=RIDGE_ALPHA, random_state=RNG_SEED),
     "gbr": lambda: GradientBoostingRegressor(n_estimators=300, max_depth=3, learning_rate=0.05, random_state=RNG_SEED),
     "hist_gbr": lambda: HistGradientBoostingRegressor(max_iter=300, max_depth=4, learning_rate=0.05, random_state=RNG_SEED),
@@ -1580,17 +1636,43 @@ MODEL_FACTORIES = {
         hidden_layer_sizes=(64, 32), activation="relu", alpha=1e-2, learning_rate_init=1e-3,
         early_stopping=True, n_iter_no_change=20, max_iter=2000, random_state=RNG_SEED),
 }
+# Feature 8: xgboost/lightgbm/catboost, added conditionally on the defensive
+# imports above -- a host missing one of these still runs the comparison
+# with a smaller candidate set instead of crashing at import time. CatBoost
+# in particular handles high-cardinality categoricals (director, lead actor,
+# genre, language) natively, worth trying as Features 5/6/7 add more of them.
+if XGBRegressor is not None:
+    MODEL_FACTORIES["xgboost"] = lambda: XGBRegressor(
+        n_estimators=300, max_depth=4, learning_rate=0.05, random_state=RNG_SEED,
+        objective="reg:squarederror", verbosity=0)
+if LGBMRegressor is not None:
+    MODEL_FACTORIES["lightgbm"] = lambda: LGBMRegressor(
+        n_estimators=300, max_depth=4, learning_rate=0.05, random_state=RNG_SEED, verbosity=-1)
+if CatBoostRegressor is not None:
+    MODEL_FACTORIES["catboost"] = lambda: CatBoostRegressor(
+        iterations=300, depth=4, learning_rate=0.05, random_seed=RNG_SEED, verbose=False)
 
 
-def cross_validated_predictions_for(df: pd.DataFrame, cols: list[str], model_name: str,
-                                     n_splits: int = CV_FOLDS,
-                                     sample_weight: Optional[pd.Series] = None) -> pd.Series:
-    """Same out-of-fold protocol as cross_validated_predictions, generalized to any model
-    in MODEL_FACTORIES. Standardizing inputs is required for Ridge/MLP and harmless for
-    the tree models, so all four candidates run through one uniform pipeline.
-    `sample_weight` (Feature 4's inverse-probability weights) is passed to
-    `.fit()` when the model supports it; MLPRegressor doesn't, so it silently
-    falls back to an unweighted fit for that one model rather than crashing."""
+def build_stacking_regressor(base_names: list[str]) -> StackingRegressor:
+    """A `sklearn.ensemble.StackingRegressor` over `base_names` (expected to be
+    the empirically-best 2-3 entries in MODEL_FACTORIES per this run's
+    compare_models() results, picked by compare_stacking_ensemble() below),
+    with a Ridge final estimator -- a small, interpretable meta-learner over
+    a handful of already-decent base predictions, not another black box."""
+    estimators = [(name, MODEL_FACTORIES[name]()) for name in base_names]
+    return StackingRegressor(estimators=estimators, final_estimator=Ridge(alpha=RIDGE_ALPHA, random_state=RNG_SEED))
+
+
+def cross_validated_predictions_for_model(df: pd.DataFrame, cols: list[str],
+                                           model_factory: Callable[[], object], n_splits: int = CV_FOLDS,
+                                           sample_weight: Optional[pd.Series] = None) -> pd.Series:
+    """Same out-of-fold protocol as cross_validated_predictions_for, generalized
+    to any zero-arg model factory rather than just a MODEL_FACTORIES lookup by
+    name -- lets compare_stacking_ensemble() reuse this for a StackingRegressor
+    built fresh per outer fold (each fold's stack does its own internal CV to
+    build meta-features, per sklearn's own StackingRegressor.fit; this outer
+    loop is what keeps the *reported* accuracy honestly out-of-fold on top of
+    that, same as every other candidate here)."""
     X = df[cols].fillna(0).values
     y = df["ln_revenue"].values
     w = sample_weight.reindex(df.index).values if sample_weight is not None else None
@@ -1600,13 +1682,25 @@ def cross_validated_predictions_for(df: pd.DataFrame, cols: list[str], model_nam
         scaler = StandardScaler()
         Xtr = scaler.fit_transform(X[train_idx])
         Xte = scaler.transform(X[test_idx])
-        model = MODEL_FACTORIES[model_name]()
+        model = model_factory()
         try:
             model.fit(Xtr, y[train_idx], sample_weight=w[train_idx] if w is not None else None)
         except TypeError:
             model.fit(Xtr, y[train_idx])
         pred[test_idx] = model.predict(Xte)
     return pd.Series(pred, index=df.index)
+
+
+def cross_validated_predictions_for(df: pd.DataFrame, cols: list[str], model_name: str,
+                                     n_splits: int = CV_FOLDS,
+                                     sample_weight: Optional[pd.Series] = None) -> pd.Series:
+    """Same out-of-fold protocol as cross_validated_predictions, generalized to any model
+    in MODEL_FACTORIES. Standardizing inputs is required for Ridge/MLP and harmless for
+    the tree models, so every candidate runs through one uniform pipeline.
+    `sample_weight` (Feature 4's inverse-probability weights) is passed to
+    `.fit()` when the model supports it; MLPRegressor doesn't, so it silently
+    falls back to an unweighted fit for that one model rather than crashing."""
+    return cross_validated_predictions_for_model(df, cols, MODEL_FACTORIES[model_name], n_splits, sample_weight)
 
 
 def compare_models(df: pd.DataFrame, cols: list[str]) -> dict:
@@ -1618,6 +1712,47 @@ def compare_models(df: pd.DataFrame, cols: list[str]) -> dict:
         _, summary = evaluate_full_corpus_accuracy(df, pred_log)
         results[name] = summary
     return results
+
+
+def pick_champion_model(results: dict) -> Optional[str]:
+    """Lowest median |% error| among compare_models()'s (or compare_models()
+    plus a registered stacking_ensemble entry's) valid candidates -- the same
+    metric print_model_comparison() leads with. Returns None if every
+    candidate errored (e.g. compare_models()'s own insufficient-rows guard)."""
+    valid = {name: s for name, s in results.items()
+             if isinstance(s, dict) and "error" not in s and "median_abs_pct_error" in s}
+    if not valid:
+        return None
+    return min(valid, key=lambda n: valid[n]["median_abs_pct_error"])
+
+
+def compare_stacking_ensemble(df: pd.DataFrame, cols: list[str], base_results: dict,
+                               sample_weight: Optional[pd.Series] = None, top_k: int = 3) -> dict:
+    """Ranks compare_models()'s base candidates by median |% error|, builds a
+    StackingRegressor over the top `top_k` (default 3, per the plan's "best
+    2-3 base models"), evaluates it with the identical out-of-fold protocol,
+    and reports whether it beats the single best base model on the same
+    metric -- "usually a small free win once base models exist," per the
+    plan, not assumed to help without checking."""
+    ranked = sorted(
+        ((name, s) for name, s in base_results.items()
+         if isinstance(s, dict) and "error" not in s and "median_abs_pct_error" in s),
+        key=lambda kv: kv[1]["median_abs_pct_error"],
+    )
+    if len(ranked) < 2:
+        return {"skipped": f"fewer than 2 valid base models ({len(ranked)})"}
+    base_names = [name for name, _ in ranked[:top_k]]
+    best_base_name, best_base_summary = ranked[0]
+
+    pred_log = cross_validated_predictions_for_model(
+        df, cols, lambda: build_stacking_regressor(base_names), sample_weight=sample_weight)
+    _, summary = evaluate_full_corpus_accuracy(df, pred_log)
+    beats_best = summary["median_abs_pct_error"] < best_base_summary["median_abs_pct_error"]
+    return {
+        "base_models_used": base_names, "summary": summary,
+        "best_base_model": best_base_name, "best_base_median_abs_pct_error": best_base_summary["median_abs_pct_error"],
+        "beats_best_base_model": beats_best,
+    }
 
 
 def print_model_comparison(results: dict) -> None:
@@ -1632,6 +1767,145 @@ def print_model_comparison(results: dict) -> None:
               f"{s['within_20pct']['n_correct']:>5d}/{n:<5d} ({s['within_20pct']['pct_correct']:>5.1f}%) "
               f"{s['within_30pct']['n_correct']:>5d}/{n:<5d} "
               f"{s['within_50pct']['n_correct']:>5d}/{n:<5d}")
+
+
+def print_stacking_result(stacking_result: dict) -> None:
+    print("\n-- Stacking ensemble over the top base models --")
+    if "skipped" in stacking_result:
+        print(f"  skipped: {stacking_result['skipped']}")
+        return
+    s = stacking_result["summary"]
+    n = s["n_movies"]
+    print(f"  base models: {stacking_result['base_models_used']}")
+    print(f"  stacking_ensemble  {s['median_abs_pct_error']:>13.1f}% "
+          f"{s['within_20pct']['n_correct']:>5d}/{n:<5d} ({s['within_20pct']['pct_correct']:>5.1f}%) "
+          f"{s['within_30pct']['n_correct']:>5d}/{n:<5d} "
+          f"{s['within_50pct']['n_correct']:>5d}/{n:<5d}")
+    verdict = "beats" if stacking_result["beats_best_base_model"] else "does NOT beat"
+    print(f"  stacking {verdict} the best single base model "
+          f"({stacking_result['best_base_model']}, {stacking_result['best_base_median_abs_pct_error']:.1f}%)")
+
+
+# ---------------------------------------------------------------------------
+# Feature 8: champion full-corpus fit, SHAP explanations, model persistence
+# ---------------------------------------------------------------------------
+# Once compare_models() (+ the stacking check above) has picked a winner by
+# out-of-fold accuracy, everything below fits that ONE model exactly once on
+# every disclosed-revenue row (not a CV fold -- that's what makes this the
+# artifact worth persisting/serving, as opposed to the many per-fold models
+# fit purely to measure accuracy above) and explains it with SHAP.
+
+def fit_champion_on_full_corpus(model_factory: Callable[[], object], df: pd.DataFrame, cols: list[str],
+                                 sample_weight: Optional[pd.Series] = None) -> tuple[StandardScaler, object]:
+    """The "do one final fit on all available labeled rows" step the plan asks
+    for once a champion is chosen -- every other fit in this script (compare_models,
+    bootstrap_calibration, time_based_split's train/test) exists to measure
+    accuracy honestly, not to produce the model that actually gets served.
+    Takes a zero-arg factory (not a MODEL_FACTORIES name) so a winning
+    stacking_ensemble can be fit here without mutating the module-level
+    MODEL_FACTORIES registry -- same reasoning as
+    cross_validated_predictions_for_model's split from cross_validated_predictions_for."""
+    X = df[cols].fillna(0).values
+    y = df["ln_revenue"].values
+    scaler = StandardScaler()
+    Xs = scaler.fit_transform(X)
+    w = sample_weight.reindex(df.index).values if sample_weight is not None else None
+    model = model_factory()
+    try:
+        model.fit(Xs, y, sample_weight=w)
+    except TypeError:
+        model.fit(Xs, y)
+    return scaler, model
+
+
+# Tree-based candidates get shap.TreeExplainer (fast, exact); everything else
+# (Ridge, MLPRegressor, StackingRegressor) falls back to shap.Explainer's
+# generic model-agnostic path, so any champion -- including one added later --
+# gets *some* SHAP explanation rather than requiring a new special case here.
+_SHAP_TREE_MODEL_NAMES = {"gbr", "hist_gbr", "xgboost", "lightgbm", "catboost"}
+# Generic SHAP explanation is O(background_size) model calls per row; capping
+# the background sample keeps a several-thousand-row corpus tractable for the
+# non-tree fallback path (TreeExplainer doesn't need a background sample at all).
+_SHAP_GENERIC_BACKGROUND_SIZE = 100
+
+
+def compute_shap_values(model_name: str, model: object, scaler: StandardScaler,
+                         df: pd.DataFrame, cols: list[str]) -> np.ndarray:
+    """Model-agnostic SHAP explanation for whichever model compare_models()
+    (or compare_stacking_ensemble()) picked as champion -- the standard,
+    model-agnostic replacement for compute_factor_effects()'s single-model
+    (MLP-only) partial-dependence sweep, per the plan. Raises if the `shap`
+    package isn't installed or the explainer itself fails; callers wrap this
+    in a try/except and fall back to the existing partial-dependence-only
+    reporting (compute_factor_effects stays wired for exactly that, as the
+    plan asks -- "a documented fallback for estimators SHAP doesn't cleanly
+    support")."""
+    if shap is None:
+        raise RuntimeError(
+            f"shap not installed ({_OPTIONAL_DEPENDENCY_IMPORT_ERRORS.get('shap')}); "
+            "run `pip install shap` to enable SHAP-based factor explanations.")
+    X = df[cols].fillna(0).values
+    Xs = scaler.transform(X)
+    if model_name in _SHAP_TREE_MODEL_NAMES:
+        explainer = shap.TreeExplainer(model)
+        shap_values = explainer.shap_values(Xs)
+    else:
+        n_background = min(_SHAP_GENERIC_BACKGROUND_SIZE, len(Xs))
+        background = shap.sample(Xs, n_background, random_state=RNG_SEED) if len(Xs) > n_background else Xs
+        explainer = shap.Explainer(model.predict, background)
+        shap_values = explainer(Xs).values
+    return np.asarray(shap_values)
+
+
+def _shap_col_label(col: str) -> str:
+    """ln1p_<factor_key> -> factor_key (matches delta_regressor_col's own
+    convention); every other column (baseline anchors, market_is_india) is
+    reported under its own feature-column name -- there's no factor_key for
+    those, they're not factor_definitions-registry rows."""
+    prefix = "ln1p_"
+    return col[len(prefix):] if col.startswith(prefix) else col
+
+
+def summarize_shap(shap_values: np.ndarray, cols: list[str]) -> dict[str, float]:
+    """Corpus-wide mean(|SHAP|) per factor_key/feature -- what
+    factor_impact_scores' new `mean_abs_shap` column reports alongside the
+    existing calibrated_min/calibrated_max band, per the plan."""
+    mean_abs = np.abs(shap_values).mean(axis=0)
+    return {_shap_col_label(col): float(val) for col, val in zip(cols, mean_abs)}
+
+
+def top_shap_drivers_per_row(shap_values: np.ndarray, cols: list[str], k: int = 5) -> list[list[dict]]:
+    """Per-movie top-k |SHAP| drivers with sign, e.g. [{"factor": "r_star",
+    "shap_value": 0.42}, ...] -- what makes a served prediction able to answer
+    "why", not just "how much" (stored alongside movie_revenue_predictions.csv
+    for Feature 10 to persist once that table exists)."""
+    labels = [_shap_col_label(c) for c in cols]
+    k = min(k, len(cols))
+    drivers = []
+    for row in shap_values:
+        order = np.argsort(-np.abs(row))[:k]
+        drivers.append([{"factor": labels[i], "shap_value": round(float(row[i]), 5)} for i in order])
+    return drivers
+
+
+def persist_model_artifact(model_name: str, model: object, scaler: StandardScaler, cols: list[str],
+                            factor_keys_used: list[str], n_training_rows: int, models_dir: str) -> Optional[str]:
+    """joblib.dump the champion model bundle to models/revenue_model_{version}.joblib
+    -- until this, every model in compare_models() was fit fresh inside a CV
+    loop and discarded, so nothing survived past a single run. This artifact
+    is what Feature 9's single-movie prediction and Feature 10's serving are
+    both meant to load; training happens once per scheduled run, inference
+    happens on demand without retraining."""
+    os.makedirs(models_dir, exist_ok=True)
+    model_version = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    path = os.path.join(models_dir, f"revenue_model_{model_version}.joblib")
+    joblib.dump({
+        "model": model, "scaler": scaler, "feature_columns": cols,
+        "factor_keys_used": factor_keys_used, "model_name": model_name,
+        "trained_at": datetime.now(timezone.utc).isoformat(),
+        "n_training_rows": n_training_rows,
+    }, path)
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -2021,7 +2295,19 @@ def fit_effect_model(train: pd.DataFrame, cols: list[str], model_name: str = "ml
 
 
 def compute_factor_effects(scaler: StandardScaler, model, train: pd.DataFrame, cols: list[str]) -> dict:
-    """For each measurable factor, sweep its feature from the literature stated_min to
+    """Feature 8: this partial-dependence sweep now feeds the formula-reconstruction
+    pipeline (build_nn_calibrated_factor_table/formula_reconstruction_oof) only --
+    the standalone "how much did each factor move the outcome" question is
+    answered by SHAP instead (compute_shap_values/summarize_shap, computed on
+    top of compare_models()'s actual champion, not a fixed MLP), per the plan:
+    "keep compute_factor_effects's partial-dependence method only as a
+    documented fallback for estimators SHAP doesn't cleanly support." It stays
+    MLP-only here because the formula pipeline's Y = B0 * prod(1+delta_i)
+    reconstruction specifically wants a single consistent nonlinear model's
+    swing-from-stated-min-to-max reading across every CV fold, which is a
+    different question from "explain the champion's actual predictions."
+
+    For each measurable factor, sweep its feature from the literature stated_min to
     stated_max -- holding every other feature at each row's actual value, i.e. a proper
     partial-dependence average -- and read the model's average predicted swing in
     ln(revenue). That swing, per unit of the swept range, is the model's own learned
@@ -2421,6 +2707,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min-budget", type=int, default=MIN_BUDGET_USD)
     p.add_argument("--min-revenue", type=int, default=MIN_REVENUE_USD)
     p.add_argument("--output-dir", default="./output")
+    p.add_argument("--models-dir", default="./models",
+                    help="Feature 8: where the champion model artifact "
+                         "(revenue_model_{version}.joblib) is written after the final "
+                         "full-corpus fit (default ./models).")
+    p.add_argument("--skip-shap", action="store_true",
+                    help="Skip Feature 8's SHAP explanation step (still fits and persists the "
+                         "champion model) -- useful for a fast dev-iteration run, since SHAP on "
+                         "a non-tree champion can be slow on a large corpus.")
     p.add_argument("--market", choices=["india", "global", "all"], default="all",
                     help="Row set for the primary training pipeline (bootstrap calibration, "
                          "factor table, single-model report, movie_revenue_predictions.csv): "
@@ -2450,6 +2744,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+
+    if _OPTIONAL_DEPENDENCY_IMPORT_ERRORS:
+        missing = ", ".join(sorted(_OPTIONAL_DEPENDENCY_IMPORT_ERRORS))
+        print(f"Warning: optional Feature 8 dependencies not installed ({missing}); "
+              f"`pip install {missing}` for the full model comparison / SHAP explanations. "
+              f"Continuing with a smaller candidate set / partial-dependence-only fallback.")
 
     print(f"Connecting to postgresql://{args.db_user}@{args.db_host}:{args.db_port}/{args.db_name} ...")
     conn = get_connection(args)
@@ -2599,9 +2899,34 @@ def main() -> None:
             n_iters=args.confidence_bootstrap_iters)
     write_prediction_outputs(predictions, accuracy_summary, args.output_dir)
 
-    print("\nComparing direct revenue-prediction models (Ridge / GBR / HistGBR / MLP neural net)...")
+    print(f"\nComparing direct revenue-prediction models ({', '.join(MODEL_FACTORIES)})...")
     model_comparison = compare_models(model_df, cols)
     print_model_comparison(model_comparison)
+    # Feature 8: snapshot before the non-model keys below get mixed into
+    # model_comparison -- compare_stacking_ensemble()/pick_champion_model()
+    # both need the pure {model_name: summary} shape compare_models() returns.
+    base_model_results = dict(model_comparison)
+
+    print("\nFitting a stacking ensemble over the top base models (Feature 8)...")
+    stacking_result = compare_stacking_ensemble(model_df, cols, base_model_results, sample_weight=sample_weight)
+    print_stacking_result(stacking_result)
+    model_comparison["stacking_ensemble"] = stacking_result
+
+    # Feature 8: champion = whichever candidate -- including the stacking
+    # ensemble above, if it actually won -- has the lowest out-of-fold median
+    # |% error|. `champion_factories` is a local name->factory lookup (a copy
+    # of MODEL_FACTORIES plus, conditionally, stacking_ensemble) rather than
+    # mutating the module-level MODEL_FACTORIES registry, so a repeated
+    # in-process call to main() (or a test) never leaks a stale
+    # stacking_ensemble entry into a later compare_models() run.
+    champion_results = dict(base_model_results)
+    champion_factories = dict(MODEL_FACTORIES)
+    if "summary" in stacking_result:
+        champion_factories["stacking_ensemble"] = (
+            lambda bn=stacking_result["base_models_used"]: build_stacking_regressor(bn))
+        champion_results["stacking_ensemble"] = stacking_result["summary"]
+    champion_name = pick_champion_model(champion_results)
+
     # Feature 2: record the exact factor_key list this run trained on, so a
     # future model_comparison_history row (Feature 11) can answer "did adding
     # factor X actually help" empirically -- added after printing so it
@@ -2615,6 +2940,65 @@ def main() -> None:
         k: v for k, v in disclosure_result.items() if k != "disclosure_likelihood"
     }
     model_comparison["ipw_comparison"] = ipw_comparison
+
+    # Feature 8: fit the champion exactly once on every disclosed-revenue row
+    # (not a CV fold), explain it with SHAP, and persist it as a joblib
+    # artifact -- until now every model in this script was fit fresh inside a
+    # CV loop and discarded. shap_factor_importances/shap_top_drivers_by_row
+    # stay empty (not an error) if SHAP is unavailable/fails or --skip-shap
+    # is passed; compute_factor_effects's MLP partial-dependence calibration
+    # below is unaffected either way, per the plan's documented-fallback note.
+    shap_factor_importances: dict[str, float] = {}
+    shap_top_drivers_by_row: Optional[list[list[dict]]] = None
+    if champion_name is None:
+        print("\nWarning: no valid champion model (compare_models() found insufficient rows); "
+              "skipping the full-corpus fit, SHAP explanations, and model-artifact persistence.")
+    else:
+        print(f"\nChampion model (lowest median |% err| across {len(champion_results)} "
+              f"candidates, Feature 8): {champion_name}")
+        champion_scaler, champion_model = fit_champion_on_full_corpus(
+            champion_factories[champion_name], model_df, cols, sample_weight=sample_weight)
+
+        if args.skip_shap:
+            print("Skipping SHAP explanation step (--skip-shap).")
+        else:
+            try:
+                shap_values = compute_shap_values(champion_name, champion_model, champion_scaler, model_df, cols)
+                shap_factor_importances = summarize_shap(shap_values, cols)
+                shap_top_drivers_by_row = top_shap_drivers_per_row(shap_values, cols)
+                print(f"Computed SHAP explanations for {len(model_df)} rows via champion model {champion_name}.")
+            except Exception as exc:  # noqa: BLE001 -- SHAP is additive reporting, never fatal to this run
+                print(f"Warning: SHAP computation failed/unavailable ({exc}); factor_impact_scores "
+                      f"will omit mean_abs_shap, falling back to the existing MLP partial-dependence "
+                      f"calibration only.")
+
+        model_artifact_path = persist_model_artifact(
+            champion_name, champion_model, champion_scaler, cols, factor_keys_used,
+            n_training_rows=len(model_df), models_dir=args.models_dir)
+        print(f"Persisted champion model artifact ({champion_name}, n={len(model_df)} rows) to "
+              f"{model_artifact_path}.")
+        model_comparison["champion_model"] = {
+            "model_name": champion_name, "model_artifact_path": model_artifact_path,
+            "n_training_rows": len(model_df),
+        }
+
+    if shap_factor_importances:
+        # Merge mean_abs_shap into the already-written factor_impact_scores
+        # output alongside the existing calibrated_min/calibrated_max band,
+        # per the plan -- re-writing is cheap and keeps write_outputs() as
+        # the single place that shapes factor_impact_scores.json/.csv.
+        for row in factor_table:
+            row["mean_abs_shap"] = shap_factor_importances.get(row["key"])
+        write_outputs(factor_table, baseline, model_metrics, args.output_dir)
+    if shap_top_drivers_by_row is not None:
+        # Store each prediction's top-5 SHAP drivers alongside it in
+        # movie_revenue_predictions.csv -- what Feature 10's serving persists
+        # to the movie_revenue_predictions table once that exists, so a
+        # served prediction can answer "why", not just "how much".
+        shap_drivers_series = pd.Series(
+            [json.dumps(d) for d in shap_top_drivers_by_row], index=model_df.index, name="top_shap_drivers")
+        predictions = predictions.join(shap_drivers_series, how="left")
+        write_prediction_outputs(predictions, accuracy_summary, args.output_dir)
 
     # Feature 0 (4): india-only-as-today vs. pooled-global vs. per-market, always
     # computed and written under new keys so the improvement (or lack of it) from
