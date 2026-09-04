@@ -36,14 +36,17 @@ plus ln(budget) and the baseline anchors (R_star, R_director, R_concept,
 franchise/R_IP), and (c) bootstraps that regression to get a calibrated
 min/max for every factor that has real signal in the data. Of the 80 factors
 described with a stated range, this schema supports direct measurement for
-12 (see MEASURABLE below) plus the four baseline anchors. The remaining ~68
-(mostly VFX/BGM/controversy/legal/distribution factors — categories 3, 6, 7
-in particular) have no corresponding column anywhere in this database; for
-those the script is explicit that it is reporting the literature-supplied
-prior band unmodified, tagged `source="prior_literature"`, rather than
-fabricating a fitted number from a signal that does not exist. That gap is
-consistent with the brief's own note that unlisted/unmeasured factors
-contribute a real 10-25% of variance this model cannot attribute.
+12 today (`status='active'` rows in the live `factor_definitions` registry --
+Feature 2, see scripts/registry/) plus the four baseline anchors. The
+remaining ~68 (mostly VFX/BGM/controversy/legal/distribution factors —
+categories 3, 6, 7 in particular) have no corresponding column anywhere in
+this database; for those the script is explicit that it is reporting the
+literature-supplied prior band unmodified, tagged `source="prior_literature"`,
+rather than fabricating a fitted number from a signal that does not exist.
+That gap is consistent with the brief's own note that unlisted/unmeasured
+factors contribute a real 10-25% of variance this model cannot attribute --
+and it is closeable over time without touching this script, by registering a
+new factor via `scripts/register_factor.py` once real data backs it.
 """
 
 from __future__ import annotations
@@ -53,7 +56,6 @@ import json
 import os
 import re
 import sys
-from dataclasses import dataclass, field
 from datetime import date
 from typing import Callable, Optional
 
@@ -66,6 +68,12 @@ from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error,
 from sklearn.model_selection import KFold
 from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from connectors.schema import movie_entity_key  # noqa: E402
+from registry.schema import (  # noqa: E402
+    ensure_factor_registry_schema, fetch_factor_definitions, fetch_movie_factor_values,
+)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -125,146 +133,33 @@ RNG_SEED = 42
 ACCURACY_THRESHOLDS = (0.20, 0.30, 0.50)
 CV_FOLDS = 5
 
+# Feature 2 coverage guard: a candidate/active factor only feeds the trained
+# model once its non-null coverage on the current run's rows clears this
+# threshold (percent, not fraction) -- keeps a brand-new sparsely-populated
+# factor from being force-fit into every run before enough data exists for it
+# to mean anything, while it's still visible in the coverage report from day
+# one. Overridable via --min-feature-coverage.
+DEFAULT_MIN_FEATURE_COVERAGE_PCT = 5.0
 
-# ---------------------------------------------------------------------------
-# Factor catalogue - every factor the business team gave a stated impact
-# range for (80 of the 90 numbered slots; the ungiven category-1 slots
-# 3/5/6/7/8/9/10/12/13/14 have no stated range and are intentionally omitted
-# rather than invented).
-# ---------------------------------------------------------------------------
-
-@dataclass
-class Factor:
-    id: int
-    key: str
-    name: str
-    category: str
-    direction: str            # Positive | Negative | Bidirectional
-    stated_min: float
-    stated_max: float
-    measurable: bool
-    proxy_note: str
-    proxy_col: Optional[str] = None  # populated at build time for measurable factors
-
-
-FACTOR_CATALOG: list[Factor] = [
-    # --- Category 1: Narrative Architecture & Screenplay Engineering -----
-    Factor(1, "conflict_balance", "Protagonist-Antagonist Conflict Balance", "Narrative", "Positive", 0.25, 0.35, True,
-           "movies_data_collection.conflict_balance_score (ConflictBalanceService, corpus-relative synopsis sentiment balance)"),
-    Factor(2, "narrative_novelty", "High-Concept Narrative Novelty", "Narrative", "Positive", 0.30, 0.45, True,
-           "movies_data_collection.narrative_novelty_score (NarrativeNoveltyService, embedding-distance percentile)"),
-    Factor(4, "genre_template_adherence", "Genre Template Adherence vs. Subversion", "Narrative", "Bidirectional", -0.20, 0.20, False,
-           "No genre-adherence score in schema; would require a subversion-detection model over synopsis text"),
-    Factor(11, "romantic_track_integration", "Romantic Track Integration", "Narrative", "Bidirectional", -0.15, 0.15, False,
-           "No subplot-quality signal available"),
-    Factor(15, "twist_effectiveness", "Twist Effectiveness and Unpredictability", "Narrative", "Positive", 0.20, 0.30, False,
-           "No third-act / twist annotation in schema"),
-
-    # --- Category 2: Cast Capital, Persona Alignment, Controversies ------
-    Factor(16, "persona_fit", "Star-to-Character Persona Fit", "Cast", "Bidirectional", -0.40, 0.40, False, "No persona/role-alignment signal"),
-    Factor(17, "fanbase_mobilization", "Core Fanbase Mobilization Value", "Cast", "Positive", 0.30, 0.50, False,
-           "Related to baseline R_star (role_position + actor popularity) but reported separately as a baseline anchor, not double-counted here"),
-    Factor(18, "lead_chemistry", "Lead Actor Screen Chemistry", "Cast", "Positive", 0.20, 0.35, False, "No pairing/chemistry signal"),
-    Factor(19, "support_cast_credibility", "Support Cast Performance Credibility", "Cast", "Positive", 0.15, 0.25, False, "No supporting-cast quality signal"),
-    Factor(20, "director_brand_equity", "Directorial Brand Equity", "Cast", "Positive", 0.25, 0.40, False,
-           "Captured as baseline anchor R_director, reported separately to avoid double-counting"),
-    Factor(21, "anti_hero_appeal", "Anti-Hero Appeal and Moral Ambiguity", "Cast", "Positive", 0.20, 0.30, False, "No character-morality annotation"),
-    Factor(22, "actor_controversy", "Off-Screen Actor Controversy", "Cast", "Bidirectional", -0.35, 0.35, False, "No controversy/news-event feed"),
-    Factor(23, "star_overexposure", "Star Satiation and Screen Overexposure", "Cast", "Negative", -0.25, -0.15, True,
-           "actors_data_collection: count of a movie's lead/support actors' OTHER releases in the trailing 12 months"),
-    Factor(24, "event_speech_impact", "Off-Script Event Speech Impact", "Cast", "Bidirectional", -0.15, 0.15, False, "No promotional-event transcript data"),
-    Factor(25, "actor_vulnerability", "Lead Actor Vulnerability and Range", "Cast", "Positive", 0.15, 0.25, False, "No performance-range signal"),
-    Factor(26, "multi_generational_appeal", "Multi-Generational Appeal of the Star", "Cast", "Positive", 0.25, 0.35, False, "No demographic-reach signal"),
-    Factor(27, "miscasting", "Miscasting and Role Incongruence", "Cast", "Negative", -0.35, -0.20, False, "No casting-fit signal"),
-    Factor(28, "nostalgic_reunion", "Nostalgic Screen Reunions", "Cast", "Positive", 0.20, 0.30, False, "No reliable prior-pairing-gap detector at this data quality"),
-    Factor(29, "political_dialogue", "Star Political Aspirations / Dialogue Placement", "Cast", "Bidirectional", -0.20, 0.20, False, "No dialogue-content data"),
-    Factor(30, "cameo_appearances", "Cameo Appearances of Iconic Stars", "Cast", "Positive", 0.15, 0.25, False, "role_position doesn't distinguish cameo billing"),
-
-    # --- Category 3: Production Scale, Visual Assets, Technical Logistics -
-    Factor(31, "vfx_quality", "Technical Quality of Visual Effects (VFX)", "Production", "Bidirectional", -0.30, 0.30, False, "No VFX rating column"),
-    Factor(32, "sound_design", "Immersive Sound Design and Mixing", "Production", "Positive", 0.10, 0.20, False, "No sound-design rating"),
-    Factor(33, "action_choreography", "Action Sequence Choreography Innovation", "Production", "Positive", 0.20, 0.35, False, "No choreography rating"),
-    Factor(34, "bgm_impact", "Background Score (BGM) Impact", "Production", "Positive", 0.25, 0.40, False, "No score/BGM rating"),
-    Factor(35, "production_design_scale", "Production Design and Architectural Scale", "Production", "Positive", 0.20, 0.30, False, "No art-direction rating"),
-    Factor(36, "cinematography", "Realistic Color Grading and Cinematography", "Production", "Positive", 0.10, 0.20, False, "No cinematography rating"),
-    Factor(37, "excessive_runtime", "Excessive Runtime and Editing Lag", "Production", "Negative", -0.30, -0.15, True,
-           "movies_data_collection.runtime_mins, penalty scaling in for runtimes above 160 minutes"),
-    Factor(38, "editing_pacing", "Dynamic Editing and Transition Pacing", "Production", "Positive", 0.10, 0.15, False, "No editing-pace rating"),
-    Factor(39, "period_authenticity", "Authenticity of Period / Cultural Setting", "Production", "Positive", 0.15, 0.25, False, "No period-setting flag"),
-    Factor(40, "budget_scale_efficiency", "Budget-to-Scale Efficiency", "Production", "Bidirectional", -0.20, 0.20, True,
-           "budget percentile within (primary genre, release year) peer group -- lean-budget films score toward the positive end"),
-    Factor(41, "flashback_animation", "Use of Animation for Complex Flashbacks", "Production", "Positive", 0.10, 0.15, False, "No animation-usage flag"),
-    Factor(42, "intrusive_song_placement", "Excessive and Intrusive Song Placements", "Production", "Negative", -0.25, -0.15, False, "No scene-level song-placement data"),
-    Factor(43, "location_novelty", "Location Novelty and Aesthetic Variety", "Production", "Positive", 0.10, 0.15, False, "No filming-location data"),
-    Factor(44, "practical_vs_green_screen", "Live Action over Heavy Green-Screen", "Production", "Positive", 0.15, 0.25, False, "No production-technique flag"),
-    Factor(45, "graphic_violence", "Overuse of Graphic / Gratuitous Violence", "Production", "Bidirectional", -0.15, 0.15, False, "No content-intensity rating"),
-
-    # --- Category 4: Pre-Release Marketing and Promotional Levers --------
-    Factor(46, "trailer_teaser_impact", "Teaser and Trailer Impact", "Marketing", "Positive", 0.35, 0.50, True,
-           "movies_data_collection.trailer_days_to_release timed against the -15%/+25% thresholds in the brief, scaled by trailer_views/comments"),
-    Factor(47, "first_single_timing", "Timing of First Single Release", "Marketing", "Positive", 0.15, 0.25, True,
-           "movies_data_collection.song_days_to_release; 6-8 week lead-up window scored as optimal"),
-    Factor(48, "brand_extension_naming", "Use of Brand Extensions / Sequel Names", "Marketing", "Bidirectional", -0.30, 0.30, False,
-           "Franchise detection is captured as baseline anchor R_IP; not separately calibrated here to avoid double-counting"),
-    Factor(49, "viral_audio_trends", "Viral Music and Social Media Audio Trends", "Marketing", "Positive", 0.20, 0.35, False, "No social-audio virality feed"),
-    Factor(50, "promotional_controversy", "Pre-Release Promotional Controversies", "Marketing", "Bidirectional", -0.15, 0.15, False, "No controversy feed"),
-    Factor(51, "on_ground_events", "Star Attendance at On-Ground Events", "Marketing", "Positive", 0.10, 0.20, False, "No event-attendance data"),
-    Factor(52, "micro_video_campaigns", "Micro-Video Social Media Campaigns", "Marketing", "Positive", 0.15, 0.25, False, "No campaign-spend/reach data"),
-    Factor(53, "influencer_promotion", "Influencer-Driven Promotions", "Marketing", "Positive", 0.10, 0.15, False, "No influencer-campaign data"),
-    Factor(54, "misleading_trailer", "Misleading Trailer Marketing", "Marketing", "Negative", -0.40, -0.25, False, "No trailer-content-vs-film-tone comparison"),
-    Factor(55, "bts_promo_content", "High-Definition Promo / BTS Content", "Marketing", "Positive", 0.10, 0.15, False, "No BTS content metadata"),
-    Factor(56, "countdown_posters", "Strategic Use of Countdown Posters", "Marketing", "Positive", 0.05, 0.10, False, "No poster-campaign data"),
-    Factor(57, "oversaturated_marketing", "Excessive / Over-Saturated Marketing", "Marketing", "Negative", -0.15, -0.10, False, "No marketing-spend/frequency data"),
-    Factor(58, "brand_partnerships", "Cross-Promotion and Brand Partnerships", "Marketing", "Positive", 0.10, 0.20, False, "No brand-tie-in data"),
-    Factor(59, "dynamic_ticket_pricing", "Dynamic Pre-Release Ticket Pricing", "Marketing", "Bidirectional", -0.15, 0.15, False, "No ticket-pricing data"),
-    Factor(60, "global_promo_tours", "Global Promotional Tours", "Marketing", "Positive", 0.15, 0.25, False, "No tour/appearance schedule data"),
-
-    # --- Category 5: Temporal Scheduling, Holiday Windows, Market Dynamics
-    Factor(61, "holiday_release_window", "Holiday Release Windows", "Timing", "Positive", 0.40, 0.60, True,
-           "release_date scored against an approximate Indian festive-calendar window table"),
-    Factor(62, "box_office_clashes", "Direct Box Office Clashes", "Timing", "Negative", -0.35, -0.20, True,
-           "count of other same-language releases within +/-3 days in movies_data_collection"),
-    Factor(63, "exam_schedules", "Student Examination Schedules", "Timing", "Negative", -0.25, -0.15, True,
-           "release month falls in the Feb-Apr Indian board-exam season"),
-    Factor(64, "political_events", "Political Events and Elections", "Timing", "Negative", -0.40, -0.20, False,
-           "No per-state election-calendar table; national-only election-year flag was judged too coarse to calibrate reliably"),
-    Factor(65, "ipl_sporting_events", "Major Sporting Events (e.g., IPL)", "Timing", "Negative", -0.20, -0.10, True,
-           "release month falls in the Mar-May IPL season"),
-    Factor(66, "summer_vacation_window", "Academic Summer Vacation Windows", "Timing", "Positive", 0.25, 0.35, True,
-           "release month falls in the Apr-Jun summer-vacation window"),
-    Factor(67, "extreme_weather", "Extreme Weather Conditions", "Timing", "Negative", -0.15, -0.10, False, "No weather data joined to release date/region"),
-    Factor(68, "ott_window_strategy", "Theatrical Window / OTT Release Strategy", "Timing", "Bidirectional", -0.20, 0.20, False, "No OTT-release-date column"),
-    Factor(69, "post_clash_spillover", "Post-Clash Spillover Audience", "Timing", "Positive", 0.10, 0.15, False, "No screen-sellout/spillover data"),
-    Factor(70, "re_release_nostalgia", "Re-Release Timing and Nostalgia", "Timing", "Positive", 0.10, 0.20, False, "No re-release flag distinguishable from original release"),
-
-    # --- Category 6: Legal, Administrative, and Censorship Barriers ------
-    Factor(71, "cbfc_rating", "CBFC Rating Classifications (U vs. UA/A)", "Legal", "Bidirectional", -0.30, 0.30, False, "No certification column"),
-    Factor(72, "state_bans", "Multi-State Political / Cultural Bans", "Legal", "Negative", -0.50, -0.30, False, "No ban/restriction data"),
-    Factor(73, "pre_release_leak", "High-Definition Pre-Release Leak", "Legal", "Negative", -0.80, -0.60, False, "No piracy/leak-event data"),
-    Factor(74, "title_ownership_disputes", "Legal Disputes over Title Ownership", "Legal", "Negative", -0.25, -0.15, False, "No litigation data"),
-    Factor(75, "copyright_claims", "Copyright Claims on Visuals / Audio", "Legal", "Negative", -0.35, -0.20, False, "No litigation data"),
-    Factor(76, "tax_exemptions", "Regional Entertainment Tax Exemptions", "Legal", "Positive", 0.15, 0.30, False, "No state-tax-policy data"),
-    Factor(77, "distribution_disputes", "Inter-State Distribution Disputes", "Legal", "Negative", -0.30, -0.15, False, "No distributor-relationship data"),
-    Factor(78, "plagiarism_remake_rights", "Plagiarism Allegations and Remake Laws", "Legal", "Bidirectional", -0.15, 0.15, False, "No plagiarism/remake-rights data"),
-    Factor(79, "name_similarity_disputes", "Real-Life Personality Name Similarities", "Legal", "Negative", -0.20, -0.10, False, "No name-collision data"),
-    Factor(80, "certification_delays", "Administrative Delays in Certifications", "Legal", "Negative", -0.40, -0.20, False, "No certification-timeline data"),
-
-    # --- Category 7: Financial Controls and Distribution Models ----------
-    Factor(81, "kdm_lockout", "Digital Key Delivery Message (KDM) Lockout", "Financial", "Negative", -0.60, -0.40, False, "No KDM/delivery-status data"),
-    Factor(82, "minimum_guarantee_deals", "Minimum Guarantee (MG) Distribution", "Financial", "Positive", 0.20, 0.35, False, "No deal-structure data"),
-    Factor(83, "outright_purchase_sales", "Outright Purchase Territorial Sales", "Financial", "Positive", 0.15, 0.25, False, "No deal-structure data"),
-    Factor(84, "high_interest_financing", "High Interest Rates on Film Finance", "Financial", "Negative", -0.30, -0.15, False, "No financing-terms data"),
-    Factor(85, "multiplex_revenue_splits", "Multiplex Revenue Share Splits", "Financial", "Bidirectional", -0.20, 0.20, False,
-           "distributor_share_usd exists but is a post-hoc revenue decomposition, not a pre-release input; using it as a predictor would leak the target"),
-    Factor(86, "subtitle_dubbing_quality", "Global Subtitle / Dubbing Quality", "Financial", "Positive", 0.15, 0.25, False, "No localization-quality rating"),
-    Factor(87, "screen_count_allocation", "Screen Count Allocation and Show Pacing", "Financial", "Positive", 0.25, 0.40, False, "No screen-count data"),
-    Factor(88, "pa_commitments", "Print & Advertising (P&A) Commitments", "Financial", "Positive", 0.20, 0.30, False, "No P&A-budget data"),
-    Factor(89, "joint_production_partnerships", "Joint Production Partnerships", "Financial", "Positive", 0.15, 0.25, False,
-           "production_companies exists but co-production vs. sole-production quality signal is unreliable at this data quality"),
-    Factor(90, "producer_debt_solvency", "Producer Debt and Studio Solvency", "Financial", "Negative", -0.45, -0.25, False, "No studio-financials data"),
-]
-
-MEASURABLE_KEYS = [f.key for f in FACTOR_CATALOG if f.measurable]
+# India-only calendar heuristics (Feature 0): applying an Indian festival/
+# exam/IPL/summer-vacation window to a Japanese or US release would be wrong,
+# not just imprecise, so these four derived_python_fn factors are masked to
+# NaN outside the Indian market regardless of what the registry row says.
+INDIA_ONLY_CALENDAR_FACTOR_KEYS = {
+    "holiday_release_window", "exam_schedules", "ipl_sporting_events", "summer_vacation_window",
+}
+# Feature 2 note: the 80-entry business-supplied factor catalogue (categories
+# Narrative/Cast/Production/Marketing/Timing/Legal/Financial, each with a
+# stated min/max impact range) used to be a hardcoded `FACTOR_CATALOG` list
+# right here. It has been replaced by the live `factor_definitions` Postgres
+# table (see scripts/registry/schema.py) -- the direct answer to "let me add
+# more parameters in the future without touching the code": register a new
+# factor via `scripts/register_factor.py` or `POST /api/admin/factor-definitions`
+# and the next run picks it up automatically, no script edit required. The
+# original catalogue data is preserved verbatim in
+# scripts/registry/seed_catalog.py, which `migrate_factor_definitions.py` uses
+# to seed the table once. `load_factor_registry()` below loads it into the
+# module-level `FACTOR_DEFS`/`FACTOR_BY_KEY` globals at the start of every run.
 
 
 # ---------------------------------------------------------------------------
@@ -278,15 +173,54 @@ def get_connection(args: argparse.Namespace):
     )
 
 
+# ---------------------------------------------------------------------------
+# Factor registry (Feature 2) -- loaded once per run into these module-level
+# globals, read by every downstream feature-assembly/reporting function
+# instead of the old hardcoded FACTOR_CATALOG list. See registry/schema.py
+# and registry/seed_catalog.py.
+# ---------------------------------------------------------------------------
+
+FACTOR_DEFS: list[dict] = []
+FACTOR_BY_KEY: dict[str, dict] = {}
+
+
+def load_factor_registry(conn) -> list[dict]:
+    """Populates FACTOR_DEFS/FACTOR_BY_KEY from the live factor_definitions
+    table. Call once near the start of a run (main() does this right after
+    connecting), before assemble_features/feature_columns/prepare_model_frame
+    or any of the factor-effect/calibration functions are used -- they all
+    read these globals rather than taking the registry as a parameter, to
+    avoid threading it through every function signature in a script this
+    size."""
+    global FACTOR_DEFS, FACTOR_BY_KEY
+    ensure_factor_registry_schema(conn)
+    FACTOR_DEFS = fetch_factor_definitions(conn)
+    FACTOR_BY_KEY = {f["factor_key"]: f for f in FACTOR_DEFS}
+    if not FACTOR_DEFS:
+        print("Warning: factor_definitions is empty -- run migrate_factor_definitions.py "
+              "first to seed the 80-entry catalogue. Proceeding with baseline-anchors-only "
+              "features (ln_budget_effective, r_star, r_director, r_concept, franchise_flag).")
+    return FACTOR_DEFS
+
+
+def load_eav_lookup(conn) -> dict[str, dict[str, float]]:
+    """{factor_key: {movie_key: value_numeric}} for every candidate/active
+    factor whose computation_type is 'eav' -- the movie_factor_values-backed
+    factors. Requires load_factor_registry() to have run first."""
+    eav_keys = [f["factor_key"] for f in FACTOR_DEFS
+                if f.get("computation_type") == "eav" and f["status"] in ("active", "candidate")]
+    return fetch_movie_factor_values(conn, eav_keys)
+
+
 # Columns the model would like to read. Several of these (`genres`, `imdb_rating`,
 # `conflict_balance_score`, `narrative_novelty_score`) do not exist on the live
 # `movies_data_collection` table today -- load_movies() below queries
 # information_schema.columns at startup and only SELECTs whichever of these
 # actually exist, then backfills the rest as an all-NaN column so every
-# downstream reader (dedupe_movies's _completeness score, build_measurable_features's
-# conflict_balance/narrative_novelty fallbacks, etc.) degrades to "no signal"
-# instead of crashing -- and stays that way automatically if the schema drifts
-# again later, without another hand-fix here.
+# downstream reader (dedupe_movies's _completeness score, compute_registry_features's
+# conflict_balance/narrative_novelty raw_column fallbacks, etc.) degrades to
+# "no signal" instead of crashing -- and stays that way automatically if the
+# schema drifts again later, without another hand-fix here.
 WANTED_MOVIE_COLUMNS = [
     "movie_name", "release_date", "language", "country", "genre", "genres", "directors",
     "budget", "revenue", "runtime_mins", "imdb_rating", "rating_10",
@@ -691,68 +625,152 @@ def compute_summer_window_raw(df: pd.DataFrame) -> pd.Series:
     return month.isin(SUMMER_VACATION_MONTHS).where(month.notna()).astype(float)
 
 
-# Direction note: for Negative-direction factors the raw signal must be flipped
-# before banding so that "more severity" maps toward stated_min (the more
-# negative bound), not stated_max.
-NEGATIVE_DIRECTION_FACTORS = {"star_overexposure", "excessive_runtime", "box_office_clashes",
-                              "exam_schedules", "ipl_sporting_events"}
+# Feature 2: registry-driven factor resolution. Each entry is a raw-signal
+# function keyed by `derivation_ref` (matched against factor_definitions rows
+# with computation_type='derived_python_fn') -- this is where the raw compute
+# logic above (compute_holiday_window_raw etc.) plugs in "by name instead of
+# hardcoded into build_measurable_features", per the plan. Every function
+# here has the same (df, actors_by_movie, actors_by_actor) -> raw pd.Series
+# signature so resolve_factor_raw_and_banded can call any of them uniformly;
+# the raw signal is pre-negation, pre-band -- direction-based sign flip and
+# stated_min/max banding happen once, generically, in the resolver below.
+DERIVED_FACTOR_FNS: dict[str, Callable[[pd.DataFrame, dict, dict], pd.Series]] = {
+    "star_overexposure": lambda df, abm, aba: df["movie_key"].map(
+        lambda k: compute_release_overexposure(k, abm, aba)),
+    "excessive_runtime": lambda df, abm, aba: compute_excessive_runtime_raw(df),
+    "budget_scale_efficiency": lambda df, abm, aba: compute_budget_scale_efficiency_raw(df),
+    "trailer_teaser_impact": lambda df, abm, aba: compute_trailer_timing_raw(df),
+    "first_single_timing": lambda df, abm, aba: compute_song_timing_raw(df),
+    "holiday_release_window": lambda df, abm, aba: compute_holiday_window_raw(df),
+    "box_office_clashes": lambda df, abm, aba: compute_clash_raw(df),
+    "exam_schedules": lambda df, abm, aba: compute_exam_season_raw(df),
+    "ipl_sporting_events": lambda df, abm, aba: compute_ipl_season_raw(df),
+    "summer_vacation_window": lambda df, abm, aba: compute_summer_window_raw(df),
+}
 
 
-def build_measurable_features(df: pd.DataFrame, actors_by_movie: dict, actors_by_actor: dict) -> pd.DataFrame:
+def resolve_factor_raw_and_banded(
+    df: pd.DataFrame, factor: dict, actors_by_movie: dict, actors_by_actor: dict,
+    india_mask: pd.Series, eav_lookup: dict[str, dict[str, float]],
+) -> tuple[Optional[pd.Series], Optional[pd.Series]]:
+    """Resolves one factor_definitions row's value on this corpus. Returns
+    (raw, banded): `raw` is pre-band/pre-sign-flip (used for coverage %% and
+    correlation-with-ln(revenue) reporting), `banded` is rescaled into
+    [stated_min, stated_max] (used as the model feature). Returns (None,
+    None) when the factor has no working computation path on this corpus --
+    a pure literature-prior candidate/explanatory_only/deprecated row, an EAV
+    factor with zero rows entered yet, or a misconfigured registry row
+    pointing at a column/derivation_ref that doesn't exist (schema drift is
+    reported, not a crash -- same philosophy as load_movies' missing-column
+    handling)."""
+    key = factor["factor_key"]
+    lo, hi = float(factor["stated_min"]), float(factor["stated_max"])
+    ctype = factor.get("computation_type")
+
+    if ctype == "raw_column":
+        col = factor.get("source_column")
+        if not col or col not in df.columns:
+            return None, None
+        raw = df[col]
+        # conflict_balance/narrative_novelty are written by ConflictBalanceService/
+        # NarrativeNoveltyService already rescaled into their own stated band --
+        # a raw_column factor's value is used as-is, just fillna'd to the band
+        # midpoint when the upstream service hasn't scored this row yet.
+        banded = raw.fillna((lo + hi) / 2.0)
+        return raw, banded
+
+    if ctype == "derived_python_fn":
+        fn = DERIVED_FACTOR_FNS.get(factor.get("derivation_ref"))
+        if fn is None:
+            return None, None
+        raw = fn(df, actors_by_movie, actors_by_actor)
+        if key in INDIA_ONLY_CALENDAR_FACTOR_KEYS:
+            raw = raw.where(india_mask)
+        # Negative-direction factors' raw signal is "amount of severity" (higher
+        # = worse); flip sign so higher severity maps toward stated_min (the
+        # more negative bound) rather than stated_max, per factor.direction --
+        # this generic rule reproduces the old hand-maintained
+        # NEGATIVE_DIRECTION_FACTORS set exactly, since that set was always just
+        # "the measurable factors whose direction is Negative".
+        signed = -raw if factor.get("direction") == "Negative" else raw
+        banded = percentile_into_band(signed, lo, hi)
+        return raw, banded
+
+    if ctype == "eav":
+        values = eav_lookup.get(key)
+        if not values:
+            return None, None
+        # movie_factor_values.movie_key is the canonical per-row
+        # movie_name|release_date|language composite (registry.schema.
+        # movie_entity_key, same convention Feature 1's data_sources uses) --
+        # NOT this script's coarser internal `df["movie_key"]`
+        # (lowercased-name|release_year, a post-dedup modeling convenience
+        # that collapses every dubbed-language release of a film into one
+        # row). Look up by the row's own exact movie_name/release_date/
+        # language so a hand-entered or connector-sourced value lands on the
+        # right row regardless of which language edition dedupe_movies kept.
+        entity_keys = df.apply(
+            lambda r: movie_entity_key(r["movie_name"], r["release_date"], r["language"]), axis=1)
+        raw = entity_keys.map(values)
+        banded = percentile_into_band(raw, lo, hi) if factor.get("data_type") == "numeric" else raw
+        return raw, banded
+
+    # computation_type is 'derived_sql', or None (a pure literature-prior row
+    # with no computation path registered yet): nothing to compute here.
+    return None, None
+
+
+def compute_registry_features(
+    df: pd.DataFrame, actors_by_movie: dict, actors_by_actor: dict,
+    factor_defs: list[dict], eav_lookup: dict[str, dict[str, float]],
+) -> tuple[pd.DataFrame, list[dict]]:
+    """Registry-driven replacement for the old hardcoded build_measurable_features:
+    for every candidate/active factor_definitions row, resolve its value on
+    this corpus (if it has a computation path) and record a coverage-report
+    entry. `status='candidate'` factors are computed and reported (coverage %%,
+    correlation with ln(revenue)) exactly like `status='active'` ones here --
+    the distinction between "computed" and "trained on" is enforced later, in
+    feature_columns()'s coverage guard, not here."""
     feats = pd.DataFrame(index=df.index)
-    # These four raw signals encode an Indian festival/exam/IPL/summer-vacation
-    # calendar; on a pooled global/all corpus, applying them to a Japanese or US
-    # release would be wrong, not just imprecise, so they're masked to NaN (which
-    # percentile_into_band below resolves to the neutral band midpoint) for any
-    # row that isn't an Indian-market release.
     india_mask = df["market_is_india"] == 1
+    n_rows = len(df)
+    coverage_report: list[dict] = []
 
-    feats["conflict_balance"] = df["conflict_balance_score"]
-    feats["conflict_balance"] = feats["conflict_balance"].fillna((0.25 + 0.35) / 2)
+    for factor in factor_defs:
+        if factor["status"] not in ("active", "candidate"):
+            continue
+        raw, banded = resolve_factor_raw_and_banded(
+            df, factor, actors_by_movie, actors_by_actor, india_mask, eav_lookup)
+        if banded is None:
+            continue
 
-    feats["narrative_novelty"] = df["narrative_novelty_score"]
-    feats["narrative_novelty"] = feats["narrative_novelty"].fillna((0.30 + 0.45) / 2)
+        key = factor["factor_key"]
+        feats[key] = banded
+        n_obs = int(raw.notna().sum()) if raw is not None else n_rows
+        coverage_pct = round(100.0 * n_obs / n_rows, 2) if n_rows else 0.0
 
-    overexposure_raw = df["movie_key"].map(lambda k: compute_release_overexposure(k, actors_by_movie, actors_by_actor))
-    feats["star_overexposure"] = percentile_into_band(-overexposure_raw, -0.25, -0.15)
+        corr = None
+        if raw is not None and n_obs >= 5 and "ln_revenue" in df.columns:
+            try:
+                corr_val = pd.to_numeric(raw, errors="coerce").astype(float).corr(df["ln_revenue"])
+                corr = round(float(corr_val), 4) if corr_val is not None and not np.isnan(corr_val) else None
+            except (TypeError, ValueError):
+                corr = None
 
-    runtime_raw = compute_excessive_runtime_raw(df)
-    feats["excessive_runtime"] = percentile_into_band(-runtime_raw, -0.30, -0.15)
+        coverage_report.append({
+            "factor_key": key, "status": factor["status"], "category": factor["category"],
+            "n_obs": n_obs, "coverage_pct": coverage_pct, "corr_with_ln_revenue": corr,
+        })
 
-    efficiency_raw = compute_budget_scale_efficiency_raw(df)
-    feats["budget_scale_efficiency"] = percentile_into_band(efficiency_raw, -0.20, 0.20)
-
-    trailer_raw = compute_trailer_timing_raw(df)
-    feats["trailer_teaser_impact"] = percentile_into_band(trailer_raw, 0.35, 0.50)
-    feats["_trailer_coverage_n"] = trailer_raw.notna().sum()
-
-    song_raw = compute_song_timing_raw(df)
-    feats["first_single_timing"] = percentile_into_band(song_raw, 0.15, 0.25)
-    feats["_song_coverage_n"] = song_raw.notna().sum()
-
-    holiday_raw = compute_holiday_window_raw(df).where(india_mask)
-    feats["holiday_release_window"] = percentile_into_band(holiday_raw, 0.40, 0.60)
-
-    clash_raw = compute_clash_raw(df)
-    feats["box_office_clashes"] = percentile_into_band(-clash_raw, -0.35, -0.20)
-
-    exam_raw = compute_exam_season_raw(df).where(india_mask)
-    feats["exam_schedules"] = percentile_into_band(-exam_raw, -0.25, -0.15)
-
-    ipl_raw = compute_ipl_season_raw(df).where(india_mask)
-    feats["ipl_sporting_events"] = percentile_into_band(-ipl_raw, -0.20, -0.10)
-
-    summer_raw = compute_summer_window_raw(df).where(india_mask)
-    feats["summer_vacation_window"] = percentile_into_band(summer_raw, 0.25, 0.35)
-
-    return feats
+    return feats, coverage_report
 
 
 # ---------------------------------------------------------------------------
 # Full feature assembly
 # ---------------------------------------------------------------------------
 
-def assemble_features(df: pd.DataFrame, actors: pd.DataFrame, apply_india_filter: bool = True) -> pd.DataFrame:
+def assemble_features(df: pd.DataFrame, actors: pd.DataFrame, apply_india_filter: bool = True,
+                       eav_lookup: Optional[dict[str, dict[str, float]]] = None) -> pd.DataFrame:
     df = df.copy()
     df["ln_revenue"] = np.log(df["revenue"].astype(float))
     df["primary_genre"] = df["genre"].map(primary_genre)
@@ -761,7 +779,7 @@ def assemble_features(df: pd.DataFrame, actors: pd.DataFrame, apply_india_filter
     # Per-row market tag (not gated by apply_india_filter -- it's needed on both
     # the india-only and pooled corpora): used both as a model feature so a pooled
     # model can learn market-specific baselines, and to gate the India-specific
-    # calendar heuristics in build_measurable_features below.
+    # calendar heuristics in compute_registry_features below.
     df["market_is_india"] = df.apply(
         lambda r: 1 if is_india_market_row(r.get("language"), r.get("country")) else 0, axis=1)
 
@@ -814,13 +832,10 @@ def assemble_features(df: pd.DataFrame, actors: pd.DataFrame, apply_india_filter
     df["r_director"] = compute_historical_anchor(df, "director_key")
     df["r_concept"] = compute_historical_anchor(df, "primary_genre")
 
-    measurable = build_measurable_features(df, actors_by_movie, actors_by_actor)
-    coverage_n = {
-        "trailer_teaser_impact": int(measurable.pop("_trailer_coverage_n").iloc[0]) if "_trailer_coverage_n" in measurable else 0,
-        "first_single_timing": int(measurable.pop("_song_coverage_n").iloc[0]) if "_song_coverage_n" in measurable else 0,
-    }
-    full = pd.concat([df, measurable], axis=1)
-    full.attrs["coverage_n"] = coverage_n
+    registry_feats, coverage_report = compute_registry_features(
+        df, actors_by_movie, actors_by_actor, FACTOR_DEFS, eav_lookup or {})
+    full = pd.concat([df, registry_feats], axis=1)
+    full.attrs["coverage_report"] = coverage_report
     return full
 
 
@@ -836,14 +851,30 @@ def delta_regressor_col(key: str) -> str:
 
 
 def prepare_model_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """ln1p-transforms every registry-computed factor column present on df
+    (both candidate and active -- feature_columns() below is what decides
+    which of these actually make it into a trained model's `cols`). Reads
+    the FACTOR_DEFS global instead of a hardcoded key list, so a newly
+    registered factor needs no change here to be picked up."""
     m = df.copy()
-    for key in MEASURABLE_KEYS:
+    for factor in FACTOR_DEFS:
+        key = factor["factor_key"]
         if key in m.columns:
-            m[delta_regressor_col(key)] = np.log1p(m[key])
+            # clip(lower=-0.999) guards ln1p against a misconfigured/free-text
+            # EAV value <= -1 blowing up into -inf; every measurable/banded
+            # factor's value is comfortably inside (-1, 1) already.
+            m[delta_regressor_col(key)] = np.log1p(m[key].astype(float).clip(lower=-0.999))
     return m
 
 
-def feature_columns(df: pd.DataFrame) -> list[str]:
+def feature_columns(df: pd.DataFrame, min_coverage_pct: float = DEFAULT_MIN_FEATURE_COVERAGE_PCT) -> list[str]:
+    """Registry-driven feature list (Feature 2): every `status='active'`
+    factor whose non-null coverage on this df's rows clears
+    `min_coverage_pct` is included automatically -- promoting a factor via
+    register_factor.py/the admin API is enough to have it picked up here,
+    no code change required. `status='candidate'` factors are deliberately
+    excluded (they're still computed and reported via
+    compute_registry_features's coverage_report, just not trained on yet)."""
     cols = list(BASELINE_ANCHOR_COLS)
     # Not folded into BASELINE_ANCHOR_COLS: those feed the Y = B0 * prod(1+delta_i)
     # formula's B0 term specifically, and market shouldn't change that formula's
@@ -852,8 +883,10 @@ def feature_columns(df: pd.DataFrame) -> list[str]:
     # learn market-specific baselines.
     if "market_is_india" in df.columns:
         cols.append("market_is_india")
-    for key in MEASURABLE_KEYS:
-        c = delta_regressor_col(key)
+    for row in df.attrs.get("coverage_report", []):
+        if row["status"] != "active" or row["coverage_pct"] < min_coverage_pct:
+            continue
+        c = delta_regressor_col(row["factor_key"])
         if c in df.columns:
             cols.append(c)
     return cols
@@ -1007,7 +1040,9 @@ def print_model_comparison(results: dict) -> None:
 # not just when a particular --market flag happens to be passed for the rest
 # of the pipeline.
 
-def run_market_comparison(movies_raw_all: pd.DataFrame, actors: pd.DataFrame) -> dict:
+def run_market_comparison(movies_raw_all: pd.DataFrame, actors: pd.DataFrame,
+                           eav_lookup: dict[str, dict[str, float]],
+                           min_coverage_pct: float = DEFAULT_MIN_FEATURE_COVERAGE_PCT) -> dict:
     print("\nRunning india-only / pooled-global / per-market model comparison (Feature 0)...")
 
     india_mask_raw = movies_raw_all.apply(
@@ -1016,9 +1051,10 @@ def run_market_comparison(movies_raw_all: pd.DataFrame, actors: pd.DataFrame) ->
 
     def run_one(raw: pd.DataFrame, apply_india_filter: bool) -> dict:
         deduped = dedupe_movies(raw)
-        assembled = assemble_features(deduped, actors, apply_india_filter=apply_india_filter)
+        assembled = assemble_features(deduped, actors, apply_india_filter=apply_india_filter,
+                                       eav_lookup=eav_lookup)
         model_df = prepare_model_frame(assembled)
-        cols = feature_columns(model_df)
+        cols = feature_columns(model_df, min_coverage_pct)
         return compare_models(model_df, cols)
 
     # (a) India-only, exactly today's pipeline (SQL-level India restriction +
@@ -1030,9 +1066,10 @@ def run_market_comparison(movies_raw_all: pd.DataFrame, actors: pd.DataFrame) ->
     # the model learn a market-specific baseline instead of assuming India and
     # the US behave the same.
     pooled_deduped = dedupe_movies(movies_raw_all)
-    pooled_assembled = assemble_features(pooled_deduped, actors, apply_india_filter=False)
+    pooled_assembled = assemble_features(pooled_deduped, actors, apply_india_filter=False,
+                                          eav_lookup=eav_lookup)
     pooled_model_df = prepare_model_frame(pooled_assembled)
-    pooled_cols = feature_columns(pooled_model_df)
+    pooled_cols = feature_columns(pooled_model_df, min_coverage_pct)
     pooled_global = compare_models(pooled_model_df, pooled_cols)
 
     # (c) Two fully separate per-market models, split from the same pooled data
@@ -1058,8 +1095,8 @@ def run_market_comparison(movies_raw_all: pd.DataFrame, actors: pd.DataFrame) ->
 # Ridge does). Unmeasurable factors still can't be calibrated -- no model invents
 # signal for a column that doesn't exist in the schema -- so they're left out of
 # the formula the same way they're absent from the regression features above.
-
-FACTOR_BY_KEY = {f.key: f for f in FACTOR_CATALOG}
+# FACTOR_BY_KEY itself is populated by load_factor_registry() at the start of
+# main() -- see the "Factor registry" section above.
 
 
 def fit_baseline_model(train: pd.DataFrame) -> tuple[StandardScaler, Ridge]:
@@ -1093,13 +1130,13 @@ def compute_factor_effects(scaler: StandardScaler, model, train: pd.DataFrame, c
     a linear fit."""
     X = train[cols].fillna(0).values
     effects = {}
-    for key in MEASURABLE_KEYS:
+    for factor in FACTOR_DEFS:
+        key = factor["factor_key"]
         col = delta_regressor_col(key)
         if col not in cols:
             continue
         idx = cols.index(col)
-        f = FACTOR_BY_KEY[key]
-        lo_val, hi_val = np.log1p(f.stated_min), np.log1p(f.stated_max)
+        lo_val, hi_val = np.log1p(float(factor["stated_min"])), np.log1p(float(factor["stated_max"]))
         X_lo, X_hi = X.copy(), X.copy()
         X_lo[:, idx] = lo_val
         X_hi[:, idx] = hi_val
@@ -1120,7 +1157,7 @@ def calibrate_factors_from_effects(effects: dict) -> dict:
     for key, slope in effects.items():
         f = FACTOR_BY_KEY[key]
         mult = float(np.clip(slope, *CALIBRATION_CLIP))
-        cal_a, cal_b = f.stated_min * mult, f.stated_max * mult
+        cal_a, cal_b = float(f["stated_min"]) * mult, float(f["stated_max"]) * mult
         calibrated[key] = (min(cal_a, cal_b), max(cal_a, cal_b), mult)
     return calibrated
 
@@ -1140,7 +1177,7 @@ def formula_predict_revenue(df: pd.DataFrame, baseline_scaler: StandardScaler, b
         if key not in df.columns:
             continue
         f = FACTOR_BY_KEY[key]
-        delta_calibrated = rescale_into_band(df[key], f.stated_min, f.stated_max, cal_lo, cal_hi)
+        delta_calibrated = rescale_into_band(df[key], float(f["stated_min"]), float(f["stated_max"]), cal_lo, cal_hi)
         ln_revenue = ln_revenue + np.log1p(delta_calibrated).values
     return pd.Series(ln_revenue, index=df.index)
 
@@ -1171,20 +1208,22 @@ def build_nn_calibrated_factor_table(df: pd.DataFrame, cols: list[str], model_na
     effects = compute_factor_effects(eff_scaler, eff_model, df, cols)
     calibrated = calibrate_factors_from_effects(effects)
     rows = []
-    for f in FACTOR_CATALOG:
-        if f.key in calibrated:
-            cal_lo, cal_hi, mult = calibrated[f.key]
+    for f in FACTOR_DEFS:
+        key = f["factor_key"]
+        stated_min, stated_max = float(f["stated_min"]), float(f["stated_max"])
+        if key in calibrated:
+            cal_lo, cal_hi, mult = calibrated[key]
             rows.append({
-                "id": f.id, "key": f.key, "name": f.name, "category": f.category,
-                "stated_min": f.stated_min, "stated_max": f.stated_max,
+                "key": key, "name": f["name"], "category": f["category"], "status": f["status"],
+                "stated_min": stated_min, "stated_max": stated_max,
                 "calibrated_min": round(cal_lo, 4), "calibrated_max": round(cal_hi, 4),
                 "calibration_multiplier": round(mult, 3), "source": f"{model_name}_partial_dependence",
             })
         else:
             rows.append({
-                "id": f.id, "key": f.key, "name": f.name, "category": f.category,
-                "stated_min": f.stated_min, "stated_max": f.stated_max,
-                "calibrated_min": f.stated_min, "calibrated_max": f.stated_max,
+                "key": key, "name": f["name"], "category": f["category"], "status": f["status"],
+                "stated_min": stated_min, "stated_max": stated_max,
+                "calibrated_min": stated_min, "calibrated_max": stated_max,
                 "calibration_multiplier": None, "source": "prior_literature",
             })
     return rows
@@ -1265,27 +1304,46 @@ def print_accuracy_report(summary: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def calibrate_factor_table(df: pd.DataFrame, bootstrap: pd.DataFrame) -> list[dict]:
+    """Registry-driven replacement for the old FACTOR_CATALOG loop: iterates
+    every factor_definitions row (not just 'active' ones, so candidate/
+    explanatory_only/deprecated factors still show up in the report) and
+    reports either a data-fitted calibrated band (if the factor made it into
+    this run's trained `cols`, per feature_columns()'s coverage guard) or the
+    literature-stated band unmodified."""
     out = []
-    coverage_n = df.attrs.get("coverage_n", {})
-    for f in FACTOR_CATALOG:
+    coverage_by_key = {row["factor_key"]: row for row in df.attrs.get("coverage_report", [])}
+    for f in FACTOR_DEFS:
+        key = f["factor_key"]
+        stated_min, stated_max = float(f["stated_min"]), float(f["stated_max"])
+        cov = coverage_by_key.get(key)
         row = {
-            "id": f.id, "key": f.key, "name": f.name, "category": f.category,
-            "direction": f.direction, "stated_min": f.stated_min, "stated_max": f.stated_max,
-            "proxy_note": f.proxy_note,
+            "key": key, "name": f["name"], "category": f["category"],
+            "direction": f["direction"], "stated_min": stated_min, "stated_max": stated_max,
+            "status": f["status"], "proxy_note": f.get("notes") or "",
+            "coverage_pct": cov["coverage_pct"] if cov else None,
+            "corr_with_ln_revenue": cov["corr_with_ln_revenue"] if cov else None,
         }
-        if not f.measurable:
+
+        if key not in df.columns:
+            # No computation path resolved any value for this factor on this
+            # corpus -- a pure literature-prior candidate, explanatory_only,
+            # or deprecated row.
             row.update({
-                "calibrated_min": f.stated_min, "calibrated_max": f.stated_max,
+                "calibrated_min": stated_min, "calibrated_max": stated_max,
                 "source": "prior_literature", "n_obs": None, "beta_p50": None,
             })
             out.append(row)
             continue
 
-        col = delta_regressor_col(f.key)
+        col = delta_regressor_col(key)
         if col not in bootstrap.index:
+            # Computed (visible in coverage_report) but not part of this run's
+            # trained cols -- either status != 'active' or it didn't clear the
+            # coverage guard yet.
             row.update({
-                "calibrated_min": f.stated_min, "calibrated_max": f.stated_max,
-                "source": "prior_literature_fallback", "n_obs": None, "beta_p50": None,
+                "calibrated_min": stated_min, "calibrated_max": stated_max,
+                "source": "prior_literature_fallback", "n_obs": cov["n_obs"] if cov else None,
+                "beta_p50": None,
             })
             out.append(row)
             continue
@@ -1294,17 +1352,14 @@ def calibrate_factor_table(df: pd.DataFrame, bootstrap: pd.DataFrame) -> list[di
         lo_mult = float(np.clip(b["beta_p10"], *CALIBRATION_CLIP))
         hi_mult = float(np.clip(b["beta_p90"], *CALIBRATION_CLIP))
         mid_mult = float(np.clip(b["beta_p50"], *CALIBRATION_CLIP))
-        cal_a, cal_b = f.stated_min * lo_mult, f.stated_max * hi_mult
+        cal_a, cal_b = stated_min * lo_mult, stated_max * hi_mult
         cal_min, cal_max = min(cal_a, cal_b), max(cal_a, cal_b)
-
-        n_obs = len(df)
-        if f.key in ("trailer_teaser_impact", "first_single_timing"):
-            n_obs = coverage_n.get(f.key, 0)
 
         row.update({
             "calibrated_min": round(cal_min, 4), "calibrated_max": round(cal_max, 4),
             "calibration_point_multiplier": round(mid_mult, 3),
-            "source": "data_fitted", "n_obs": n_obs, "beta_p50": round(float(b["beta_p50"]), 4),
+            "source": "data_fitted", "n_obs": cov["n_obs"] if cov else len(df),
+            "beta_p50": round(float(b["beta_p50"]), 4),
         })
         out.append(row)
     return out
@@ -1349,12 +1404,13 @@ def print_report(factor_table: list[dict], baseline: dict, model_metrics: dict, 
 
     for cat, rows in by_cat.items():
         print(f"\n  [{cat}]")
-        for r in sorted(rows, key=lambda x: x["id"]):
+        for r in sorted(rows, key=lambda x: x["key"]):
             src = "DATA-FITTED" if r["source"] == "data_fitted" else "prior"
+            status_note = f" [{r['status']}]" if r.get("status") not in (None, "active") else ""
             n_note = f" n={r['n_obs']}" if r.get("n_obs") else ""
-            print(f"    {r['id']:>3}. {r['name']:<48s} "
+            print(f"    {r['name']:<48s} "
                   f"[{r['calibrated_min']:+.0%}, {r['calibrated_max']:+.0%}]  "
-                  f"(stated [{r['stated_min']:+.0%},{r['stated_max']:+.0%}])  {src}{n_note}")
+                  f"(stated [{r['stated_min']:+.0%},{r['stated_max']:+.0%}])  {src}{status_note}{n_note}")
     print("\n" + "=" * 100)
 
 
@@ -1379,6 +1435,32 @@ def write_prediction_outputs(predictions: pd.DataFrame, summary: dict, output_di
     with open(os.path.join(output_dir, "revenue_accuracy_summary.json"), "w") as f:
         json.dump(summary, f, indent=2, default=float)
     print(f"Wrote {output_dir}/movie_revenue_predictions.csv and revenue_accuracy_summary.json")
+
+
+def factor_keys_used_from_cols(cols: list[str]) -> list[str]:
+    """Extracts the active factor_key list from a feature_columns() result --
+    every non-baseline-anchor/non-market column is `ln1p_<factor_key>`. This
+    is what makes "did adding factor X actually help" empirically answerable
+    per run: Feature 11's model_comparison_history is meant to persist this
+    exact list alongside each row's accuracy numbers."""
+    prefix = "ln1p_"
+    return [c[len(prefix):] for c in cols if c.startswith(prefix)]
+
+
+def print_factor_coverage_report(coverage_report: list[dict]) -> None:
+    print("\n-- Factor registry coverage (Feature 2: candidate + active factors, this run) --")
+    for row in sorted(coverage_report, key=lambda r: (-r["coverage_pct"], r["factor_key"])):
+        corr_note = f"  corr={row['corr_with_ln_revenue']:+.3f}" if row["corr_with_ln_revenue"] is not None else ""
+        print(f"  {row['factor_key']:<28s} [{row['status']:<9s}] "
+              f"coverage={row['coverage_pct']:>6.2f}%  n_obs={row['n_obs']:<8d}{corr_note}")
+
+
+def write_factor_coverage_report(coverage_report: list[dict], output_dir: str) -> None:
+    os.makedirs(output_dir, exist_ok=True)
+    pd.DataFrame(coverage_report).to_csv(os.path.join(output_dir, "factor_coverage_report.csv"), index=False)
+    with open(os.path.join(output_dir, "factor_coverage_report.json"), "w") as f:
+        json.dump(coverage_report, f, indent=2, default=float)
+    print(f"Wrote {output_dir}/factor_coverage_report.csv and .json")
 
 
 # ---------------------------------------------------------------------------
@@ -1442,6 +1524,14 @@ def parse_args() -> argparse.Namespace:
                          "per-market model comparison in model_comparison.json always runs "
                          "regardless of this flag.")
     p.add_argument("--use-llm", action="store_true", help="Ask AuraLLM (Claude) for qualitative commentary on prior-only factors")
+    p.add_argument("--min-feature-coverage", type=float, default=DEFAULT_MIN_FEATURE_COVERAGE_PCT,
+                    dest="min_feature_coverage",
+                    help="Feature 2 coverage guard: minimum non-null coverage, in percent "
+                         f"(default {DEFAULT_MIN_FEATURE_COVERAGE_PCT}), an active factor_definitions "
+                         "row must clear on this run's rows to be included in the trained feature "
+                         "set. Below-threshold active factors (and every candidate factor, "
+                         "regardless of coverage) are still computed and reported in "
+                         "factor_coverage_report.csv/.json, just excluded from the model.")
     return p.parse_args()
 
 
@@ -1451,6 +1541,14 @@ def main() -> None:
     print(f"Connecting to postgresql://{args.db_user}@{args.db_host}:{args.db_port}/{args.db_name} ...")
     conn = get_connection(args)
     try:
+        # Feature 2: load the live factor_definitions registry (replacing the
+        # old hardcoded FACTOR_CATALOG) and any movie_factor_values EAV rows
+        # before closing the connection -- everything downstream reads the
+        # FACTOR_DEFS/FACTOR_BY_KEY globals and the eav_lookup dict rather than
+        # querying the DB again per-row.
+        load_factor_registry(conn)
+        eav_lookup = load_eav_lookup(conn)
+
         # Always load every market at the SQL level (restrict_to_india=False) --
         # the india-only row set (for --market india, and for the fixed baseline
         # half of the market comparison below) is derived from this in Python via
@@ -1461,6 +1559,9 @@ def main() -> None:
     finally:
         conn.close()
     print(f"Loaded {len(movies_raw_all)} raw movie rows (all markets), {len(actors_raw)} actor-credit rows.")
+    print(f"Factor registry: {len(FACTOR_DEFS)} factor_definitions rows "
+          f"({sum(1 for f in FACTOR_DEFS if f['status'] == 'active')} active, "
+          f"{sum(1 for f in FACTOR_DEFS if f['status'] == 'candidate')} candidate).")
 
     actors = build_actor_features(actors_raw)
 
@@ -1476,11 +1577,17 @@ def main() -> None:
     movies = dedupe_movies(primary_raw)
     print(f"Deduped to {len(movies)} distinct (movie, release year) entities (--market {args.market}).")
 
-    full = assemble_features(movies, actors, apply_india_filter=apply_india_filter)
+    full = assemble_features(movies, actors, apply_india_filter=apply_india_filter, eav_lookup=eav_lookup)
     model_df = prepare_model_frame(full)
 
     train, test = time_based_split(model_df)
-    cols = feature_columns(model_df)
+    cols = feature_columns(model_df, args.min_feature_coverage)
+    factor_keys_used = factor_keys_used_from_cols(cols)
+    print(f"Trained feature set: {len(factor_keys_used)} active factor(s) cleared the "
+          f"{args.min_feature_coverage}% coverage guard: {factor_keys_used}")
+
+    print_factor_coverage_report(full.attrs.get("coverage_report", []))
+    write_factor_coverage_report(full.attrs.get("coverage_report", []), args.output_dir)
 
     bootstrap = bootstrap_calibration(train, cols)
     model_metrics = fit_predictive_model(train, test, cols)
@@ -1499,12 +1606,17 @@ def main() -> None:
     print("\nComparing direct revenue-prediction models (Ridge / GBR / HistGBR / MLP neural net)...")
     model_comparison = compare_models(model_df, cols)
     print_model_comparison(model_comparison)
+    # Feature 2: record the exact factor_key list this run trained on, so a
+    # future model_comparison_history row (Feature 11) can answer "did adding
+    # factor X actually help" empirically -- added after printing so it
+    # doesn't get mistaken for a fifth model's results.
+    model_comparison["factor_keys_used"] = factor_keys_used
 
     # Feature 0 (4): india-only-as-today vs. pooled-global vs. per-market, always
     # computed and written under new keys so the improvement (or lack of it) from
     # pooling markets is visible in model_comparison.json's diff every run,
     # regardless of what --market was passed for the primary pipeline above.
-    market_comparison = run_market_comparison(movies_raw_all, actors)
+    market_comparison = run_market_comparison(movies_raw_all, actors, eav_lookup, args.min_feature_coverage)
     model_comparison.update(market_comparison)
     print("\n-- India-only (today) vs. pooled-global vs. per-market comparison --")
     for label in ("per_market_india", "pooled_global", "per_market_other"):

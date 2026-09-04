@@ -35,6 +35,7 @@ of REST endpoints that can be consumed by an ad-buying or campaign-planning serv
    - [Diagnostic / Test (`/test`, `/api/test`)](#10-diagnostic--test-endpoints)
    - [Ask Engine (`/api/ask`)](#11-ask-engine-experimental)
    - [User Graph (`/api/graph`)](#12-user-graph-api)
+   - [Movie Revenue Prediction Pipeline (scripts + `/api/admin`)](#13-movie-revenue-prediction-pipeline)
 7. [Common Models](#common-models)
 8. [Integration Recipes](#integration-recipes)
 9. [Errors](#errors)
@@ -125,6 +126,11 @@ write to them directly, but the column names appear in responses.
 | `marketing_target_profiles` | Enriched per-user rows (Hawkes α, MOI, top genres, handles) |
 | `user_identity_link`        | Maps `global_user_id` → `normalized_author`              |
 | `author_categories`         | Persisted category labels written by `/user-report` and `/users/sync` |
+| `movies_data_collection`    | 544k-row global movie corpus (budget/revenue/cast/marketing telemetry) backing the standalone revenue-prediction pipeline, see [§13](#13-movie-revenue-prediction-pipeline) |
+| `actors_data_collection`    | Per-movie cast/crew credits, self-joined for cast track-record factors in §13 |
+| `data_sources`              | Feature 1: registry of per-entity source URLs (`sacnilk`/`kulfiy`/`fandango`/...) driving `scripts/collect_data.py`'s connectors |
+| `factor_definitions`        | Feature 2: live replacement for the old hardcoded 80-factor catalogue — governs which columns the revenue model trains on. Read/written via the [Factor Registry Admin API](#13-movie-revenue-prediction-pipeline) |
+| `movie_factor_values`       | Feature 2: generic per-movie EAV overflow table for factors with no dedicated column yet |
 
 JSONB columns appearing in responses: `platform_handles`, `top_genres`, `peak_activity_times`.
 They are unwrapped to proper JSON trees (not embedded strings) before the response is sent.
@@ -1987,4 +1993,166 @@ nodes at all; a `movie` filter that matches no titles for an otherwise-valid `la
   "summary": { "totalUsers": 1, "totalMovies": 1, "totalEdges": 2 }
 }
 ```
+
+---
+
+### 13. Movie Revenue Prediction Pipeline
+
+A standalone revenue-prediction pipeline for `movies_data_collection`/`actors_data_collection`,
+built as a set of Python scripts under `scripts/` plus one Java admin API. Unlike every other
+section in this reference, most of this pipeline runs **outside** the Spring Boot app — nothing
+in `com.lit.fire.flame` schedules or calls `movie_revenue_impact_model.py` today; it's a `python3`
+job you run by hand or from your own scheduler. The one piece that *is* a Java REST API is the
+Factor Registry Admin API (Feature 2, below), since that registry is meant to be editable by a
+non-Python teammate.
+
+#### 13a. Revenue model script (Feature 0)
+
+**`python3 scripts/movie_revenue_impact_model.py [flags]`**
+
+Predicts theatrical revenue and calibrates business-supplied factor impact bands. Connection
+flags mirror `src/main/resources/secrets.txt` (`--db-host`, `--db-port`, `--db-name`, `--db-user`,
+`--db-password`, all overridable via `MOVIE_DB_*` env vars).
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--market {india,global,all}` | `all` | Row set for the primary pipeline. `india` replicates the historical Indian-only filtering; `global`/`all` pool every market with a `market_is_india` feature. The india-only-vs-pooled-vs-per-market comparison in `model_comparison.json` always runs regardless of this flag. |
+| `--min-year` / `--min-budget` / `--min-revenue` | `2000` / `10000` / `10000` | Row floors. |
+| `--min-feature-coverage` | `5.0` | Feature 2 coverage guard (percent) — see [§13c](#13c-factor-registry-feature-2). |
+| `--output-dir` | `./output` | Where every output file below is written. |
+| `--use-llm` | off | Asks Claude for qualitative commentary on prior-only (unmeasured) factors; requires `ANTHROPIC_API_KEY`. |
+
+Outputs written to `--output-dir`: `factor_impact_scores.json`/`.csv` (calibrated min/max per
+factor), `movie_revenue_predictions.csv` + `revenue_accuracy_summary.json` (out-of-fold accuracy),
+`model_comparison.json` (Ridge/GBR/HistGBR/MLP comparison, plus the india/pooled/per-market
+breakdown and the `factor_keys_used` list actually trained on that run), `factor_coverage_report.csv`/`.json`
+(Feature 2 — every candidate/active factor's coverage % and correlation with `ln(revenue)`),
+`factor_impact_scores_nn_calibrated.csv` + `formula_revenue_predictions.csv` +
+`formula_accuracy_summary.json` (the SHAP-free MLP partial-dependence calibration and the
+`Y = B0 * prod(1+delta_i)` formula reconstruction).
+
+Query `movies_data_collection`'s column list dynamically at startup (`information_schema.columns`)
+so a schema-drifted or missing column (e.g. `genres`, `imdb_rating`, `conflict_balance_score`,
+`narrative_novelty_score` — none of which exist on the live table today) degrades to an
+always-NaN feature instead of crashing the whole run.
+
+#### 13b. Data-source registry + connectors (Feature 1)
+
+Generalizes the per-row URL pattern already on `actors_data_collection`
+(`sacnilk_url`/`kulfiy_url`/`fandango_url`) into a `data_sources` table plus three connector
+implementations, so adding a new scrape/API/Kaggle source is a data-registration step, not a new
+hardcoded column. No REST API — this is a Python-only registry, driven from the CLI or from
+`scripts/connectors/schema.register_source(...)` directly. See `scripts/connectors/README.md` for
+the full connector reference.
+
+| Script | Purpose |
+|--------|---------|
+| `python3 scripts/migrate_data_sources.py [--db-*]` | One-time backfill of `data_sources` from the legacy `sacnilk_url`/`kulfiy_url`/`fandango_url` columns on `actors_data_collection`. Safe to re-run (`ON CONFLICT DO NOTHING`). |
+| `python3 scripts/collect_data.py --source <name> --entity-type {movie,actor} [--dry-run]` | Loads matching `data_sources` rows, calls the right connector (`html_scrape`/`api`/`kaggle_csv`), upserts the mapped fields onto `movies_data_collection`/`actors_data_collection` (adding columns with `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` as needed), and writes back `last_fetched_at`/`last_status`/`raw_payload`. |
+
+`data_sources` columns: `id, entity_type ('movie'|'actor'), entity_key, source_name, url,
+connector_type ('html_scrape'|'api'|'kaggle_csv'), field_mapping (jsonb), last_fetched_at,
+last_status, raw_payload (jsonb)`. `entity_key` for a movie is
+`movie_name|release_date|language`; for an actor it's the bare `actor_name` — the same
+`movie_name|release_date|language` composite is reused by Feature 2's `movie_factor_values.movie_key`
+(§13c), so a hand-entered factor value and a scraped source can both be traced to the exact same
+`movies_data_collection` row.
+
+#### 13c. Factor Registry (Feature 2)
+
+The live, queryable replacement for the hardcoded 80-entry `FACTOR_CATALOG` list that used to live
+inside `movie_revenue_impact_model.py`. Adding a new predictive parameter is now a data-registration
+step — insert one `factor_definitions` row, supply values, and the next run picks it up
+automatically — instead of hand-editing `feature_columns()`/`assemble_features()`.
+
+**CLI (Python):**
+
+| Script | Purpose |
+|--------|---------|
+| `python3 scripts/migrate_factor_definitions.py [--db-*] [--no-overwrite-status]` | One-time seed of `factor_definitions` from the original 80-factor catalogue (preserved in `scripts/registry/seed_catalog.py`). Safe to re-run; `--no-overwrite-status` preserves a factor's status if it's already been promoted/deprecated by hand since the last seed. |
+| `python3 scripts/register_factor.py --key <key> --name <name> --category <cat> --direction {Positive,Negative,Bidirectional} --stated-min <f> --stated-max <f> [--data-type {numeric,boolean,categorical}] [--status {candidate,active,deprecated,explanatory_only}] [--source-table <t>] [--source-column <c>] [--computation-type {raw_column,derived_sql,derived_python_fn,eav}] [--derivation-ref <ref>] [--notes <text>]` | Upserts one `factor_definitions` row. |
+| `python3 scripts/register_factor.py --key <key> --status active --promote-only` | Changes only `status` on an existing factor (the candidate→active / active→deprecated promotion path). |
+
+**Coverage guard:** a `candidate`/`active` factor is only included in a training run's feature set
+once its non-null coverage on that run's rows clears `--min-feature-coverage` (default 5%) —
+below-threshold `active` factors, and every `candidate` factor regardless of coverage, are still
+computed and reported in `factor_coverage_report.csv`/`.json`, just excluded from the trained model.
+
+**Java Admin API (`/api/admin`)** — `FactorDefinitionController`, for a non-Python teammate to
+register/promote a factor or hand the system a spreadsheet of scores without touching Python or
+the Postgres console:
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /api/admin/factor-definitions?status=<status>` | Lists `factor_definitions` rows, optionally filtered by `status`. |
+| `GET /api/admin/factor-definitions/{key}` | Fetches one factor by `factorKey`; `404` if it doesn't exist. |
+| `POST /api/admin/factor-definitions` | Creates or updates (upsert-on-`factorKey`) one factor. |
+| `PATCH /api/admin/factor-definitions/{key}/status` | Changes only `status` — the promote/deprecate path. |
+| `POST /api/admin/factor-values` | Bulk-upserts `movie_factor_values` rows — the "hand the system a spreadsheet of scores" path for a factor with no dedicated column. |
+| `GET /api/admin/factor-definitions/status-counts` | `{status: count}` across `factor_definitions` — e.g. `{"active": 12, "candidate": 62, "deprecated": 3, "explanatory_only": 3}`. |
+
+**`POST /api/admin/factor-definitions`**
+
+```json
+{
+  "factorKey": "ticket_price_atp",
+  "name": "Average Ticket Price",
+  "category": "Financial",
+  "direction": "Positive",
+  "statedMin": 0.15,
+  "statedMax": 0.25,
+  "dataType": "numeric",
+  "status": "candidate",
+  "sourceTable": "ticket_price_index",
+  "sourceColumn": "atp_usd",
+  "computationType": "raw_column",
+  "derivationRef": null,
+  "addedBy": "jdoe",
+  "notes": "Hand-curated from PVR Inox / FICCI-EY quarterly reports"
+}
+```
+
+`factorKey`, `name`, `category`, `statedMin`, `statedMax` are required. `direction` (if present)
+must be one of `Positive`/`Negative`/`Bidirectional`; `dataType` one of
+`numeric`/`boolean`/`categorical` (default `numeric`); `status` one of
+`candidate`/`active`/`deprecated`/`explanatory_only` (default `candidate`); `computationType` one
+of `raw_column`/`derived_sql`/`derived_python_fn`/`eav`. A request violating any of these returns
+`400` with an `errors` array. Response: `200 OK` with `{"factorKey": ..., "status": ...}`.
+
+**`PATCH /api/admin/factor-definitions/{key}/status`**
+
+```json
+{ "status": "active" }
+```
+
+`200 OK` with `{"factorKey": ..., "status": ...}` on success; `400` for an invalid `status` value;
+`404` if `{key}` has no existing row (this endpoint only changes status on a factor that's already
+been registered — it does not create one).
+
+**`POST /api/admin/factor-values`**
+
+```json
+{
+  "values": [
+    { "movieKey": "Dune: Part Two|2024-03-01|english", "factorKey": "ticket_price_atp", "valueNumeric": 0.42 },
+    { "movieName": "Vikram", "releaseDate": "2022-06-03", "language": "tamil", "factorKey": "ticket_price_atp", "valueNumeric": 0.31 }
+  ]
+}
+```
+
+Each entry needs either `movieKey` directly, or `movieName`+`releaseDate`+`language` (the same
+composite Feature 1's `data_sources.entity_key` uses — the endpoint builds `movieKey` from them),
+plus `factorKey` and one of `valueNumeric`/`valueText`. Re-posting the same `(movieKey, factorKey)`
+updates the existing row in place (`ON CONFLICT ... DO UPDATE`) rather than duplicating it. `400`
+if any entry is missing an identifier, a `factorKey`, or a value; `200 OK` with
+`{"upserted": <n>}` on success.
+
+Note the movie-key format mismatch to watch for: `movie_factor_values.movie_key` (and
+`data_sources.entity_key`) is the **canonical per-row** `movie_name|release_date|language`
+composite — matching `movies_data_collection`'s own primary key — whereas
+`movie_revenue_impact_model.py`'s *internal* `movie_key` (used for post-dedup joins like
+`actors_by_movie`) is a coarser `lowercased-name|release_year` key with no language component,
+since `dedupe_movies()` collapses every dubbed-language release of a film into one training row.
+The script translates between the two automatically when resolving an `eav`-typed factor; API
+callers only ever need the canonical three-part form shown above.
 
