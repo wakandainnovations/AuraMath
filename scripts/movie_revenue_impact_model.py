@@ -1908,6 +1908,26 @@ def persist_model_artifact(model_name: str, model: object, scaler: StandardScale
     return path
 
 
+def persist_disclosure_artifact(disclosure_result: dict, models_dir: str) -> Optional[str]:
+    """joblib.dump Stage A's (Feature 4) fitted disclosure classifier bundle to
+    models/disclosure_classifier_{version}.joblib -- same convention as
+    persist_model_artifact above, one version-stamped file per run. Feature 9's
+    predict_movie.py loads this to score a brand-new row's disclosure_likelihood
+    on demand, instead of re-running fit_disclosure_classifier's full-corpus
+    KFold comparison on every single-movie prediction call."""
+    os.makedirs(models_dir, exist_ok=True)
+    model_version = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    path = os.path.join(models_dir, f"disclosure_classifier_{model_version}.joblib")
+    joblib.dump({
+        "model": disclosure_result["model"], "scaler": disclosure_result["scaler"],
+        "feature_columns": disclosure_result["feature_columns"],
+        "model_name": disclosure_result["winner"],
+        "trained_at": datetime.now(timezone.utc).isoformat(),
+        "n_rows": disclosure_result["n_rows"],
+    }, path)
+    return path
+
+
 # ---------------------------------------------------------------------------
 # Feature 0 (4): india-only-as-today vs. pooled-global vs. per-market comparison
 # ---------------------------------------------------------------------------
@@ -2135,6 +2155,15 @@ def fit_disclosure_classifier(full_df: pd.DataFrame) -> dict:
         # a model that trained on its own label), used both for Stage B's IPW
         # weights and for the disclosure_likelihood attached to predictions.
         "disclosure_likelihood": pd.Series(oof_probas[winner], index=full_df.index),
+        # The final full-corpus-fit model/scaler/feature_columns (not just the
+        # OOF diagnostics above) -- Feature 9's predict_movie.py needs to score
+        # a brand-new, never-before-seen row's disclosure_likelihood on demand
+        # without retraining Stage A from scratch on every single-movie
+        # prediction call. Non-JSON-serializable -- callers that json.dump()
+        # this dict (write_disclosure_outputs, main()'s model_comparison)
+        # exclude these three keys the same way they already exclude
+        # "disclosure_likelihood".
+        "model": final_model, "scaler": scaler, "feature_columns": feat_cols,
     }
 
 
@@ -2200,6 +2229,32 @@ def bootstrap_prediction_spread(df: pd.DataFrame, cols: list[str],
     }, index=df.index)
 
 
+def bootstrap_prediction_spread_for_row(train_df: pd.DataFrame, cols: list[str], target_X: np.ndarray,
+                                         sample_weight: Optional[pd.Series] = None,
+                                         n_iters: int = CONFIDENCE_BOOTSTRAP_ITERS) -> dict:
+    """Feature 9 variant of bootstrap_prediction_spread: fits each bootstrap
+    resample on `train_df` (a corpus of *historical* rows with real disclosed
+    ln_revenue) exactly like the original, but reads the spread of predictions
+    on a single external `target_X` row instead of scoring the same rows the
+    resample was fit on -- what a genuinely upcoming movie (no ln_revenue of
+    its own) needs, since it can't be part of `train_df` in the first place."""
+    rng = np.random.RandomState(RNG_SEED)
+    X = train_df[cols].fillna(0).values
+    y = train_df["ln_revenue"].values
+    w = sample_weight.reindex(train_df.index).values if sample_weight is not None else None
+    n = len(train_df)
+    preds = np.full(n_iters, np.nan)
+    for i in range(n_iters):
+        idx = rng.randint(0, n, size=n)
+        model = GradientBoostingRegressor(**CONFIDENCE_GBR_PARAMS)
+        try:
+            model.fit(X[idx], y[idx], sample_weight=w[idx] if w is not None else None)
+        except TypeError:
+            model.fit(X[idx], y[idx])
+        preds[i] = model.predict(target_X)[0]
+    return {"p10_log": float(np.percentile(preds, 10)), "p90_log": float(np.percentile(preds, 90))}
+
+
 def confidence_band_multiplier(disclosure_likelihood: pd.Series) -> pd.Series:
     lo_mult, hi_mult = CONFIDENCE_WIDTH_MULTIPLIER_RANGE
     p = disclosure_likelihood.fillna(disclosure_likelihood.median() if disclosure_likelihood.notna().any() else 0.5)
@@ -2229,9 +2284,12 @@ def attach_confidence_band(predictions: pd.DataFrame, df: pd.DataFrame, cols: li
     return out
 
 
+_DISCLOSURE_NON_SERIALIZABLE_KEYS = {"disclosure_likelihood", "model", "scaler"}
+
+
 def write_disclosure_outputs(disclosure_result: dict, full_df: pd.DataFrame, output_dir: str) -> None:
     os.makedirs(output_dir, exist_ok=True)
-    report = {k: v for k, v in disclosure_result.items() if k != "disclosure_likelihood"}
+    report = {k: v for k, v in disclosure_result.items() if k not in _DISCLOSURE_NON_SERIALIZABLE_KEYS}
     with open(os.path.join(output_dir, "disclosure_classifier_report.json"), "w") as f:
         json.dump(report, f, indent=2, default=float)
 
@@ -2802,6 +2860,9 @@ def main() -> None:
     disclosure_result = fit_disclosure_classifier(prerelease_full)
     print_disclosure_report(disclosure_result)
     write_disclosure_outputs(disclosure_result, prerelease_full, args.output_dir)
+    disclosure_artifact_path = persist_disclosure_artifact(disclosure_result, args.models_dir)
+    print(f"Persisted Stage A disclosure classifier artifact ({disclosure_result['winner']}) to "
+          f"{disclosure_artifact_path}.")
     disclosure_by_entity_key = disclosure_result["disclosure_likelihood"].copy()
     disclosure_by_entity_key.index = prerelease_full["entity_key"].values
 
@@ -2937,7 +2998,7 @@ def main() -> None:
     # model_comparison.json diff Feature 11 tracks run-over-run, not just
     # printed to the console.
     model_comparison["disclosure_classifier"] = {
-        k: v for k, v in disclosure_result.items() if k != "disclosure_likelihood"
+        k: v for k, v in disclosure_result.items() if k not in _DISCLOSURE_NON_SERIALIZABLE_KEYS
     }
     model_comparison["ipw_comparison"] = ipw_comparison
 
