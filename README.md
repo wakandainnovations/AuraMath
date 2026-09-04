@@ -2213,3 +2213,33 @@ rating/popularity, `overview`) are registered today; extending the connector (or
 named follow-up work for the cast/crew track-record factors, not done here — see `sources.yaml`'s
 notes on `the_movies_dataset` for the exact reasoning.
 
+#### 13e. Macro factors: Sensex + ticket-price index (Feature 6)
+
+Two new factors with no home anywhere in the original 80-factor business catalogue — broad
+market-sentiment and ticket-price level. Both are gated to the Indian market only (Feature 0's
+`market_is_india` flag / `infer_city_tier()`): joining a Sensex-derived sentiment number or a
+PVR Inox-sourced ticket price onto a Japanese or US release would be wrong, not just imprecise,
+same category of restriction as `INDIA_ONLY_CALENDAR_FACTOR_KEYS`.
+
+| Table / script | Purpose |
+|---|---|
+| `market_index_daily(index_name, trade_date, close)` | Reference table of BSE Sensex (`^BSESN`) / NSE Nifty (`^NSEI`) daily closes (`scripts/market_index_schema.py`). |
+| `python3 scripts/backfill_market_index.py [--start 1990-01-01] [--dry-run]` | Populates `market_index_daily` via `yfinance`. Pulls both tickers (Nifty is free on the same call shape, even though only Sensex backs a registered factor today). |
+| `ticket_price_index(period_start, period_end, region, city_tier, atp_usd, source_url)` | Hand-curated average-ticket-price reference table — no scrape-ready source exists, so this ships with **zero pre-seeded rows**; nothing here is fabricated. |
+| `python3 scripts/register_ticket_price.py --period-start ... --period-end ... --city-tier {tier_1,tier_2_3,national_average} --atp-usd ... --source-url ...` | Hand-enters one real `ticket_price_index` row, sourced from a PVR Inox quarterly investor-relations deck or the FICCI-EY "Media & Entertainment" annual report — `--source-url` is required, for auditability. |
+| `python3 scripts/register_feature6_factors.py` | Registers the two new `factor_definitions` rows (`status='candidate'`): `sensex_sentiment` and `ticket_price_level`. Both are genuinely new — flagged in their own `notes` as additions outside the original 90 stated-min/max slots, pending real business input on the band. |
+
+**How the join works, in `movie_revenue_impact_model.py`:** `assemble_features()` computes
+`sensex_close_at_release` and `sensex_90d_change_pct` per Indian-market row by joining
+`release_date` against `market_index_daily` on the nearest *prior* trading day (a Sensex/Nifty
+series has no entry on weekends/market holidays) — `sensex_90d_change_pct` (percent change over
+the 90 days before that close, a proxy for consumer discretionary sentiment at launch) is the raw
+signal behind the `sensex_sentiment` factor; `sensex_close_at_release` is carried onto the model
+frame for context only, with no factor of its own. `ticket_price_atp_usd` joins `release_date`
+against whichever `ticket_price_index` row's `[period_start, period_end]` window covers it, for
+the row's `infer_city_tier()`-inferred bucket (`tier_1`/`tier_2_3`/`national_average` — a coarse
+language/country-based proxy, same documented-approximation category as `FESTIVE_WINDOWS`, since
+this schema has no real per-movie release-city data). Both stay all-`NaN` — reported at 0%
+coverage, never force-fit into the trained feature set (Feature 2's coverage guard) — until
+`backfill_market_index.py`/`register_ticket_price.py` have actually been run.
+

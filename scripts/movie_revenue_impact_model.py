@@ -79,6 +79,9 @@ from connectors.schema import movie_entity_key  # noqa: E402
 from registry.schema import (  # noqa: E402
     ensure_factor_registry_schema, fetch_factor_definitions, fetch_movie_factor_values,
 )
+from market_index_schema import (  # noqa: E402
+    SENSEX_INDEX_NAME, fetch_market_index_series, fetch_ticket_price_index_rows, nearest_prior_close,
+)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -243,6 +246,24 @@ def load_eav_lookup(conn) -> dict[str, dict[str, float]]:
     eav_keys = [f["factor_key"] for f in FACTOR_DEFS
                 if f.get("computation_type") == "eav" and f["status"] in ("active", "candidate")]
     return fetch_movie_factor_values(conn, eav_keys)
+
+
+# Feature 6: the two macro-factor reference tables (see market_index_schema.py),
+# loaded once per run into these module-level globals -- same pattern as
+# FACTOR_DEFS above. SENSEX_SERIES/TICKET_PRICE_ROWS default to empty, so a
+# database where backfill_market_index.py/register_ticket_price.py haven't
+# been run yet degrades to "no signal" (sensex_sentiment/ticket_price_level
+# stay all-NaN, reported at 0% coverage) rather than crashing.
+SENSEX_SERIES: dict[str, pd.Series] = {}
+TICKET_PRICE_ROWS: list[dict] = []
+
+
+def load_market_index_data(conn) -> None:
+    """Populates SENSEX_SERIES/TICKET_PRICE_ROWS. Call once near the start
+    of a run, same as load_factor_registry/load_eav_lookup."""
+    global SENSEX_SERIES, TICKET_PRICE_ROWS
+    SENSEX_SERIES = fetch_market_index_series(conn)
+    TICKET_PRICE_ROWS = fetch_ticket_price_index_rows(conn)
 
 
 # Columns the model would like to read. Several of these (`genres`, `imdb_rating`,
@@ -450,6 +471,97 @@ def is_india_market_row(language_value, country_value) -> bool:
     if is_indian_language_field(language_value):
         return True
     return isinstance(country_value, str) and country_value.strip() == "India"
+
+
+# ---------------------------------------------------------------------------
+# Feature 6: macro factors -- Sensex 90-day pre-release momentum, ticket-price
+# level. Both join `movies_data_collection.release_date` against a reference
+# table (market_index_daily / ticket_price_index, see market_index_schema.py)
+# rather than a per-movie column, and both are restricted to the Indian
+# market -- a Sensex-derived "sentiment" number joined onto a Japanese or US
+# release, or a PVR Inox-sourced ticket price applied to a non-Indian title,
+# would be wrong, not just imprecise (same category of restriction as
+# INDIA_ONLY_CALENDAR_FACTOR_KEYS above).
+# ---------------------------------------------------------------------------
+
+def compute_sensex_features_raw(df: pd.DataFrame, india_mask: pd.Series) -> pd.DataFrame:
+    """Returns a 2-column frame: `sensex_close_at_release` (nearest prior
+    trading day's close) and `sensex_90d_change_pct` (percent change over the
+    90 days before that close) -- both NaN outside `india_mask` and wherever
+    `market_index_daily` has no Sensex data yet (backfill_market_index.py
+    hasn't been run). `sensex_90d_change_pct` is the raw signal
+    `sensex_sentiment` (DERIVED_FACTOR_FNS) reports; `sensex_close_at_release`
+    is carried onto the model frame for context/explainability only -- it has
+    no registered factor of its own, per the plan."""
+    out = pd.DataFrame(
+        {"sensex_close_at_release": np.nan, "sensex_90d_change_pct": np.nan}, index=df.index)
+    series = SENSEX_SERIES.get(SENSEX_INDEX_NAME)
+    if series is None or series.empty:
+        return out
+
+    parsed = df["release_date"].map(parse_release_date)
+    for idx in df.index:
+        if not india_mask.loc[idx]:
+            continue
+        release_dt = parsed.loc[idx]
+        if release_dt is None:
+            continue
+        close_now = nearest_prior_close(series, release_dt)
+        close_90d_ago = nearest_prior_close(series, release_dt - pd.Timedelta(days=90))
+        out.at[idx, "sensex_close_at_release"] = close_now
+        if close_now is not None and close_90d_ago:
+            out.at[idx, "sensex_90d_change_pct"] = 100.0 * (close_now - close_90d_ago) / close_90d_ago
+    return out
+
+
+def infer_city_tier(language_value, country_value) -> Optional[str]:
+    """Coarse city-tier proxy for the ticket_price_index join -- there is no
+    real per-movie release-city data anywhere in this schema, so this infers
+    a tier bucket from language, the same documented-approximation way
+    FESTIVE_WINDOWS stands in for a real per-year festival-date table: wide
+    Hindi/English-language releases skew toward Tier-1-heavy multiplex
+    distribution; other Indian-regional-language releases skew toward a more
+    Tier-2/3-heavy mix; anything outside the Indian market has no matching
+    ticket_price_index row at all. Must return one of
+    market_index_schema.TICKET_PRICE_CITY_TIERS (or None) -- register_ticket_price.py
+    enforces the same vocabulary on the write side so the join below always
+    has a chance of matching."""
+    if not is_india_market_row(language_value, country_value):
+        return None
+    lang = str(language_value or "").strip().lower()
+    if lang in {"hindi", "english"}:
+        return "tier_1"
+    if is_indian_language_field(language_value):
+        return "tier_2_3"
+    return "national_average"
+
+
+def compute_ticket_price_atp_raw(df: pd.DataFrame) -> pd.Series:
+    """Average ticket price (USD) for each row's inferred city_tier bucket
+    and release_date, from the hand-curated `ticket_price_index` table (see
+    register_ticket_price.py) -- NaN wherever no row's [period_start,
+    period_end] window covers the release_date for that tier, including
+    every non-Indian row (infer_city_tier returns None there) and, until
+    someone hand-enters real rows, every row at all (TICKET_PRICE_ROWS ships
+    empty)."""
+    out = pd.Series(np.nan, index=df.index)
+    if not TICKET_PRICE_ROWS:
+        return out
+
+    parsed = df["release_date"].map(parse_release_date)
+    tiers = df.apply(lambda r: infer_city_tier(r.get("language"), r.get("country")), axis=1)
+    for idx in df.index:
+        tier = tiers.loc[idx]
+        release_dt = parsed.loc[idx]
+        if tier is None or release_dt is None:
+            continue
+        for row in TICKET_PRICE_ROWS:
+            if row["city_tier"] != tier:
+                continue
+            if pd.Timestamp(row["period_start"]) <= release_dt <= pd.Timestamp(row["period_end"]):
+                out.at[idx] = float(row["atp_usd"])
+                break
+    return out
 
 
 def name_tokens(name) -> set[str]:
@@ -973,6 +1085,13 @@ DERIVED_FACTOR_FNS: dict[str, Callable[[pd.DataFrame, dict, dict, dict], pd.Seri
         lambda r: compute_director_prior_hit_rate(r["director_key"], r["release_year"], dbd), axis=1),
     "ensemble_avg_prior_hit_rate": lambda df, abm, aba, dbd: df.apply(
         lambda r: compute_ensemble_avg_prior_hit_rate(r["movie_key"], r["release_year"], abm, aba), axis=1),
+    # Feature 6: assemble_features() computes these two columns directly onto
+    # df before compute_registry_features runs (see the "Feature 6: macro
+    # factors" block above df["r_concept"] assembly) -- both are already
+    # India-market-masked/join-derived there, so these entries just read the
+    # column back rather than recomputing.
+    "sensex_sentiment": lambda df, abm, aba, dbd: df["sensex_90d_change_pct"],
+    "ticket_price_level": lambda df, abm, aba, dbd: df["ticket_price_atp_usd"],
 }
 
 
@@ -1182,6 +1301,18 @@ def assemble_features(df: pd.DataFrame, actors: pd.DataFrame, apply_india_filter
 
     df["r_director"] = compute_historical_anchor(df, "director_key")
     df["r_concept"] = compute_historical_anchor(df, "primary_genre")
+
+    # Feature 6: macro factors -- computed directly onto df (like
+    # market_is_india/budget_effective above) rather than through
+    # DERIVED_FACTOR_FNS's fixed 4-arg signature, since both need external
+    # reference-table data (SENSEX_SERIES/TICKET_PRICE_ROWS) that signature
+    # has no slot for. DERIVED_FACTOR_FNS['sensex_sentiment']/
+    # ['ticket_price_level'] below just read these columns back off df.
+    india_mask_for_macro = df["market_is_india"] == 1
+    sensex_feats = compute_sensex_features_raw(df, india_mask_for_macro)
+    df["sensex_close_at_release"] = sensex_feats["sensex_close_at_release"]
+    df["sensex_90d_change_pct"] = sensex_feats["sensex_90d_change_pct"]
+    df["ticket_price_atp_usd"] = compute_ticket_price_atp_raw(df)
 
     registry_feats, coverage_report = compute_registry_features(
         df, actors_by_movie, actors_by_actor, FACTOR_DEFS, eav_lookup or {}, directors_by_director)
@@ -2235,6 +2366,10 @@ def main() -> None:
         # querying the DB again per-row.
         load_factor_registry(conn)
         eav_lookup = load_eav_lookup(conn)
+        # Feature 6: Sensex/Nifty daily closes + the hand-curated ticket-price
+        # table, into the SENSEX_SERIES/TICKET_PRICE_ROWS globals -- same
+        # load-once-per-run pattern as the factor registry above.
+        load_market_index_data(conn)
 
         # Feature 4: load the FULL corpus (every row with a parseable release
         # year, disclosed or not) rather than the budget/revenue-floored

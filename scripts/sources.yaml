@@ -229,9 +229,13 @@ sources:
       atp_usd, source_url) from PVR Inox's public quarterly
       investor-relations presentations and the FICCI-EY "Media &
       Entertainment" annual report -- a manually-updated quarterly reference
-      table, not an automated connector. Table DDL + the join-to-movie logic
-      is Feature 6's job; this row exists only so the source is on the
-      record for this feature's "register every named source" scope.
+      table, not an automated connector. Implemented in Feature 6: schema in
+      scripts/market_index_schema.py, rows entered one at a time via
+      scripts/register_ticket_price.py (ships with zero pre-seeded rows --
+      real figures still need to be read off those two PDFs by hand), joined
+      to movies via infer_city_tier()/compute_ticket_price_atp_raw() in
+      movie_revenue_impact_model.py, feeding the ticket_price_level factor
+      (scripts/register_feature6_factors.py).
 
   - source_name: sensex_nifty
     entity_type: movie
@@ -241,6 +245,9 @@ sources:
       BSE Sensex (^BSESN) / NSE Nifty (^NSEI) via the `yfinance` Python
       library -- a package call against a time series, not a single fetch
       URL, so it doesn't fit this repo's html_scrape/api/kaggle_csv/
-      file_download connector shapes. market_index_daily population and the
-      sensex_close_at_release/sensex_90d_change_pct features are Feature 6's
-      job; listed here only for the registry record.
+      file_download connector shapes. Implemented in Feature 6:
+      scripts/backfill_market_index.py populates market_index_daily
+      (scripts/market_index_schema.py); movie_revenue_impact_model.py joins
+      each Indian-market row's release_date against it (nearest prior
+      trading day) to compute sensex_close_at_release/sensex_90d_change_pct,
+      feeding the sensex_sentiment factor (scripts/register_feature6_factors.py).
