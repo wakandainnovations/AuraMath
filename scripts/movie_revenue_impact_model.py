@@ -62,9 +62,13 @@ from typing import Callable, Optional
 import numpy as np
 import pandas as pd
 import psycopg2
-from sklearn.ensemble import GradientBoostingRegressor, HistGradientBoostingRegressor
-from sklearn.linear_model import Ridge
-from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error, r2_score
+from sklearn.ensemble import (
+    GradientBoostingClassifier, GradientBoostingRegressor, HistGradientBoostingRegressor,
+)
+from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.metrics import (
+    accuracy_score, mean_absolute_error, mean_absolute_percentage_error, r2_score, roc_auc_score,
+)
 from sklearn.model_selection import KFold
 from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler
@@ -148,6 +152,28 @@ DEFAULT_MIN_FEATURE_COVERAGE_PCT = 5.0
 INDIA_ONLY_CALENDAR_FACTOR_KEYS = {
     "holiday_release_window", "exam_schedules", "ipl_sporting_events", "summer_vacation_window",
 }
+
+# Feature 4: budget/revenue disclosure is MNAR (obscure/low-budget/foreign
+# films are both less likely to have tracked financials AND more likely to
+# have underperformed), not missing at random -- so instead of just training
+# Stage B's revenue regressor on the ~3-6% of rows with usable budget/revenue
+# and ignoring the selection effect, Stage A models P(disclosed) on the full
+# corpus and that probability feeds an inverse-probability weight into Stage B
+# plus a per-row confidence-band width. See fit_disclosure_classifier() below.
+DISCLOSURE_TOP_CATEGORIES = 20
+# Clip 1/P(disclosed) so a handful of near-zero-probability rows (a genuinely
+# obscure film that happens to have leaked financials anyway) don't dominate
+# Stage B's loss -- same clipping philosophy as CALIBRATION_CLIP above.
+IPW_WEIGHT_CLIP = (1.0, 20.0)
+# Bagged-bootstrap prediction-interval settings for the per-row confidence
+# band (reduced n_estimators vs. the primary GBR since this refits
+# CONFIDENCE_BOOTSTRAP_ITERS times just to read the spread of the estimate,
+# not to optimize point-prediction accuracy).
+CONFIDENCE_BOOTSTRAP_ITERS = 30
+CONFIDENCE_GBR_PARAMS = dict(n_estimators=150, max_depth=3, learning_rate=0.05, random_state=RNG_SEED)
+# Band half-width multiplier at disclosure_likelihood = 0 (few/no comparable
+# disclosed films back this estimate -- widen) vs. = 1 (well-covered -- narrow).
+CONFIDENCE_WIDTH_MULTIPLIER_RANGE = (1.6, 0.7)
 # Feature 2 note: the 80-entry business-supplied factor catalogue (categories
 # Narrative/Cast/Production/Marketing/Timing/Legal/Financial, each with a
 # stated min/max impact range) used to be a hardcoded `FACTOR_CATALOG` list
@@ -247,7 +273,8 @@ def fetch_existing_columns(conn, table_name: str) -> set[str]:
         return {row[0] for row in cur.fetchall()}
 
 
-def build_movies_sql(available_cols: list[str], restrict_to_india: bool) -> str:
+def build_movies_sql(available_cols: list[str], restrict_to_india: bool,
+                      require_financials: bool = True) -> str:
     select_cols = ", ".join(available_cols)
     # `restrict_to_india=False` (the `global`/`all` --market modes) keeps every row
     # passing the budget/revenue/year floors regardless of language/country --
@@ -257,18 +284,26 @@ def build_movies_sql(available_cols: list[str], restrict_to_india: bool) -> str:
         "\n      AND (language = ANY(%(indian_languages)s) OR btrim(country) = 'India')"
         if restrict_to_india else ""
     )
+    # `require_financials=False` (Feature 4's disclosure classifier) drops the
+    # budget/revenue floors entirely so the query returns the full corpus --
+    # every row with a parseable release year, disclosed or not -- instead of
+    # just the ~3-6% of rows the rest of the pipeline trains the revenue
+    # regressor on. has_financials is then derived in pandas from the raw
+    # (possibly null/zero) budget/revenue columns.
+    where_financials = (
+        "revenue >= %(min_revenue)s\n          AND budget > %(min_budget)s\n          AND "
+        if require_financials else ""
+    )
     return f"""
         SELECT {select_cols}
         FROM movies_data_collection
-        WHERE revenue >= %(min_revenue)s
-          AND budget > %(min_budget)s
-          AND left(release_date, 4) ~ '^[0-9]{{4}}$'
+        WHERE {where_financials}left(release_date, 4) ~ '^[0-9]{{4}}$'
           AND left(release_date, 4)::int > %(min_year)s{where_market}
     """
 
 
 def load_movies(conn, min_year: int, min_budget: int, min_revenue: int,
-                 restrict_to_india: bool) -> pd.DataFrame:
+                 restrict_to_india: bool, require_financials: bool = True) -> pd.DataFrame:
     existing = fetch_existing_columns(conn, "movies_data_collection")
     available_cols = [c for c in WANTED_MOVIE_COLUMNS if c in existing]
     missing_cols = [c for c in WANTED_MOVIE_COLUMNS if c not in existing]
@@ -276,7 +311,7 @@ def load_movies(conn, min_year: int, min_budget: int, min_revenue: int,
         print(f"Note: movies_data_collection is missing column(s) {missing_cols}; "
               f"treating them as always-NaN rather than failing the query.")
 
-    sql = build_movies_sql(available_cols, restrict_to_india)
+    sql = build_movies_sql(available_cols, restrict_to_india, require_financials)
     df = pd.read_sql(
         sql, conn,
         params={
@@ -291,6 +326,22 @@ def load_movies(conn, min_year: int, min_budget: int, min_revenue: int,
 
 def load_actor_credits(conn) -> pd.DataFrame:
     return pd.read_sql(ACTORS_SQL, conn)
+
+
+def has_financials_mask(df: pd.DataFrame) -> pd.Series:
+    """budget/revenue null-or-<=0 counts as 'not disclosed' -- Stage A's
+    (Feature 4) classification target and the same predicate the old SQL-level
+    floor used to enforce unconditionally."""
+    return (df["budget"] > 0) & (df["revenue"] > 0)
+
+
+def filter_financials(df: pd.DataFrame, min_budget: int, min_revenue: int) -> pd.DataFrame:
+    """Applies the same budget/revenue floor build_movies_sql used to apply at
+    the SQL level, in pandas -- lets main() load the full corpus once
+    (require_financials=False, for Stage A) and derive the disclosed subset
+    the rest of the pipeline already expects from it, instead of a second
+    round-trip to Postgres with the floor re-applied at the SQL level."""
+    return df[(df["budget"] > min_budget) & (df["revenue"] >= min_revenue)].reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
@@ -941,12 +992,14 @@ def time_based_split(df: pd.DataFrame, test_frac: float = 0.18) -> tuple[pd.Data
     return train, test
 
 
-def fit_predictive_model(train: pd.DataFrame, test: pd.DataFrame, cols: list[str]) -> dict:
+def fit_predictive_model(train: pd.DataFrame, test: pd.DataFrame, cols: list[str],
+                          sample_weight: Optional[pd.Series] = None) -> dict:
     Xtr, ytr = train[cols].fillna(0).values, train["ln_revenue"].values
     Xte, yte = test[cols].fillna(0).values, test["ln_revenue"].values
+    w = sample_weight.reindex(train.index).values if sample_weight is not None else None
 
     gbr = GradientBoostingRegressor(n_estimators=300, max_depth=3, learning_rate=0.05, random_state=RNG_SEED)
-    gbr.fit(Xtr, ytr)
+    gbr.fit(Xtr, ytr, sample_weight=w)
     pred_log = gbr.predict(Xte)
 
     ridge_coefs, scaler, ridge_model = fit_ridge(train, cols)
@@ -988,12 +1041,17 @@ MODEL_FACTORIES = {
 
 
 def cross_validated_predictions_for(df: pd.DataFrame, cols: list[str], model_name: str,
-                                     n_splits: int = CV_FOLDS) -> pd.Series:
+                                     n_splits: int = CV_FOLDS,
+                                     sample_weight: Optional[pd.Series] = None) -> pd.Series:
     """Same out-of-fold protocol as cross_validated_predictions, generalized to any model
     in MODEL_FACTORIES. Standardizing inputs is required for Ridge/MLP and harmless for
-    the tree models, so all four candidates run through one uniform pipeline."""
+    the tree models, so all four candidates run through one uniform pipeline.
+    `sample_weight` (Feature 4's inverse-probability weights) is passed to
+    `.fit()` when the model supports it; MLPRegressor doesn't, so it silently
+    falls back to an unweighted fit for that one model rather than crashing."""
     X = df[cols].fillna(0).values
     y = df["ln_revenue"].values
+    w = sample_weight.reindex(df.index).values if sample_weight is not None else None
     pred = np.full(len(df), np.nan)
     kf = KFold(n_splits=n_splits, shuffle=True, random_state=RNG_SEED)
     for train_idx, test_idx in kf.split(X):
@@ -1001,7 +1059,10 @@ def cross_validated_predictions_for(df: pd.DataFrame, cols: list[str], model_nam
         Xtr = scaler.fit_transform(X[train_idx])
         Xte = scaler.transform(X[test_idx])
         model = MODEL_FACTORIES[model_name]()
-        model.fit(Xtr, y[train_idx])
+        try:
+            model.fit(Xtr, y[train_idx], sample_weight=w[train_idx] if w is not None else None)
+        except TypeError:
+            model.fit(Xtr, y[train_idx])
         pred[test_idx] = model.predict(Xte)
     return pd.Series(pred, index=df.index)
 
@@ -1082,6 +1143,304 @@ def run_market_comparison(movies_raw_all: pd.DataFrame, actors: pd.DataFrame,
         "per_market_india": per_market_india,
         "per_market_other": per_market_other,
     }
+
+
+# ---------------------------------------------------------------------------
+# Feature 4: MNAR missing-financials modeling
+# ---------------------------------------------------------------------------
+# 513,198/544,424 rows (94.3%) have budget null/0 and 525,637 (96.6%) have
+# revenue null/0, almost certainly MNAR -- obscure/low-budget/foreign films
+# are both less likely to have tracked financials AND more likely to have
+# underperformed. Training Stage B (the revenue regressor) only on the
+# disclosed subset, as the rest of this script otherwise does, silently
+# assumes the pattern that holds for films whose financials get published
+# also holds for the long tail that never gets tracked. Stage A below models
+# P(disclosed) on the FULL corpus so that assumption can be corrected for
+# (inverse-probability weighting) and surfaced (a per-row confidence band and
+# a `disclosure_likelihood` field), instead of just being ignored.
+
+# Deliberately excludes anything derived from budget/revenue/trailer
+# telemetry: those are either the target itself or correlated with whether a
+# row's financials got tracked in the first place -- exactly the selection
+# effect Stage A exists to model, not a legitimate predictor of it. Note:
+# the plan's "director prior-film count" pre-release factor is Feature 5's
+# job to compute properly (an actors_data_collection self-join); Stage A
+# below computes its own lightweight version directly from
+# movies_data_collection.directors so Feature 4 doesn't have to wait on
+# Feature 5 landing first -- Feature 5, once built, can supersede this with
+# its richer version without changing Stage A's shape.
+DISCLOSURE_MODEL_FACTORIES = {
+    "logistic_regression": lambda: LogisticRegression(max_iter=1000, C=1.0, random_state=RNG_SEED),
+    "gbc": lambda: GradientBoostingClassifier(n_estimators=200, max_depth=3, learning_rate=0.05,
+                                               random_state=RNG_SEED),
+}
+
+
+def compute_director_prior_release_counts(distinct_movies: pd.DataFrame) -> pd.Series:
+    """Count of strictly-earlier-released movies (by release_year) credited to
+    the same primary director, computed on a frame already deduplicated to one
+    row per (movie_name, release_year) -- Stage A's own pre-release-only proxy
+    for director track record (see module note above re: Feature 5). Uses
+    np.searchsorted per director group instead of a python loop: sorting each
+    director's release years and searching each row's own year into that
+    sorted array gives 'count of years strictly less than mine' directly,
+    correctly collapsing same-year multi-language duplicates without treating
+    them as leaking into each other's prior count."""
+    out = pd.Series(0, index=distinct_movies.index, dtype=int)
+    has_director = distinct_movies["director_key"].fillna("") != ""
+    for _key, grp in distinct_movies[has_director].groupby("director_key"):
+        years = grp["release_year"].to_numpy()
+        sorted_years = np.sort(years)
+        out.loc[grp.index] = np.searchsorted(sorted_years, years, side="left")
+    return out
+
+
+def compute_prerelease_movie_attrs(df: pd.DataFrame) -> pd.DataFrame:
+    """Per-row release_year / primary_genre / director_key / franchise_flag /
+    director_prior_release_count, computed once on a deduplicated
+    (movie_name, release_year) view -- so a title's simultaneous language
+    editions don't inflate another film's director-prior-films count or its
+    own franchise sequel count -- then broadcast back onto every row
+    (including every language edition) of the full, non-deduplicated corpus
+    Stage A trains on. Unlike dedupe_movies() elsewhere in this script, this
+    dedup doesn't need to pick a single 'best' representative row (nothing
+    downstream here reads revenue/budget), so it keeps the first occurrence
+    per (movie_name, release_year) rather than sorting by completeness."""
+    d = df.copy()
+    d["release_year"] = d["release_date"].map(parse_release_year).astype(int)
+    d["primary_genre_disclosure"] = d["genre"].map(primary_genre)
+    d["primary_genre_disclosure"] = d["primary_genre_disclosure"].where(
+        d["primary_genre_disclosure"] != "unknown", d["genres"].map(primary_genre))
+    d["director_key"] = d["directors"].fillna("").str.split(",").str[0].str.strip().str.lower()
+    d["movie_key"] = d["movie_name"].str.strip().str.lower() + "|" + d["release_year"].astype(str)
+
+    distinct = d.drop_duplicates(subset="movie_key").copy()
+    stems = distinct["movie_name"].map(franchise_stem)
+    stem_counts = stems.value_counts()
+    distinct["franchise_flag"] = stems.map(lambda s: 1 if stem_counts.get(s, 0) >= 2 else 0)
+    distinct["director_prior_release_count"] = compute_director_prior_release_counts(distinct)
+
+    lookup = distinct.set_index("movie_key")[["franchise_flag", "director_prior_release_count"]]
+    d = d.merge(lookup, on="movie_key", how="left", suffixes=("", ""))
+    d["entity_key"] = d.apply(
+        lambda r: movie_entity_key(r["movie_name"], r["release_date"], r["language"]), axis=1)
+    return d
+
+
+def _top_k_bucketed(series: pd.Series, k: int = DISCLOSURE_TOP_CATEGORIES) -> pd.Series:
+    top = series.value_counts().head(k).index
+    return series.where(series.isin(top), "other")
+
+
+def build_disclosure_features(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """Pre-release-only, always-available design matrix for Stage A: genre,
+    language, country, release year, franchise flag, director prior-release
+    count -- exactly the plan's named feature list, one-hot encoding the three
+    categoricals (bucketing anything outside the top DISCLOSURE_TOP_CATEGORIES
+    values as 'other' so a long tail of one-off languages/countries doesn't
+    blow up the design matrix)."""
+    feats = pd.DataFrame(index=df.index)
+    feats["release_year"] = df["release_year"].astype(float)
+    feats["franchise_flag"] = df["franchise_flag"].astype(float)
+    feats["director_prior_release_count"] = df["director_prior_release_count"].astype(float)
+
+    genre = _top_k_bucketed(df["primary_genre_disclosure"].fillna("unknown"))
+    language = _top_k_bucketed(df["language"].fillna("unknown").str.strip().str.lower())
+    country = _top_k_bucketed(df["country"].fillna("unknown").str.strip())
+    cat = pd.get_dummies(
+        pd.DataFrame({"genre": genre, "language": language, "country": country}),
+        prefix=["genre", "language", "country"],
+    )
+    full = pd.concat([feats, cat], axis=1)
+    return full, list(full.columns)
+
+
+def cross_validated_disclosure_proba(X: np.ndarray, y: np.ndarray, model_name: str,
+                                      n_splits: int = CV_FOLDS) -> np.ndarray:
+    """Out-of-fold predicted P(disclosed), same protocol as
+    cross_validated_predictions_for -- needed both to report an honest
+    AUC/accuracy (not inflated by scoring a model on rows it trained on) and
+    because Stage B's inverse-probability weights must come from a
+    disclosure-probability estimate that didn't see that row's own label
+    during its own fold."""
+    proba = np.full(len(y), np.nan)
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=RNG_SEED)
+    for train_idx, test_idx in kf.split(X):
+        scaler = StandardScaler()
+        Xtr = scaler.fit_transform(X[train_idx])
+        Xte = scaler.transform(X[test_idx])
+        model = DISCLOSURE_MODEL_FACTORIES[model_name]()
+        model.fit(Xtr, y[train_idx])
+        proba[test_idx] = model.predict_proba(Xte)[:, 1]
+    return proba
+
+
+def fit_disclosure_classifier(full_df: pd.DataFrame) -> dict:
+    """Stage A (Feature 4): binary classifier for has_financials =
+    (budget>0 AND revenue>0), trained on the FULL corpus that clears the year
+    floor -- not just the ~3-6% of rows that pass the budget/revenue floor --
+    using only pre-release-always-available features. Compares
+    LogisticRegression against GradientBoostingClassifier via out-of-fold
+    AUC and keeps whichever wins; reports both as a first-class output
+    (accuracy/AUC/feature importances), not just internal plumbing, since
+    'is this movie even in a class of films whose revenue tends to get
+    tracked' is a useful signal on its own."""
+    feats, feat_cols = build_disclosure_features(full_df)
+    X = feats.fillna(0).values
+    y = has_financials_mask(full_df).astype(int).values
+
+    model_comparison = {}
+    oof_probas = {}
+    for name in DISCLOSURE_MODEL_FACTORIES:
+        proba = cross_validated_disclosure_proba(X, y, name)
+        oof_probas[name] = proba
+        model_comparison[name] = {
+            "auc": round(float(roc_auc_score(y, proba)), 4),
+            "accuracy_at_0.5": round(float(accuracy_score(y, (proba >= 0.5).astype(int))), 4),
+        }
+    winner = max(model_comparison, key=lambda n: model_comparison[n]["auc"])
+
+    scaler = StandardScaler()
+    Xs = scaler.fit_transform(X)
+    final_model = DISCLOSURE_MODEL_FACTORIES[winner]()
+    final_model.fit(Xs, y)
+    if hasattr(final_model, "feature_importances_"):
+        importances = dict(zip(feat_cols, final_model.feature_importances_.tolist()))
+    else:
+        importances = dict(zip(feat_cols, (final_model.coef_[0] / scaler.scale_).tolist()))
+    importances = dict(sorted(importances.items(), key=lambda kv: -abs(kv[1])))
+
+    return {
+        "winner": winner,
+        "model_comparison": model_comparison,
+        "feature_importances": importances,
+        "n_rows": int(len(full_df)), "n_disclosed": int(y.sum()), "n_undisclosed": int(len(y) - y.sum()),
+        # OOF probability for every full-corpus row -- honest (no row scored by
+        # a model that trained on its own label), used both for Stage B's IPW
+        # weights and for the disclosure_likelihood attached to predictions.
+        "disclosure_likelihood": pd.Series(oof_probas[winner], index=full_df.index),
+    }
+
+
+def compute_ipw_weights(disclosure_likelihood: pd.Series, clip_range: tuple = IPW_WEIGHT_CLIP) -> pd.Series:
+    """1 / P(disclosed), clipped -- a row from a class of films rarely seen
+    with tracked financials counts more in Stage B's loss, so the regressor
+    doesn't implicitly learn only the pattern that holds for the
+    well-covered, high-disclosure-probability slice of the corpus."""
+    p = disclosure_likelihood.fillna(disclosure_likelihood.median()).clip(lower=1e-3, upper=1.0)
+    return (1.0 / p).clip(*clip_range)
+
+
+def compare_ipw_weighting(df: pd.DataFrame, cols: list[str], model_name: str = "gbr") -> dict:
+    """Weighted vs. unweighted CV accuracy for Stage B's primary regressor --
+    keep whichever wins on within_30pct (ties broken by median_abs_pct_error),
+    same comparison convention run_market_comparison uses for Feature 0.
+    MLPRegressor doesn't accept sample_weight; this comparison is scoped to
+    the tree/linear models (default 'gbr', today's champion) that do."""
+    unweighted_pred = cross_validated_predictions_for(df, cols, model_name)
+    _, unweighted = evaluate_full_corpus_accuracy(df, unweighted_pred)
+
+    weights = compute_ipw_weights(df["disclosure_likelihood"])
+    weighted_pred = cross_validated_predictions_for(df, cols, model_name, sample_weight=weights)
+    _, weighted = evaluate_full_corpus_accuracy(df, weighted_pred)
+
+    def score(s: dict) -> tuple:
+        return (s["within_30pct"]["pct_correct"], -s["median_abs_pct_error"])
+
+    winner = "weighted" if score(weighted) > score(unweighted) else "unweighted"
+    return {"model_name": model_name, "unweighted": unweighted, "weighted": weighted, "winner": winner}
+
+
+def bootstrap_prediction_spread(df: pd.DataFrame, cols: list[str],
+                                 sample_weight: Optional[pd.Series] = None,
+                                 n_iters: int = CONFIDENCE_BOOTSTRAP_ITERS) -> pd.DataFrame:
+    """Bagged-tree-style bootstrap prediction interval: refit a (reduced)
+    GBR on n_iters bootstrap resamples of df and read the spread of predicted
+    ln(revenue) per row across resamples -- the same 'refit on resampled
+    data, read the spread of the estimate' idea bootstrap_calibration already
+    uses for Ridge coefficients, applied here to per-row predictions. This is
+    an in-sample bagging spread (each resample is fit on -- and scores -- the
+    same df), not a fold-held-out spread: cheap enough to run
+    CONFIDENCE_BOOTSTRAP_ITERS times without multiplying by CV_FOLDS, and
+    adequate for a *width* estimate (it's rescaled by disclosure_likelihood
+    below anyway, not used as the point prediction itself)."""
+    rng = np.random.RandomState(RNG_SEED)
+    X = df[cols].fillna(0).values
+    y = df["ln_revenue"].values
+    w = sample_weight.reindex(df.index).values if sample_weight is not None else None
+    n = len(df)
+    preds = np.full((n_iters, n), np.nan)
+    for i in range(n_iters):
+        idx = rng.randint(0, n, size=n)
+        model = GradientBoostingRegressor(**CONFIDENCE_GBR_PARAMS)
+        try:
+            model.fit(X[idx], y[idx], sample_weight=w[idx] if w is not None else None)
+        except TypeError:
+            model.fit(X[idx], y[idx])
+        preds[i] = model.predict(X)
+    return pd.DataFrame({
+        "p10_log": np.percentile(preds, 10, axis=0),
+        "p90_log": np.percentile(preds, 90, axis=0),
+    }, index=df.index)
+
+
+def confidence_band_multiplier(disclosure_likelihood: pd.Series) -> pd.Series:
+    lo_mult, hi_mult = CONFIDENCE_WIDTH_MULTIPLIER_RANGE
+    p = disclosure_likelihood.fillna(disclosure_likelihood.median() if disclosure_likelihood.notna().any() else 0.5)
+    return lo_mult + p.clip(0, 1) * (hi_mult - lo_mult)
+
+
+def attach_confidence_band(predictions: pd.DataFrame, df: pd.DataFrame, cols: list[str],
+                            disclosure_likelihood: pd.Series,
+                            sample_weight: Optional[pd.Series] = None,
+                            n_iters: int = CONFIDENCE_BOOTSTRAP_ITERS) -> pd.DataFrame:
+    """Adds disclosure_likelihood/confidence_band_low/confidence_band_high to
+    an evaluate_full_corpus_accuracy() predictions frame: a title with a low
+    disclosure_likelihood (few comparable disclosed films back its estimate)
+    gets a wider band around the same point prediction; a well-covered title
+    gets a narrower one -- so a downstream consumer can tell 'well-supported
+    estimate' from 'thin-comparables guess' instead of one flat number."""
+    dl = disclosure_likelihood.reindex(df.index)
+    spread = bootstrap_prediction_spread(df, cols, sample_weight, n_iters=n_iters)
+    mult = confidence_band_multiplier(dl)
+    center_log = np.log(predictions["predicted_revenue"].clip(lower=1.0)).values
+    half_width_log = ((spread["p90_log"] - spread["p10_log"]) / 2.0).values * mult.values
+
+    out = predictions.copy()
+    out["disclosure_likelihood"] = dl.round(4).values
+    out["confidence_band_low"] = np.exp(center_log - half_width_log).round(0)
+    out["confidence_band_high"] = np.exp(center_log + half_width_log).round(0)
+    return out
+
+
+def write_disclosure_outputs(disclosure_result: dict, full_df: pd.DataFrame, output_dir: str) -> None:
+    os.makedirs(output_dir, exist_ok=True)
+    report = {k: v for k, v in disclosure_result.items() if k != "disclosure_likelihood"}
+    with open(os.path.join(output_dir, "disclosure_classifier_report.json"), "w") as f:
+        json.dump(report, f, indent=2, default=float)
+
+    likelihood_df = pd.DataFrame({
+        "movie_name": full_df["movie_name"], "release_date": full_df["release_date"],
+        "language": full_df["language"], "has_financials": has_financials_mask(full_df).values,
+        "disclosure_likelihood": disclosure_result["disclosure_likelihood"].round(4).values,
+    })
+    likelihood_df.to_csv(os.path.join(output_dir, "disclosure_likelihood.csv"), index=False)
+    print(f"Wrote {output_dir}/disclosure_classifier_report.json and disclosure_likelihood.csv "
+          f"({disclosure_result['winner']} won: AUC="
+          f"{disclosure_result['model_comparison'][disclosure_result['winner']]['auc']})")
+
+
+def print_disclosure_report(disclosure_result: dict) -> None:
+    print("\n-- Stage A: budget/revenue disclosure classifier (Feature 4) --")
+    print(f"  Full corpus: {disclosure_result['n_rows']} rows "
+          f"({disclosure_result['n_disclosed']} disclosed / {disclosure_result['n_undisclosed']} not)")
+    for name, m in disclosure_result["model_comparison"].items():
+        marker = "  <- winner" if name == disclosure_result["winner"] else ""
+        print(f"  {name:20s} AUC={m['auc']:.4f}  accuracy@0.5={m['accuracy_at_0.5']:.4f}{marker}")
+    top_feats = list(disclosure_result["feature_importances"].items())[:8]
+    print("  Top feature importances:")
+    for name, val in top_feats:
+        print(f"    {name:<24s} {val:+.4f}")
 
 
 # ---------------------------------------------------------------------------
@@ -1247,18 +1606,23 @@ def write_nn_outputs(nn_factor_table: list[dict], model_comparison: dict,
 # Full-corpus out-of-fold prediction accuracy
 # ---------------------------------------------------------------------------
 
-def cross_validated_predictions(df: pd.DataFrame, cols: list[str], n_splits: int = CV_FOLDS) -> pd.Series:
+def cross_validated_predictions(df: pd.DataFrame, cols: list[str], n_splits: int = CV_FOLDS,
+                                 sample_weight: Optional[pd.Series] = None) -> pd.Series:
     """Out-of-fold ln(revenue) prediction for every row via K-fold GBR, so each
     movie is scored by a model that never saw its own revenue during training --
     unlike just refitting on the full corpus and predicting back on it, which
-    would report in-sample fit and overstate accuracy."""
+    would report in-sample fit and overstate accuracy. `sample_weight` (Feature
+    4's inverse-probability weights) is applied when compare_ipw_weighting()
+    found weighting wins for this corpus; None reproduces the old unweighted
+    behavior exactly."""
     X = df[cols].fillna(0).values
     y = df["ln_revenue"].values
+    w = sample_weight.reindex(df.index).values if sample_weight is not None else None
     pred = np.full(len(df), np.nan)
     kf = KFold(n_splits=n_splits, shuffle=True, random_state=RNG_SEED)
     for train_idx, test_idx in kf.split(X):
         gbr = GradientBoostingRegressor(n_estimators=300, max_depth=3, learning_rate=0.05, random_state=RNG_SEED)
-        gbr.fit(X[train_idx], y[train_idx])
+        gbr.fit(X[train_idx], y[train_idx], sample_weight=w[train_idx] if w is not None else None)
         pred[test_idx] = gbr.predict(X[test_idx])
     return pd.Series(pred, index=df.index)
 
@@ -1532,6 +1896,13 @@ def parse_args() -> argparse.Namespace:
                          "set. Below-threshold active factors (and every candidate factor, "
                          "regardless of coverage) are still computed and reported in "
                          "factor_coverage_report.csv/.json, just excluded from the model.")
+    p.add_argument("--confidence-bootstrap-iters", type=int, default=CONFIDENCE_BOOTSTRAP_ITERS,
+                    dest="confidence_bootstrap_iters",
+                    help="Feature 4: number of bootstrap refits used to estimate each row's "
+                         f"confidence-band width (default {CONFIDENCE_BOOTSTRAP_ITERS}). Set to 0 "
+                         "to skip the confidence-band step entirely (movie_revenue_predictions.csv "
+                         "still gets disclosure_likelihood, just no confidence_band_low/high) -- "
+                         "useful for a fast dev-iteration run against a small corpus.")
     return p.parse_args()
 
 
@@ -1549,21 +1920,39 @@ def main() -> None:
         load_factor_registry(conn)
         eav_lookup = load_eav_lookup(conn)
 
-        # Always load every market at the SQL level (restrict_to_india=False) --
-        # the india-only row set (for --market india, and for the fixed baseline
-        # half of the market comparison below) is derived from this in Python via
-        # is_india_market_row, rather than round-tripping the DB a second time.
-        movies_raw_all = load_movies(conn, args.min_year, args.min_budget, args.min_revenue,
-                                      restrict_to_india=False)
+        # Feature 4: load the FULL corpus (every row with a parseable release
+        # year, disclosed or not) rather than the budget/revenue-floored
+        # subset -- Stage A's disclosure classifier needs to see the ~94-97%
+        # of rows the rest of the pipeline can't train a revenue regressor on.
+        # The disclosed subset (movies_raw_all, same rows the old single query
+        # returned) is then just a pandas filter of this, avoiding a second
+        # round-trip to Postgres with the floor re-applied at the SQL level.
+        full_corpus_raw = load_movies(conn, args.min_year, args.min_budget, args.min_revenue,
+                                       restrict_to_india=False, require_financials=False)
+        movies_raw_all = filter_financials(full_corpus_raw, args.min_budget, args.min_revenue)
         actors_raw = load_actor_credits(conn)
     finally:
         conn.close()
-    print(f"Loaded {len(movies_raw_all)} raw movie rows (all markets), {len(actors_raw)} actor-credit rows.")
+    print(f"Loaded {len(full_corpus_raw)} full-corpus movie rows (all markets, any disclosure status); "
+          f"{len(movies_raw_all)} have disclosed budget+revenue. {len(actors_raw)} actor-credit rows.")
     print(f"Factor registry: {len(FACTOR_DEFS)} factor_definitions rows "
           f"({sum(1 for f in FACTOR_DEFS if f['status'] == 'active')} active, "
           f"{sum(1 for f in FACTOR_DEFS if f['status'] == 'candidate')} candidate).")
 
     actors = build_actor_features(actors_raw)
+
+    # Feature 4, Stage A: disclosure classifier on the full corpus, using only
+    # pre-release-always-available features -- run once up front so its
+    # per-row disclosure_likelihood is available to both Stage B's
+    # inverse-probability weighting and the confidence-band step below.
+    print("\nFitting Stage A disclosure classifier "
+          "(P(budget/revenue disclosed) on the full corpus, Feature 4)...")
+    prerelease_full = compute_prerelease_movie_attrs(full_corpus_raw)
+    disclosure_result = fit_disclosure_classifier(prerelease_full)
+    print_disclosure_report(disclosure_result)
+    write_disclosure_outputs(disclosure_result, prerelease_full, args.output_dir)
+    disclosure_by_entity_key = disclosure_result["disclosure_likelihood"].copy()
+    disclosure_by_entity_key.index = prerelease_full["entity_key"].values
 
     if args.market == "india":
         india_mask_raw = movies_raw_all.apply(
@@ -1580,6 +1969,21 @@ def main() -> None:
     full = assemble_features(movies, actors, apply_india_filter=apply_india_filter, eav_lookup=eav_lookup)
     model_df = prepare_model_frame(full)
 
+    # Feature 4: attach each row's Stage A disclosure_likelihood by the same
+    # exact (movie_name, release_date, language) composite key data_sources/
+    # movie_factor_values use -- model_df's own movie_key (lowercased-name|
+    # release_year) collapses dubbed-language editions, which would blur
+    # rows the disclosure model scored individually.
+    model_df["entity_key"] = model_df.apply(
+        lambda r: movie_entity_key(r["movie_name"], r["release_date"], r["language"]), axis=1)
+    model_df["disclosure_likelihood"] = model_df["entity_key"].map(disclosure_by_entity_key)
+    n_unmatched = int(model_df["disclosure_likelihood"].isna().sum())
+    if n_unmatched:
+        print(f"Note: {n_unmatched}/{len(model_df)} rows didn't match a Stage A entity_key "
+              f"(unparseable release_year edge case); backfilling with the corpus median.")
+    model_df["disclosure_likelihood"] = model_df["disclosure_likelihood"].fillna(
+        model_df["disclosure_likelihood"].median())
+
     train, test = time_based_split(model_df)
     cols = feature_columns(model_df, args.min_feature_coverage)
     factor_keys_used = factor_keys_used_from_cols(cols)
@@ -1589,8 +1993,21 @@ def main() -> None:
     print_factor_coverage_report(full.attrs.get("coverage_report", []))
     write_factor_coverage_report(full.attrs.get("coverage_report", []), args.output_dir)
 
+    # Feature 4, Stage B: compare inverse-probability-weighted vs. unweighted
+    # CV accuracy for the primary GBR pipeline and keep whichever wins, rather
+    # than assuming IPW helps without checking -- same "measure, don't assume"
+    # convention run_market_comparison uses for the pooled-vs-per-market call.
+    print("\nComparing IPW-weighted vs. unweighted Stage B regressor (Feature 4)...")
+    ipw_comparison = compare_ipw_weighting(model_df, cols, model_name="gbr")
+    print(f"  unweighted: within_30pct={ipw_comparison['unweighted']['within_30pct']['pct_correct']}%  "
+          f"median_abs_pct_error={ipw_comparison['unweighted']['median_abs_pct_error']}%")
+    print(f"  weighted:   within_30pct={ipw_comparison['weighted']['within_30pct']['pct_correct']}%  "
+          f"median_abs_pct_error={ipw_comparison['weighted']['median_abs_pct_error']}%")
+    print(f"  winner: {ipw_comparison['winner']}")
+    sample_weight = compute_ipw_weights(model_df["disclosure_likelihood"]) if ipw_comparison["winner"] == "weighted" else None
+
     bootstrap = bootstrap_calibration(train, cols)
-    model_metrics = fit_predictive_model(train, test, cols)
+    model_metrics = fit_predictive_model(train, test, cols, sample_weight=sample_weight)
 
     factor_table = calibrate_factor_table(full, bootstrap)
     baseline = calibrate_baseline_anchors(bootstrap)
@@ -1598,9 +2015,16 @@ def main() -> None:
     print_report(factor_table, baseline, model_metrics, len(train), len(test))
     write_outputs(factor_table, baseline, model_metrics, args.output_dir)
 
-    oof_pred_log = cross_validated_predictions(model_df, cols)
+    oof_pred_log = cross_validated_predictions(model_df, cols, sample_weight=sample_weight)
     predictions, accuracy_summary = evaluate_full_corpus_accuracy(model_df, oof_pred_log)
     print_accuracy_report(accuracy_summary)
+
+    if args.confidence_bootstrap_iters > 0:
+        print(f"\nEstimating per-row confidence bands ({args.confidence_bootstrap_iters} bootstrap "
+              f"refits, Feature 4)...")
+        predictions = attach_confidence_band(
+            predictions, model_df, cols, model_df["disclosure_likelihood"], sample_weight=sample_weight,
+            n_iters=args.confidence_bootstrap_iters)
     write_prediction_outputs(predictions, accuracy_summary, args.output_dir)
 
     print("\nComparing direct revenue-prediction models (Ridge / GBR / HistGBR / MLP neural net)...")
@@ -1611,6 +2035,14 @@ def main() -> None:
     # factor X actually help" empirically -- added after printing so it
     # doesn't get mistaken for a fifth model's results.
     model_comparison["factor_keys_used"] = factor_keys_used
+    # Feature 4: record Stage A's own accuracy plus the weighted-vs-unweighted
+    # Stage B comparison so "did IPW actually help" is visible in the same
+    # model_comparison.json diff Feature 11 tracks run-over-run, not just
+    # printed to the console.
+    model_comparison["disclosure_classifier"] = {
+        k: v for k, v in disclosure_result.items() if k != "disclosure_likelihood"
+    }
+    model_comparison["ipw_comparison"] = ipw_comparison
 
     # Feature 0 (4): india-only-as-today vs. pooled-global vs. per-market, always
     # computed and written under new keys so the improvement (or lack of it) from
