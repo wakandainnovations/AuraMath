@@ -336,6 +336,10 @@ WANTED_MOVIE_COLUMNS = [
     # connector hasn't run yet, same graceful-missing-column handling as
     # genres/imdb_rating above.
     "production_companies", "overview",
+    # cbfc_rating: added alongside the data-entry UI (scripts/data_entry_ui.py) --
+    # the factor_definitions row for this existed since Feature 3/7 registration
+    # but had no backing column ("No certification column" in its notes) until now.
+    "cbfc_rating",
 ]
 
 ACTORS_SQL = """
@@ -1128,6 +1132,23 @@ def compute_joint_production_partnerships_raw(df: pd.DataFrame) -> pd.Series:
     return df["production_companies"].map(_count_companies)
 
 
+# CBFC certification -> ordinal accessibility score (U = broadest audience/most
+# accessible, UA = moderate, A = adults-only/most restrictive). Unrecognized or
+# missing certifications map to NaN (no signal) rather than a guessed middle
+# value -- percentile_into_band() rescales whatever's left into cbfc_rating's
+# stated [-0.3, +0.3] Bidirectional band the usual way.
+CBFC_RATING_ORDINAL = {"U": 2.0, "UA": 1.0, "S": 1.0, "A": 0.0}
+
+
+def compute_cbfc_rating_raw(df: pd.DataFrame) -> pd.Series:
+    normalized = (
+        df["cbfc_rating"].astype(str).str.strip().str.upper()
+        .str.replace(" ", "", regex=False).str.replace("-", "", regex=False)
+        .str.replace("/", "", regex=False)
+    )
+    return normalized.map(CBFC_RATING_ORDINAL)
+
+
 REMAKE_PHRASE_PATTERN = re.compile(
     r"(?i)\b(official\s+remake\s+of|remake\s+of\s+the|is\s+a\s+remake\s+of|"
     r"remake\s+of\s+the\s+\d{4}|based\s+on\s+the\s+\d{4}\s+film)\b"
@@ -1231,6 +1252,10 @@ DERIVED_FACTOR_FNS: dict[str, Callable[[pd.DataFrame, dict, dict, dict], pd.Seri
     "joint_production_partnerships": lambda df, abm, aba, dbd: compute_joint_production_partnerships_raw(df),
     "subtitle_dubbing_quality": lambda df, abm, aba, dbd: df["dubbing_breadth_count"],
     "remake_rights_detected": lambda df, abm, aba, dbd: compute_remake_rights_detected_raw(df),
+    # Registered since Feature 3/7 but never had a backing column ("No
+    # certification column" in its factor_definitions.notes) until
+    # scripts/data_entry_ui.py's cbfc_rating text column landed.
+    "cbfc_rating": lambda df, abm, aba, dbd: compute_cbfc_rating_raw(df),
 }
 
 
