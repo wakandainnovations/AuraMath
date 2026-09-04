@@ -34,27 +34,49 @@ from registry.schema import ensure_factor_registry_schema, fetch_factor_definiti
 from registry.seed_catalog import seed_rows  # noqa: E402
 
 
+_WIRING_FIELDS = ("computation_type", "derivation_ref", "source_table", "source_column", "notes")
+
+
 def migrate(conn, overwrite_status: bool = True) -> dict:
     ensure_factor_registry_schema(conn)
-    existing = {row["factor_key"]: row["status"] for row in fetch_factor_definitions(conn)}
+    existing = {row["factor_key"]: row for row in fetch_factor_definitions(conn)}
 
-    inserted, updated, skipped_status = 0, 0, 0
+    inserted, updated, skipped_status, wiring_preserved = 0, 0, 0, 0
     for row in seed_rows():
         row = dict(row)
         row.pop("catalog_id", None)
         was_present = row["factor_key"] in existing
-        if was_present and not overwrite_status and existing[row["factor_key"]] != row["status"]:
+        if was_present and not overwrite_status and existing[row["factor_key"]]["status"] != row["status"]:
             # Someone already promoted/demoted this factor via register_factor.py
             # or the Java admin API -- don't stomp on that with the seed default.
-            row["status"] = existing[row["factor_key"]]
+            row["status"] = existing[row["factor_key"]]["status"]
             skipped_status += 1
+        # This seed only knows the 12 factors MEASURABLE_WIRING wired up as of
+        # Feature 2's original migration -- every other catalog row here still
+        # has computation_type=None. A later feature (Feature 7 in particular:
+        # unlike Feature 5/6's brand-new adjacent keys, it directly promotes
+        # existing catalog slots like joint_production_partnerships/state_bans
+        # via register_feature7_factors.py) can wire one of those same
+        # factor_keys up for real after this migration has already run once.
+        # Re-running this "one-time seed" later must not silently un-wire that
+        # -- only overwrite computation_type/derivation_ref/source_table/
+        # source_column/notes when the seed itself defines a real computation
+        # path (MEASURABLE_WIRING), or the existing row was never wired up to
+        # begin with.
+        if was_present and row.get("computation_type") is None and existing[row["factor_key"]].get("computation_type"):
+            for field in _WIRING_FIELDS:
+                row[field] = existing[row["factor_key"]][field]
+            wiring_preserved += 1
         register_factor(conn, **row)
         if was_present:
             updated += 1
         else:
             inserted += 1
 
-    return {"inserted": inserted, "updated": updated, "status_preserved": skipped_status}
+    return {
+        "inserted": inserted, "updated": updated, "status_preserved": skipped_status,
+        "wiring_preserved": wiring_preserved,
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -83,7 +105,10 @@ def main() -> None:
 
     print(f"factor_definitions seeded: {result['inserted']} inserted, {result['updated']} updated"
           + (f", {result['status_preserved']} kept their existing (already-changed) status"
-             if result["status_preserved"] else "") + ".")
+             if result["status_preserved"] else "")
+          + (f", {result['wiring_preserved']} kept their existing (already-wired-up-since) "
+             f"computation_type/derivation_ref/source_table/source_column/notes"
+             if result["wiring_preserved"] else "") + ".")
 
 
 if __name__ == "__main__":

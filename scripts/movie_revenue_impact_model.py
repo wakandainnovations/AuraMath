@@ -283,6 +283,15 @@ WANTED_MOVIE_COLUMNS = [
     "trailer_days_to_release", "teaser_days_to_release", "song_days_to_release",
     "trailer_views", "teaser_views", "trailer_comments", "teaser_comments",
     "conflict_balance_score", "narrative_novelty_score",
+    # Feature 7: production_companies is a real live column (see
+    # compute_joint_production_partnerships_raw); overview is not live on
+    # movies_data_collection today but is a target_column Feature 3's
+    # the_movies_dataset source (sources.yaml) writes via collect_data.py's
+    # ALTER TABLE ADD COLUMN IF NOT EXISTS -- degrades to all-NaN (and
+    # remake_rights_detected reports 0% coverage) on a DB where that
+    # connector hasn't run yet, same graceful-missing-column handling as
+    # genres/imdb_rating above.
+    "production_companies", "overview",
 ]
 
 ACTORS_SQL = """
@@ -423,6 +432,17 @@ def dedupe_movies(df: pd.DataFrame) -> pd.DataFrame:
     split; collapse to one row per (movie, release year) first, preferring the most
     complete record."""
     df = df.copy()
+
+    # Feature 7: dubbing/localization-breadth proxy for the subtitle_dubbing_quality
+    # catalogue slot (quality itself isn't measurable, breadth is) -- count of
+    # sibling rows sharing (movie_name, release_date) but a different `language`,
+    # i.e. how many simultaneous language releases a title had. Computed HERE,
+    # before drop_duplicates below collapses those sibling rows to one, since
+    # every dedupe_movies() call site feeds straight into assemble_features() and
+    # the signal can't be reconstructed after the sibling rows are gone.
+    dubbing_group_key = df["movie_name"].astype(str).str.strip().str.lower() + "|" + df["release_date"].astype(str)
+    df["dubbing_breadth_count"] = df.groupby(dubbing_group_key)["language"].transform("nunique").astype(float)
+
     df["release_year"] = df["release_date"].map(parse_release_year)
     df = df[df["release_year"].notna()]
     df["release_year"] = df["release_year"].astype(int)
@@ -1046,6 +1066,72 @@ def compute_summer_window_raw(df: pd.DataFrame) -> pd.Series:
     return month.isin(SUMMER_VACATION_MONTHS).where(month.notna()).astype(float)
 
 
+# ---------------------------------------------------------------------------
+# Feature 7: two zero-new-data legal/financial factors, computed directly from
+# columns already in movies_data_collection -- no connector required. See
+# register_feature7_factors.py for the factor_definitions registration.
+# ---------------------------------------------------------------------------
+
+def compute_joint_production_partnerships_raw(df: pd.DataFrame) -> pd.Series:
+    """Count of comma-separated entries in movies_data_collection.production_companies
+    -- a real column, real signal, available today with zero new data collection
+    (catalogue slot 89). NaN (not 0) when production_companies itself is blank,
+    so a genuinely-unknown row doesn't get scored as "zero partnerships"."""
+    def _count_companies(value) -> float:
+        if pd.isna(value) or not str(value).strip():
+            return np.nan
+        return float(len([c for c in str(value).split(",") if c.strip()]))
+    return df["production_companies"].map(_count_companies)
+
+
+REMAKE_PHRASE_PATTERN = re.compile(
+    r"(?i)\b(official\s+remake\s+of|remake\s+of\s+the|is\s+a\s+remake\s+of|"
+    r"remake\s+of\s+the\s+\d{4}|based\s+on\s+the\s+\d{4}\s+film)\b"
+)
+
+
+def compute_remake_rights_detected_raw(df: pd.DataFrame) -> pd.Series:
+    """Higher-confidence half of catalogue slot 78 (plagiarism_remake_rights),
+    split out per the plan since remake-rights detection is a genuine
+    pre-release fact while the plagiarism-allegation half is a rare news event
+    (see plagiarism_allegation_events / LEGAL_EVENT_KEYWORDS below). Regex over
+    `overview` (Feature 3's the_movies_dataset synopsis column) for explicit
+    "official remake of ___" / "is a remake of ___" phrasing -- a real,
+    if narrow, synopsis-NLP signal, not TMDB "belongs to collection" metadata
+    (that needs a live TMDB API id lookup this repo doesn't have wired yet;
+    see sources.yaml's tmdb_api_certification note for the same gap).
+    NaN (not 0) when `overview` is null/absent -- movies_data_collection has
+    no `overview` column on a DB where Feature 3's the_movies_dataset source
+    hasn't been collected yet (WANTED_MOVIE_COLUMNS backfills it as all-NaN),
+    so this degrades to 0% coverage rather than a false-negative 0."""
+    if "overview" not in df.columns:
+        return pd.Series(np.nan, index=df.index)
+    overview = df["overview"]
+    detected = overview.map(
+        lambda v: 1.0 if isinstance(v, str) and REMAKE_PHRASE_PATTERN.search(v) else (np.nan if pd.isna(v) else 0.0)
+    )
+    return detected
+
+
+# Feature 7: shared legal/controversy news-event feed (GDELT DOC 2.0 API,
+# see connectors/news_event_feed.py + backfill_legal_news_events.py) --
+# one connector class, seven factor_keys, keyword set differs per factor,
+# connector logic doesn't. All seven are rare, mostly-zero events: most
+# movies have zero legal drama, so even a perfectly accurate detector
+# produces a mostly-zero flag with limited standalone lift on model
+# accuracy -- built because it's cheap once the shared connector exists and
+# Feature 8's SHAP output will show empirically whether any of them actually
+# move predictions, not because any one is expected to be a top driver.
+# Populated via movie_factor_values (computation_type='eav'), not a Python
+# fn here -- DERIVED_FACTOR_FNS has no slot for these; they're resolved by
+# resolve_factor_raw_and_banded's eav branch instead, same as any other
+# EAV-backed factor.
+LEGAL_NEWS_EVENT_FACTOR_KEYS = (
+    "state_bans", "pre_release_leak", "title_ownership_disputes", "copyright_claims",
+    "distribution_disputes", "name_similarity_disputes", "plagiarism_allegation_events",
+)
+
+
 # Feature 2: registry-driven factor resolution. Each entry is a raw-signal
 # function keyed by `derivation_ref` (matched against factor_definitions rows
 # with computation_type='derived_python_fn') -- this is where the raw compute
@@ -1092,6 +1178,15 @@ DERIVED_FACTOR_FNS: dict[str, Callable[[pd.DataFrame, dict, dict, dict], pd.Seri
     # column back rather than recomputing.
     "sensex_sentiment": lambda df, abm, aba, dbd: df["sensex_90d_change_pct"],
     "ticket_price_level": lambda df, abm, aba, dbd: df["ticket_price_atp_usd"],
+    # Feature 7: joint_production_partnerships/subtitle_dubbing_quality are
+    # direct promotions of catalogue slots 89/86 (not new adjacent keys, unlike
+    # the Feature 5/6 entries above) -- both compute from columns already on
+    # df with zero new data collection. dubbing_breadth_count is precomputed
+    # by dedupe_movies() (see its docstring) since the sibling-language rows
+    # it counts are destroyed by that same function's collapse.
+    "joint_production_partnerships": lambda df, abm, aba, dbd: compute_joint_production_partnerships_raw(df),
+    "subtitle_dubbing_quality": lambda df, abm, aba, dbd: df["dubbing_breadth_count"],
+    "remake_rights_detected": lambda df, abm, aba, dbd: compute_remake_rights_detected_raw(df),
 }
 
 

@@ -251,3 +251,73 @@ sources:
       each Indian-market row's release_date against it (nearest prior
       trading day) to compute sensex_close_at_release/sensex_90d_change_pct,
       feeding the sensex_sentiment factor (scripts/register_feature6_factors.py).
+
+  - source_name: tmdb_api_certification
+    entity_type: movie
+    connector_type: api
+    skip_registration: true
+    notes: >
+      Feature 7's cbfc_rating factor -- TMDB's per-country certification
+      field (GET /movie/{id}/release_dates), distinct from the tmdb_5000
+      Kaggle CSV above (that's a bulk static snapshot with no certification
+      column; this is the live TMDB REST API, needs an API key). Not
+      registered as a real data_sources row yet: it's a two-step lookup
+      (search-by-title to resolve a numeric TMDB id, then GET the
+      release_dates endpoint for that id) that ApiConnector's single
+      dot-path-per-URL shape doesn't do in one call -- same category of gap
+      as imdb_non_commercial's two-file join, would need a dedicated
+      backfill_tmdb_certification.py (built on connectors.entity_resolution/
+      bulk_upsert) rather than a collect_data.py row. See
+      register_feature7_factors.py's cbfc_rating notes.
+
+  - source_name: screen_count_sources
+    entity_type: movie
+    connector_type: html_scrape
+    skip_registration: true
+    notes: >
+      Feature 7's screen_count_allocation factor -- Indian trade sites
+      routinely report opening-day/weekend screen counts: Sacnilk (already
+      a named source above), Box Office India, Koimoi. Prioritize this over
+      cbfc_rating/tax_exemptions per the plan -- real, credible, and
+      multiple sources already named. Not registered as a real data_sources
+      row yet: needs a sample page's CSS-selector field_mapping reviewed
+      against a live page first, same as the_numbers/sacnilk-movie-level
+      above. See register_feature7_factors.py's screen_count_allocation notes.
+
+  - source_name: tax_exemptions_search
+    entity_type: movie
+    connector_type: api
+    skip_registration: true
+    notes: >
+      Feature 7's tax_exemptions factor -- a targeted keyword news search
+      ("<movie name>" AND "tax free") when a state grants a film tax-free
+      status; public policy, reported explicitly by entertainment press.
+      Same shape as the shared legal news-event feed (legal_news_feed
+      below) but not folded into it: a tax-exemption grant is a
+      positive-direction policy event, not a negative-direction
+      controversy, so it needs its own keyword set and sign. A dedicated
+      search is named follow-up work, not built in this pass. See
+      register_feature7_factors.py's tax_exemptions notes.
+
+  - source_name: legal_news_feed
+    entity_type: movie
+    connector_type: api
+    skip_registration: true
+    notes: >
+      Feature 7's shared legal/controversy news-event feed -- ONE connector
+      (NewsEventFeedConnector, GDELT DOC 2.0 API, no key needed) behind
+      SEVEN factors at once: state_bans, pre_release_leak,
+      title_ownership_disputes, copyright_claims, distribution_disputes,
+      name_similarity_disputes, plagiarism_allegation_events -- same
+      "searchable news event of type X" shape, only the keyword set
+      differs per factor (connectors/news_event_feed.py's
+      LEGAL_EVENT_KEYWORDS). Not registered as a per-row data_sources entry
+      like a single-entity API source: it needs SEVEN queries per movie
+      (one per keyword set) against a release-date-anchored window, which
+      doesn't fit collect_data.py's one-URL-per-row dispatch -- implemented
+      instead as scripts/backfill_legal_news_events.py (same "own script"
+      reasoning as sensex_nifty/world_bank above), writing into
+      movie_factor_values (computation_type='eav') rather than new
+      movies_data_collection columns, since these are sparse rare-event
+      signals. See register_feature7_factors.py for the factor_definitions
+      registration.
