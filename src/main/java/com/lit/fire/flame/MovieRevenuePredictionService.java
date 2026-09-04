@@ -13,20 +13,17 @@ import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
-import java.util.Properties;
 import java.util.concurrent.TimeUnit;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 /**
  * Feature 9: shells out to {@code scripts/predict_movie.py} for a single
  * upcoming-movie revenue prediction. The model itself is a Python job (the
  * champion artifact Feature 8 persists via joblib, plus Feature 4's
  * disclosure classifier) -- this is the first {@link ProcessBuilder} bridge
- * in the Java app, the same shape Feature 10's {@code MovieRevenuePredictionScheduler}
- * will later reuse for the weekly full-corpus batch re-scoring job, following
- * the plan's note to reuse the same connection details {@link DataSourceConfig}
- * already loads from {@code secrets.txt} rather than hardcoding a second copy.
+ * in the Java app, the same shape {@link MovieRevenuePredictionScheduler}
+ * (Feature 10) reuses for the weekly full-corpus batch re-scoring job --
+ * both go through {@link MovieRevenueModelDbConnectionDetails} rather than
+ * each parsing {@code secrets.txt} a second time.
  *
  * {@code predict_movie.py} is written to keep its progress/diagnostic
  * messages on stderr and print exactly one JSON result line to stdout, so
@@ -37,8 +34,6 @@ import java.util.regex.Pattern;
 public class MovieRevenuePredictionService {
 
     private static final Logger log = LoggerFactory.getLogger(MovieRevenuePredictionService.class);
-    private static final Pattern JDBC_URL_PATTERN =
-        Pattern.compile("jdbc:postgresql://([^:/]+):(\\d+)/([^?]+)");
 
     private final ObjectMapper objectMapper;
     private final String pythonExecutable;
@@ -72,7 +67,12 @@ public class MovieRevenuePredictionService {
      * output -- the caller (the controller) turns that into a 4xx/5xx.
      */
     public Map<String, Object> predict(Map<String, Object> attrs) {
-        DbConnectionDetails db = loadDbConnectionDetails();
+        MovieRevenueModelDbConnectionDetails db;
+        try {
+            db = MovieRevenueModelDbConnectionDetails.load();
+        } catch (IllegalStateException e) {
+            throw new PredictionException(e.getMessage(), e);
+        }
         ProcessBuilder pb = new ProcessBuilder(
             pythonExecutable, scriptPath,
             "--db-host", db.host, "--db-port", db.port, "--db-name", db.name,
@@ -182,26 +182,4 @@ public class MovieRevenuePredictionService {
         return null;
     }
 
-    private record DbConnectionDetails(String host, String port, String name, String user, String password) {}
-
-    /** Same secrets.txt {@link DataSourceConfig} already loads -- one source of truth for DB connection details. */
-    private DbConnectionDetails loadDbConnectionDetails() {
-        Properties dbProperties = new Properties();
-        try (InputStream in = getClass().getClassLoader().getResourceAsStream("secrets.txt")) {
-            if (in != null) {
-                dbProperties.load(in);
-            }
-        } catch (IOException e) {
-            log.warn("Could not load secrets.txt: {}", e.getMessage());
-        }
-        String url = dbProperties.getProperty("db.url", "jdbc:postgresql://localhost:5432/aura");
-        String user = dbProperties.getProperty("db.user", "postgres");
-        String password = dbProperties.getProperty("db.password", "postgres");
-
-        Matcher matcher = JDBC_URL_PATTERN.matcher(url);
-        if (!matcher.matches()) {
-            throw new PredictionException("Could not parse db.url from secrets.txt: " + url);
-        }
-        return new DbConnectionDetails(matcher.group(1), matcher.group(2), matcher.group(3), user, password);
-    }
 }

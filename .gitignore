@@ -45,3 +45,7 @@ src/main/resources/secrets.txt
 ### Python ###
 __pycache__/
 /output/
+# Feature 8: persisted revenue_model_*.joblib/disclosure_classifier_*.joblib artifacts -- generated, not source.
+/models/
+# catboost's own auto-generated per-run training log directory (Feature 8's CatBoostRegressor).
+catboost_info/

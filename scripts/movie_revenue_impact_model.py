@@ -95,22 +95,26 @@ from sklearn.preprocessing import StandardScaler
 _OPTIONAL_DEPENDENCY_IMPORT_ERRORS: dict[str, str] = {}
 try:
     from xgboost import XGBRegressor
-except ImportError as _exc:  # pragma: no cover -- exercised only when xgboost isn't installed
+except Exception as _exc:  # noqa: BLE001 -- pragma: no cover -- not just ImportError: e.g. on macOS
+    # without Homebrew's libomp, `pip install xgboost` succeeds but the import raises
+    # xgboost's own XGBoostError (a RuntimeError) trying to dlopen libxgboost.dylib.
+    # Catching broadly is what actually delivers the "graceful degradation" this
+    # block's intro comment promises -- ImportError alone only covers "not installed".
     XGBRegressor = None
     _OPTIONAL_DEPENDENCY_IMPORT_ERRORS["xgboost"] = str(_exc)
 try:
     from lightgbm import LGBMRegressor
-except ImportError as _exc:  # pragma: no cover
+except Exception as _exc:  # noqa: BLE001 -- pragma: no cover -- same native-lib-load caveat as xgboost above
     LGBMRegressor = None
     _OPTIONAL_DEPENDENCY_IMPORT_ERRORS["lightgbm"] = str(_exc)
 try:
     from catboost import CatBoostRegressor
-except ImportError as _exc:  # pragma: no cover
+except Exception as _exc:  # noqa: BLE001 -- pragma: no cover -- same native-lib-load caveat as xgboost above
     CatBoostRegressor = None
     _OPTIONAL_DEPENDENCY_IMPORT_ERRORS["catboost"] = str(_exc)
 try:
     import shap
-except ImportError as _exc:  # pragma: no cover
+except Exception as _exc:  # noqa: BLE001 -- pragma: no cover -- same native-lib-load caveat as xgboost above
     shap = None
     _OPTIONAL_DEPENDENCY_IMPORT_ERRORS["shap"] = str(_exc)
 
@@ -2520,7 +2524,8 @@ def evaluate_full_corpus_accuracy(df: pd.DataFrame, pred_ln_revenue: pd.Series,
     abs_pct_error = (predicted - actual).abs() / actual
 
     rows = pd.DataFrame({
-        "movie_name": df["movie_name"], "release_year": df["release_year"],
+        "movie_name": df["movie_name"], "release_date": df["release_date"], "language": df["language"],
+        "release_year": df["release_year"],
         "actual_revenue": actual, "predicted_revenue": predicted.round(0),
         "abs_pct_error": abs_pct_error.round(4),
     })
@@ -2711,6 +2716,190 @@ def write_factor_coverage_report(coverage_report: list[dict], output_dir: str) -
     with open(os.path.join(output_dir, "factor_coverage_report.json"), "w") as f:
         json.dump(coverage_report, f, indent=2, default=float)
     print(f"Wrote {output_dir}/factor_coverage_report.csv and .json")
+
+
+# ---------------------------------------------------------------------------
+# Feature 10: serve predictions/factor scores/accuracy history from Postgres,
+# alongside the existing CSV/JSON writers above -- output/* stays the offline-
+# analysis destination, these tables are what MovieRevenuePredictionController
+# reads from the Java app. Same ensureSchema()-style CREATE TABLE IF NOT EXISTS
+# + upsert convention persist_feature5_columns/predict_movie.py's
+# persist_prediction already use.
+# ---------------------------------------------------------------------------
+
+# Same table predict_movie.py (Feature 9) pre-created for its own is_upcoming=true
+# rows -- defined here (the "main" module) and imported by predict_movie.py so
+# both writers share one schema definition rather than two copies drifting apart.
+MOVIE_REVENUE_PREDICTIONS_SCHEMA_SQL = """
+    CREATE TABLE IF NOT EXISTS movie_revenue_predictions (
+        movie_name text, release_date text, language text,
+        predicted_revenue numeric, confidence_band_low numeric, confidence_band_high numeric,
+        actual_revenue numeric, abs_pct_error numeric, is_upcoming boolean default false,
+        model_name text, model_version text, factor_keys_used jsonb, generated_at timestamptz,
+        primary key (movie_name, release_date, language)
+    )
+"""
+
+FACTOR_IMPACT_SCORES_SCHEMA_SQL = """
+    CREATE TABLE IF NOT EXISTS factor_impact_scores (
+        factor_key text PRIMARY KEY, name text, category text, direction text,
+        stated_min numeric, stated_max numeric, status text, proxy_note text,
+        coverage_pct numeric, corr_with_ln_revenue numeric,
+        calibrated_min numeric, calibrated_max numeric, calibration_point_multiplier numeric,
+        source text, n_obs integer, beta_p50 numeric, mean_abs_shap numeric,
+        generated_at timestamptz
+    )
+"""
+
+MODEL_COMPARISON_HISTORY_SCHEMA_SQL = """
+    CREATE TABLE IF NOT EXISTS model_comparison_history (
+        id serial PRIMARY KEY, model_name text, run_at timestamptz default now(),
+        n_movies integer, within_20pct numeric, within_30pct numeric, within_50pct numeric,
+        median_abs_pct_error numeric, factor_keys_used jsonb
+    )
+"""
+
+
+def model_version_from_artifact_path(path: str) -> str:
+    """Inverse of persist_model_artifact's `revenue_model_{version}.joblib` naming
+    -- avoids changing that function's (tested) return type just to also hand back
+    the version string; the version is fully recoverable from the path it returns."""
+    base = os.path.basename(path)
+    prefix, suffix = "revenue_model_", ".joblib"
+    if base.startswith(prefix) and base.endswith(suffix):
+        return base[len(prefix):-len(suffix)]
+    return base
+
+
+def persist_movie_revenue_predictions(conn, predictions: pd.DataFrame, model_name: str,
+                                       model_version: str, factor_keys_used: list[str]) -> int:
+    """Upserts every backtested row (is_upcoming=false, actual_revenue/abs_pct_error
+    populated) into the same movie_revenue_predictions table predict_movie.py writes
+    is_upcoming=true rows into -- one table serves both cases, per the plan, keyed on
+    the (movie_name, release_date, language) primary key Feature 1's data_sources/
+    Feature 2's movie_factor_values also use."""
+    with conn.cursor() as cur:
+        cur.execute(MOVIE_REVENUE_PREDICTIONS_SCHEMA_SQL)
+    conn.commit()
+
+    generated_at = datetime.now(timezone.utc)
+    factor_keys_json = psycopg2.extras.Json(factor_keys_used)
+    param_rows = []
+    for _, row in predictions.iterrows():
+        release_date, language = row.get("release_date"), row.get("language")
+        if pd.isna(release_date) or pd.isna(language):
+            # PK needs all three columns -- dedupe_movies always keeps a real
+            # release_date/language on the row it picks, so this should be rare;
+            # skip rather than write a row that can never match the PK on conflict.
+            continue
+        param_rows.append((
+            row["movie_name"], str(release_date), str(language),
+            None if pd.isna(row.get("predicted_revenue")) else float(row["predicted_revenue"]),
+            None if pd.isna(row.get("confidence_band_low")) else float(row["confidence_band_low"]),
+            None if pd.isna(row.get("confidence_band_high")) else float(row["confidence_band_high"]),
+            None if pd.isna(row.get("actual_revenue")) else float(row["actual_revenue"]),
+            None if pd.isna(row.get("abs_pct_error")) else float(row["abs_pct_error"]),
+            model_name, model_version, factor_keys_json, generated_at,
+        ))
+
+    sql = """
+        INSERT INTO movie_revenue_predictions
+            (movie_name, release_date, language, predicted_revenue,
+             confidence_band_low, confidence_band_high, actual_revenue, abs_pct_error,
+             is_upcoming, model_name, model_version, factor_keys_used, generated_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, false, %s, %s, %s, %s)
+        ON CONFLICT (movie_name, release_date, language) DO UPDATE SET
+            predicted_revenue = EXCLUDED.predicted_revenue,
+            confidence_band_low = EXCLUDED.confidence_band_low,
+            confidence_band_high = EXCLUDED.confidence_band_high,
+            actual_revenue = EXCLUDED.actual_revenue, abs_pct_error = EXCLUDED.abs_pct_error,
+            is_upcoming = false, model_name = EXCLUDED.model_name,
+            model_version = EXCLUDED.model_version, factor_keys_used = EXCLUDED.factor_keys_used,
+            generated_at = EXCLUDED.generated_at
+    """
+    with conn.cursor() as cur:
+        psycopg2.extras.execute_batch(cur, sql, param_rows)
+    conn.commit()
+    return len(param_rows)
+
+
+def persist_factor_impact_scores(conn, factor_table: list[dict]) -> int:
+    """Upserts factor_impact_scores.csv's exact row shape into Postgres --
+    the served, always-current counterpart to that CSV snapshot."""
+    with conn.cursor() as cur:
+        cur.execute(FACTOR_IMPACT_SCORES_SCHEMA_SQL)
+    conn.commit()
+
+    generated_at = datetime.now(timezone.utc)
+    param_rows = [
+        {
+            "factor_key": r["key"], "name": r["name"], "category": r["category"],
+            "direction": r["direction"], "stated_min": r["stated_min"], "stated_max": r["stated_max"],
+            "status": r.get("status"), "proxy_note": r.get("proxy_note"),
+            "coverage_pct": r.get("coverage_pct"), "corr_with_ln_revenue": r.get("corr_with_ln_revenue"),
+            "calibrated_min": r.get("calibrated_min"), "calibrated_max": r.get("calibrated_max"),
+            "calibration_point_multiplier": r.get("calibration_point_multiplier"),
+            "source": r.get("source"), "n_obs": r.get("n_obs"), "beta_p50": r.get("beta_p50"),
+            "mean_abs_shap": r.get("mean_abs_shap"), "generated_at": generated_at,
+        }
+        for r in factor_table
+    ]
+    sql = """
+        INSERT INTO factor_impact_scores
+            (factor_key, name, category, direction, stated_min, stated_max, status, proxy_note,
+             coverage_pct, corr_with_ln_revenue, calibrated_min, calibrated_max,
+             calibration_point_multiplier, source, n_obs, beta_p50, mean_abs_shap, generated_at)
+        VALUES (%(factor_key)s, %(name)s, %(category)s, %(direction)s, %(stated_min)s, %(stated_max)s,
+                %(status)s, %(proxy_note)s, %(coverage_pct)s, %(corr_with_ln_revenue)s,
+                %(calibrated_min)s, %(calibrated_max)s, %(calibration_point_multiplier)s,
+                %(source)s, %(n_obs)s, %(beta_p50)s, %(mean_abs_shap)s, %(generated_at)s)
+        ON CONFLICT (factor_key) DO UPDATE SET
+            name = EXCLUDED.name, category = EXCLUDED.category, direction = EXCLUDED.direction,
+            stated_min = EXCLUDED.stated_min, stated_max = EXCLUDED.stated_max,
+            status = EXCLUDED.status, proxy_note = EXCLUDED.proxy_note,
+            coverage_pct = EXCLUDED.coverage_pct, corr_with_ln_revenue = EXCLUDED.corr_with_ln_revenue,
+            calibrated_min = EXCLUDED.calibrated_min, calibrated_max = EXCLUDED.calibrated_max,
+            calibration_point_multiplier = EXCLUDED.calibration_point_multiplier,
+            source = EXCLUDED.source, n_obs = EXCLUDED.n_obs, beta_p50 = EXCLUDED.beta_p50,
+            mean_abs_shap = EXCLUDED.mean_abs_shap, generated_at = EXCLUDED.generated_at
+    """
+    with conn.cursor() as cur:
+        psycopg2.extras.execute_batch(cur, sql, param_rows)
+    conn.commit()
+    return len(param_rows)
+
+
+def persist_model_comparison_history(conn, model_name: str, accuracy_summary: dict,
+                                      factor_keys_used: list[str]) -> None:
+    """Feature 11: appends (never overwrites) one row per run -- unlike
+    output/model_comparison.json (write_nn_outputs, open(..., "w")), which is
+    replaced in place every run, this table accumulates so a future accuracy
+    regression (bad data pull, upstream schema drift, a stale connector) shows
+    up as a visible trend, and so 'did adding factor X actually move accuracy'
+    is answerable by diffing two rows before/after that factor was promoted to
+    active. Also what Feature 10's /accuracy endpoint reads a 'latest run' row
+    from."""
+    with conn.cursor() as cur:
+        cur.execute(MODEL_COMPARISON_HISTORY_SCHEMA_SQL)
+    conn.commit()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO model_comparison_history
+                (model_name, n_movies, within_20pct, within_30pct, within_50pct,
+                 median_abs_pct_error, factor_keys_used)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                model_name, accuracy_summary.get("n_movies"),
+                accuracy_summary.get("within_20pct", {}).get("pct_correct"),
+                accuracy_summary.get("within_30pct", {}).get("pct_correct"),
+                accuracy_summary.get("within_50pct", {}).get("pct_correct"),
+                accuracy_summary.get("median_abs_pct_error"),
+                psycopg2.extras.Json(factor_keys_used),
+            ),
+        )
+    conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -3060,6 +3249,33 @@ def main() -> None:
             [json.dumps(d) for d in shap_top_drivers_by_row], index=model_df.index, name="top_shap_drivers")
         predictions = predictions.join(shap_drivers_series, how="left")
         write_prediction_outputs(predictions, accuracy_summary, args.output_dir)
+
+    # Feature 10/11: persist backtested predictions, factor scores, and this
+    # run's accuracy summary (appended to model_comparison_history, Feature
+    # 11's drift-monitoring trend) to Postgres, alongside the CSV/JSON writers
+    # above -- output/* stays for offline analysis, these tables are what
+    # MovieRevenuePredictionController serves. Best-effort/non-fatal, matching
+    # persist_feature5_columns' convention -- a DB hiccup here shouldn't
+    # invalidate an otherwise-successful run.
+    if champion_name is not None:
+        model_version = model_version_from_artifact_path(model_artifact_path)
+        try:
+            db_conn = get_connection(args)
+            try:
+                n_persisted = persist_movie_revenue_predictions(
+                    db_conn, predictions, champion_name, model_version, factor_keys_used)
+                persist_factor_impact_scores(db_conn, factor_table)
+                persist_model_comparison_history(db_conn, champion_name, accuracy_summary, factor_keys_used)
+            finally:
+                db_conn.close()
+            print(f"Feature 10: persisted {n_persisted} movie_revenue_predictions row(s), "
+                  f"{len(factor_table)} factor_impact_scores row(s), and one model_comparison_history "
+                  f"row to Postgres (model {champion_name} {model_version}).")
+        except Exception as exc:  # noqa: BLE001 -- best-effort side write, never fatal to this run
+            print(f"Warning: Feature 10 Postgres persistence failed ({exc}); continuing "
+                  f"(CSV/JSON outputs above are unaffected).")
+    else:
+        print("\nSkipping Feature 10 Postgres persistence: no champion model this run.")
 
     # Feature 0 (4): india-only-as-today vs. pooled-global vs. per-market, always
     # computed and written under new keys so the improvement (or lack of it) from

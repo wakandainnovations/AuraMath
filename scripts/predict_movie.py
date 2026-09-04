@@ -72,20 +72,11 @@ REQUIRED_JSON_FIELDS = ("movie_name", "release_date", "language", "budget")
 
 ACTOR_ROW_COLUMNS = ["actor_name", "movie_name", "release_date", "language", "genre", "director", "role_position"]
 
-_PREDICTIONS_SCHEMA_SQL = """
-    CREATE TABLE IF NOT EXISTS movie_revenue_predictions (
-        movie_name text, release_date text, language text,
-        predicted_revenue numeric, confidence_band_low numeric, confidence_band_high numeric,
-        actual_revenue numeric, abs_pct_error numeric, is_upcoming boolean default false,
-        model_name text, model_version text, factor_keys_used jsonb, generated_at timestamptz,
-        primary key (movie_name, release_date, language)
-    )
-"""
-# Feature 10 (not yet built) defines this exact table; Feature 9 needs
-# somewhere to write an upcoming-movie prediction now, so it pre-creates it
-# with the same schema (idempotent CREATE TABLE IF NOT EXISTS) rather than
-# inventing a parallel one -- the same table serves both cases per the plan,
-# distinguished by is_upcoming.
+# Feature 10 defines this exact table (movie_revenue_impact_model.MOVIE_REVENUE_PREDICTIONS_SCHEMA_SQL)
+# and writes is_upcoming=false backtested rows into it; this module writes
+# is_upcoming=true rows via the same idempotent CREATE TABLE IF NOT EXISTS --
+# one shared schema definition, one table serving both cases per the plan.
+_PREDICTIONS_SCHEMA_SQL = m.MOVIE_REVENUE_PREDICTIONS_SCHEMA_SQL
 
 
 def _log(msg: str) -> None:

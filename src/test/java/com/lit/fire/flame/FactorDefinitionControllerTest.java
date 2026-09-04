@@ -220,4 +220,22 @@ public class FactorDefinitionControllerTest {
         assertTrue(resp.getBody().getOrDefault("active", 0) >= 1);
         assertTrue(resp.getBody().getOrDefault("candidate", 0) >= 1);
     }
+
+    /** Feature 11: the single active/total/pct catalogue-coverage metric. */
+    @Test
+    public void factorCoverage_activeCountNeverExceedsTotalCount() {
+        controller.upsert(sampleRequest(KEY, "active"));
+        controller.upsert(sampleRequest(KEY_2, "candidate"));
+
+        ResponseEntity<Map<String, Object>> resp = controller.factorCoverage();
+        assertEquals(HttpStatus.OK, resp.getStatusCode());
+        Map<String, Object> body = resp.getBody();
+        assertNotNull(body);
+        int activeCount = ((Number) body.get("activeCount")).intValue();
+        int totalCount = ((Number) body.get("totalCount")).intValue();
+        double pct = ((Number) body.get("pct")).doubleValue();
+        assertTrue(activeCount >= 1, "expected at least the seeded active row");
+        assertTrue(totalCount >= activeCount);
+        assertEquals(Math.round(1000.0 * activeCount / totalCount) / 10.0, pct, 0.01);
+    }
 }

@@ -2,10 +2,12 @@ package com.lit.fire.flame;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.LinkedHashMap;
 import java.util.Map;
 
 @RestController
@@ -41,6 +43,9 @@ public class EnrichmentController {
 
     @Autowired
     private UserCausalLiftScoreService userCausalLiftScoreService;
+
+    @Autowired
+    private MovieRevenuePredictionScheduler movieRevenuePredictionScheduler;
 
     @PostMapping("/run-enrichment")
     public ResponseEntity<String> runEnrichment() {
@@ -103,5 +108,42 @@ public class EnrichmentController {
     @PostMapping("/run-causal-lift-scoring")
     public ResponseEntity<Map<String, Object>> runCausalLiftScoring() {
         return ResponseEntity.ok(userCausalLiftScoreService.recomputeAndPersist());
+    }
+
+    /**
+     * Feature 10: on-demand trigger for the weekly {@code movie_revenue_impact_model.py}
+     * full-corpus re-scoring job (same shape as /run-enrichment: synchronous,
+     * blocking for the run's full duration). See
+     * {@link MovieRevenuePredictionScheduler#run()} for the advisory-lock/cron
+     * details -- this is the manual equivalent of that cron firing early.
+     */
+    @PostMapping("/run-movie-revenue-model")
+    public ResponseEntity<Map<String, Object>> runMovieRevenueModel() {
+        MovieRevenuePredictionScheduler.RunStatus status = movieRevenuePredictionScheduler.run();
+        Map<String, Object> resp = new LinkedHashMap<>();
+        resp.put("startedAt", status.startedAt());
+        resp.put("finishedAt", status.finishedAt());
+        resp.put("exitCode", status.exitCode());
+        resp.put("logPath", status.logPath());
+        resp.put("error", status.error());
+        return ResponseEntity.ok(resp);
+    }
+
+    /** Last-run timestamp/exit code/log tail for the weekly movie-revenue-model job. */
+    @GetMapping("/movie-revenue-model-status")
+    public ResponseEntity<Map<String, Object>> movieRevenueModelStatus() {
+        MovieRevenuePredictionScheduler.RunStatus status = movieRevenuePredictionScheduler.getLastRun();
+        if (status == null) {
+            return ResponseEntity.ok(Map.of("message", "No run recorded yet on this instance."));
+        }
+        Map<String, Object> resp = new LinkedHashMap<>();
+        resp.put("startedAt", status.startedAt());
+        resp.put("finishedAt", status.finishedAt());
+        resp.put("exitCode", status.exitCode());
+        resp.put("success", status.success());
+        resp.put("logPath", status.logPath());
+        resp.put("logTail", status.logTail());
+        resp.put("error", status.error());
+        return ResponseEntity.ok(resp);
     }
 }

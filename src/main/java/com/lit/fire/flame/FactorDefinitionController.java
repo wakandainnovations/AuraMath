@@ -121,4 +121,25 @@ public class FactorDefinitionController {
     public ResponseEntity<Map<String, Integer>> statusCounts() {
         return ResponseEntity.ok(repository.statusCounts());
     }
+
+    /**
+     * Feature 11: the single "how much of the catalogue is actually live"
+     * number (today's equivalent: 12/80, 15%) -- grows automatically as
+     * Features 3/5/6/7 (and anything registered afterward) promote more
+     * factors to {@code active}, instead of being visible only by reading
+     * the script's docstring. {@link #statusCounts()} above has the full
+     * breakdown; this is the single-metric summary of it.
+     */
+    @GetMapping("/factor-coverage")
+    public ResponseEntity<Map<String, Object>> factorCoverage() {
+        Map<String, Integer> counts = repository.statusCounts();
+        int activeCount = counts.getOrDefault("active", 0);
+        int totalCount = counts.values().stream().mapToInt(Integer::intValue).sum();
+        double pct = totalCount == 0 ? 0.0 : Math.round(1000.0 * activeCount / totalCount) / 10.0;
+        Map<String, Object> resp = new LinkedHashMap<>();
+        resp.put("activeCount", activeCount);
+        resp.put("totalCount", totalCount);
+        resp.put("pct", pct);
+        return ResponseEntity.ok(resp);
+    }
 }
