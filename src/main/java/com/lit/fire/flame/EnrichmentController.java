@@ -5,6 +5,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.LinkedHashMap;
@@ -114,22 +115,34 @@ public class EnrichmentController {
      * Feature 10: on-demand trigger for the weekly {@code movie_revenue_impact_model.py}
      * full-corpus re-scoring job (same shape as /run-enrichment: synchronous,
      * blocking for the run's full duration). See
-     * {@link MovieRevenuePredictionScheduler#run()} for the advisory-lock/cron
+     * {@link MovieRevenuePredictionScheduler#run(String)} for the advisory-lock/cron
      * details -- this is the manual equivalent of that cron firing early.
+     *
+     * @param market optional override of {@code movie.revenue.model.market}
+     *               (india/global/all) for this one run; omit to use the
+     *               configured default.
      */
     @PostMapping("/run-movie-revenue-model")
-    public ResponseEntity<Map<String, Object>> runMovieRevenueModel() {
-        MovieRevenuePredictionScheduler.RunStatus status = movieRevenuePredictionScheduler.run();
+    public ResponseEntity<Map<String, Object>> runMovieRevenueModel(
+            @RequestParam(required = false) String market) {
+        if (market != null && !MovieRevenuePredictionScheduler.VALID_MARKETS.contains(market)) {
+            return ResponseEntity.badRequest().body(Map.of(
+                "error", "market must be one of " + MovieRevenuePredictionScheduler.VALID_MARKETS));
+        }
+        MovieRevenuePredictionScheduler.RunStatus status = market == null
+            ? movieRevenuePredictionScheduler.run()
+            : movieRevenuePredictionScheduler.run(market);
         Map<String, Object> resp = new LinkedHashMap<>();
         resp.put("startedAt", status.startedAt());
         resp.put("finishedAt", status.finishedAt());
         resp.put("exitCode", status.exitCode());
+        resp.put("market", status.market());
         resp.put("logPath", status.logPath());
         resp.put("error", status.error());
         return ResponseEntity.ok(resp);
     }
 
-    /** Last-run timestamp/exit code/log tail for the weekly movie-revenue-model job. */
+    /** Last-run timestamp/exit code/market/log tail for the weekly movie-revenue-model job. */
     @GetMapping("/movie-revenue-model-status")
     public ResponseEntity<Map<String, Object>> movieRevenueModelStatus() {
         MovieRevenuePredictionScheduler.RunStatus status = movieRevenuePredictionScheduler.getLastRun();
@@ -141,6 +154,7 @@ public class EnrichmentController {
         resp.put("finishedAt", status.finishedAt());
         resp.put("exitCode", status.exitCode());
         resp.put("success", status.success());
+        resp.put("market", status.market());
         resp.put("logPath", status.logPath());
         resp.put("logTail", status.logTail());
         resp.put("error", status.error());
