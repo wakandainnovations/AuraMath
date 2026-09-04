@@ -62,6 +62,7 @@ from typing import Callable, Optional
 import numpy as np
 import pandas as pd
 import psycopg2
+import psycopg2.extras
 from sklearn.ensemble import (
     GradientBoostingClassifier, GradientBoostingRegressor, HistGradientBoostingRegressor,
 )
@@ -152,6 +153,12 @@ DEFAULT_MIN_FEATURE_COVERAGE_PCT = 5.0
 INDIA_ONLY_CALENDAR_FACTOR_KEYS = {
     "holiday_release_window", "exam_schedules", "ipl_sporting_events", "summer_vacation_window",
 }
+
+# Feature 5: a lead/director/cast member's prior film counts as a "hit" when
+# its own revenue/budget ratio clears this multiple. A named constant per the
+# plan, not a magic number -- tune later once Feature 8's model comparison
+# shows whether a different threshold predicts better.
+LEAD_PRIOR_FILM_HIT_THRESHOLD = 1.5
 
 # Feature 4: budget/revenue disclosure is MNAR (obscure/low-budget/foreign
 # films are both less likely to have tracked financials AND more likely to
@@ -344,6 +351,28 @@ def filter_financials(df: pd.DataFrame, min_budget: int, min_revenue: int) -> pd
     return df[(df["budget"] > min_budget) & (df["revenue"] >= min_revenue)].reset_index(drop=True)
 
 
+def build_movie_financials_lookup(full_corpus_raw: pd.DataFrame) -> dict[str, tuple[float, float]]:
+    """movie_key (movie_name.lower()|release_year) -> (budget, revenue), built
+    from the FULL corpus (every market, disclosed or not) rather than the
+    budget/revenue-floored training subset -- Feature 5's lead/director
+    prior-film hit-rate lookups need to find an earlier film's financials even
+    when that earlier film itself never cleared this run's --min-budget/
+    --min-revenue floors. Only rows with real disclosed financials
+    (has_financials_mask) are kept; an undisclosed prior film is intentionally
+    absent from this lookup so callers can tell "checked, not disclosed" (the
+    plan's explicit "leave null rather than guessing") apart from "no prior
+    film at all"."""
+    d = full_corpus_raw.copy()
+    d["release_year"] = d["release_date"].map(parse_release_year)
+    d = d[d["release_year"].notna()].copy()
+    d["movie_key"] = d["movie_name"].str.strip().str.lower() + "|" + d["release_year"].astype(int).astype(str)
+    disclosed = d[has_financials_mask(d)]
+    lookup: dict[str, tuple[float, float]] = {}
+    for key, grp in disclosed.groupby("movie_key"):
+        lookup[key] = (float(grp["budget"].iloc[0]), float(grp["revenue"].iloc[0]))
+    return lookup
+
+
 # ---------------------------------------------------------------------------
 # Cleaning / entity resolution
 # ---------------------------------------------------------------------------
@@ -482,12 +511,22 @@ def role_weight(role_position) -> float:
     return 0.15
 
 
-def build_actor_features(actors: pd.DataFrame) -> pd.DataFrame:
+def build_actor_features(actors: pd.DataFrame,
+                          movie_financials: Optional[dict[str, tuple[float, float]]] = None) -> pd.DataFrame:
     actors = actors.copy()
     actors["release_year"] = actors["release_date"].map(parse_release_year)
     actors = actors[actors["release_year"].notna()].copy()
     actors["release_year"] = actors["release_year"].astype(int)
     actors["actor_key"] = actors["actor_name"].str.strip().str.lower()
+    actors["director_key"] = actors["director"].fillna("").str.strip().str.lower().replace("", np.nan)
+    actors["movie_key"] = actors["movie_name"].str.strip().str.lower() + "|" + actors["release_year"].astype(str)
+    if movie_financials:
+        financials = actors["movie_key"].map(movie_financials)
+        actors["own_budget"] = financials.map(lambda t: t[0] if isinstance(t, tuple) else np.nan)
+        actors["own_revenue"] = financials.map(lambda t: t[1] if isinstance(t, tuple) else np.nan)
+    else:
+        actors["own_budget"] = np.nan
+        actors["own_revenue"] = np.nan
     actors = actors.sort_values(["actor_key", "release_year"])
 
     # Films-before-this-one, per actor, strictly prior years only (no same-year
@@ -521,6 +560,225 @@ def compute_release_overexposure(movie_key: str, actors_by_movie: dict, actors_b
         c = sum(1 for h in hist if h["movie_key"] != movie_key and (year - 1) <= h["release_year"] <= year)
         counts.append(c)
     return float(np.mean(counts)) if counts else np.nan
+
+
+# ---------------------------------------------------------------------------
+# Feature 5: cast/crew track-record factors
+#
+# "Lead" = the actors_data_collection row(s) for this movie with the minimum
+# available role_position (role_position=1 when present, else whichever
+# position is smallest for that movie -- the plan's own fallback rule).
+#
+# The plan calls for a strict release_date (day-level) "prior" comparison,
+# reusing parse_release_date. Verified directly against the live
+# `actors_data_collection` table before wiring this up: 0 of its 62,413 rows
+# match a day-level date (`release_date ~ '^\d{4}-\d{2}-\d{2}$'`) -- every
+# row is year-only (e.g. "1971"). parse_release_date only accepts full
+# YYYY-MM-DD strings, so a literal day-level comparison here would silently
+# resolve every "prior" list to empty. Comparisons below therefore use
+# release_year (strictly less than), the same granularity build_actor_features's
+# `films_before` ranking and compute_release_overexposure's trailing-12-month
+# window above already use for this exact table, for the same reason.
+# ---------------------------------------------------------------------------
+
+def compute_lead_actor_key(movie_key: str, actors_by_movie: dict) -> Optional[str]:
+    rows = actors_by_movie.get(movie_key)
+    if not rows:
+        return None
+    with_position = [r for r in rows if pd.notna(r.get("role_position"))]
+    if not with_position:
+        return None
+    return min(with_position, key=lambda r: r["role_position"]).get("actor_key")
+
+
+def _strictly_prior(history: list[dict], before_year: Optional[int]) -> list[dict]:
+    """History entries with release_year strictly before `before_year` -- the
+    shared no-leakage filter every Feature 5 lookup below uses. Year
+    granularity, not release_date, per the module note above."""
+    if before_year is None or pd.isna(before_year):
+        return []
+    return [h for h in history
+            if h.get("release_year") is not None and pd.notna(h["release_year"])
+            and h["release_year"] < before_year]
+
+
+def _hit_flag_and_ratio(budget, revenue) -> tuple[Optional[float], Optional[float]]:
+    """Only computable when the film in question itself has disclosed
+    budget>0 and revenue>0 -- per the plan, leave both null rather than
+    guessing when a prior film's financials were never disclosed (Feature 4's
+    disclosure_likelihood explains why)."""
+    if not (pd.notna(budget) and pd.notna(revenue) and budget > 0 and revenue > 0):
+        return None, None
+    ratio = float(revenue) / float(budget)
+    return (1.0 if ratio >= LEAD_PRIOR_FILM_HIT_THRESHOLD else 0.0), ratio
+
+
+def compute_lead_prior_films_count(movie_key: str, release_year: Optional[int],
+                                    actors_by_movie: dict, actors_by_actor: dict) -> float:
+    if release_year is None or pd.isna(release_year):
+        return np.nan  # unparseable release_year -- "unknown", not "zero prior films"
+    lead_key = compute_lead_actor_key(movie_key, actors_by_movie)
+    if lead_key is None:
+        return np.nan
+    prior = _strictly_prior(actors_by_actor.get(lead_key, []), release_year)
+    return float(len(prior))
+
+
+def compute_lead_prior_film_hit(movie_key: str, release_year: Optional[int],
+                                 actors_by_movie: dict, actors_by_actor: dict) -> tuple[float, float]:
+    """Looks at the lead's most recent prior release_year and returns
+    (hit_flag, revenue_ratio) for it -- np.nan/np.nan when the lead is
+    unknown, has no prior film, or that prior film's financials were never
+    disclosed. Year granularity means "most recent" can be a tie (the lead
+    released more than one credited film in that same year); when it is, the
+    two are averaged rather than picking one arbitrarily, since nothing in
+    this schema orders same-year releases."""
+    lead_key = compute_lead_actor_key(movie_key, actors_by_movie)
+    if lead_key is None:
+        return np.nan, np.nan
+    prior = _strictly_prior(actors_by_actor.get(lead_key, []), release_year)
+    if not prior:
+        return np.nan, np.nan
+    most_recent_year = max(h["release_year"] for h in prior)
+    tied = [h for h in prior if h["release_year"] == most_recent_year]
+    flags_ratios = [_hit_flag_and_ratio(h.get("budget"), h.get("revenue")) for h in tied]
+    flags = [f for f, _r in flags_ratios if f is not None]
+    ratios = [r for _f, r in flags_ratios if r is not None]
+    return ((float(np.mean(flags)) if flags else np.nan),
+            (float(np.mean(ratios)) if ratios else np.nan))
+
+
+def compute_director_prior_films_count(director_key: Optional[str], release_year: Optional[int],
+                                        directors_by_director: dict) -> float:
+    if not director_key or pd.isna(director_key):
+        return np.nan
+    if release_year is None or pd.isna(release_year):
+        return np.nan  # unparseable release_year -- "unknown", not "zero prior films"
+    prior = _strictly_prior(directors_by_director.get(director_key, []), release_year)
+    return float(len(prior))
+
+
+def compute_director_prior_hit_rate(director_key: Optional[str], release_year: Optional[int],
+                                     directors_by_director: dict) -> float:
+    """Hit rate across every strictly-prior film of this director that itself
+    has disclosed financials -- prior films with undisclosed financials are
+    excluded from both numerator and denominator rather than counted as
+    misses, same "leave null, don't guess" rule as the lead's own factors."""
+    if not director_key or pd.isna(director_key):
+        return np.nan
+    prior = _strictly_prior(directors_by_director.get(director_key, []), release_year)
+    flags = [f for f, _r in (_hit_flag_and_ratio(h.get("budget"), h.get("revenue")) for h in prior)
+             if f is not None]
+    return float(np.mean(flags)) if flags else np.nan
+
+
+def compute_actor_prior_hit_rate(actor_key: Optional[str], release_year: Optional[int],
+                                  actors_by_actor: dict) -> Optional[float]:
+    if not actor_key:
+        return None
+    prior = _strictly_prior(actors_by_actor.get(actor_key, []), release_year)
+    flags = [f for f, _r in (_hit_flag_and_ratio(h.get("budget"), h.get("revenue")) for h in prior)
+             if f is not None]
+    return float(np.mean(flags)) if flags else None
+
+
+def compute_ensemble_avg_prior_hit_rate(movie_key: str, release_year: Optional[int],
+                                         actors_by_movie: dict, actors_by_actor: dict) -> float:
+    """role_weight()-weighted average, across the full credited cast, of each
+    actor's OWN prior-film hit rate -- same role_wt-weighted num/den pattern
+    compute_r_star uses, so an ensemble with a strong lead but an untested
+    supporting cast isn't penalized/rewarded the same as one where every
+    credited actor has a track record."""
+    rows = actors_by_movie.get(movie_key)
+    if not rows:
+        return np.nan
+    num, den = 0.0, 0.0
+    for r in rows:
+        rate = compute_actor_prior_hit_rate(r.get("actor_key"), release_year, actors_by_actor)
+        if rate is None:
+            continue
+        wt = r.get("role_wt") or 0.0
+        num += wt * rate
+        den += wt
+    return num / den if den > 0 else np.nan
+
+
+# Columns Feature 5 persists back onto `movies_data_collection` (see
+# persist_feature5_columns below) -- the RAW signal (an actual count/ratio/
+# hit-rate), not the [stated_min, stated_max]-rescaled value
+# compute_registry_features produces for the model's own feature matrix. A
+# real count is a more useful thing for another consumer to read back off the
+# table than a percentile band calibrated to one particular training run.
+FEATURE5_PERSISTED_COLUMNS = [
+    "lead_prior_films_count", "lead_prior_film_hit_flag", "lead_prior_film_revenue_ratio",
+    "director_prior_films_count", "director_prior_hit_rate", "ensemble_avg_prior_hit_rate",
+]
+
+
+def compute_feature5_raw_columns(df: pd.DataFrame, actors_by_movie: dict, actors_by_actor: dict,
+                                  directors_by_director: dict) -> pd.DataFrame:
+    """Raw (unbanded) values for FEATURE5_PERSISTED_COLUMNS, computed directly
+    from the same functions DERIVED_FACTOR_FNS wires into the registry --
+    duplicated here (rather than reusing compute_registry_features' output)
+    because that path returns the banded model-feature value, not the raw
+    count/ratio/rate this function persists."""
+    out = pd.DataFrame(index=df.index)
+    out["lead_prior_films_count"] = df.apply(
+        lambda r: compute_lead_prior_films_count(r["movie_key"], r["release_year"],
+                                                   actors_by_movie, actors_by_actor), axis=1)
+    hit = df.apply(
+        lambda r: compute_lead_prior_film_hit(r["movie_key"], r["release_year"],
+                                               actors_by_movie, actors_by_actor), axis=1)
+    out["lead_prior_film_hit_flag"] = hit.map(lambda t: t[0])
+    out["lead_prior_film_revenue_ratio"] = hit.map(lambda t: t[1])
+    out["director_prior_films_count"] = df.apply(
+        lambda r: compute_director_prior_films_count(r["director_key"], r["release_year"],
+                                                       directors_by_director), axis=1)
+    out["director_prior_hit_rate"] = df.apply(
+        lambda r: compute_director_prior_hit_rate(r["director_key"], r["release_year"],
+                                                    directors_by_director), axis=1)
+    out["ensemble_avg_prior_hit_rate"] = df.apply(
+        lambda r: compute_ensemble_avg_prior_hit_rate(r["movie_key"], r["release_year"],
+                                                        actors_by_movie, actors_by_actor), axis=1)
+    return out
+
+
+def persist_feature5_columns(conn, df: pd.DataFrame) -> int:
+    """Python-side equivalent of the `ensureSchema()`-style
+    `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` + batched `UPDATE` convention
+    `ConflictBalanceService`/`NarrativeNoveltyService` use on the Java side to
+    persist `conflict_balance_score`/`narrative_novelty_score` -- applied here
+    so both languages write `movies_data_collection` the same way.
+
+    `df` must carry `movie_name`, `release_year`, and every
+    FEATURE5_PERSISTED_COLUMNS column (see compute_feature5_raw_columns), one
+    row per deduplicated (movie_name, release_year) entity. The UPDATE keys
+    only on (movie_name, left(release_date, 4)), not the full (movie_name,
+    release_date, language) triple Feature 1's connectors use -- these are
+    per-FILM signals (a lead actor's track record doesn't change per dubbed-
+    language edition), so every sibling language release of the same title/
+    year intentionally gets the same value, matching how budget/revenue
+    themselves are already shared across those sibling rows."""
+    with conn.cursor() as cur:
+        for col in FEATURE5_PERSISTED_COLUMNS:
+            cur.execute(f"ALTER TABLE movies_data_collection ADD COLUMN IF NOT EXISTS {col} numeric")
+    conn.commit()
+
+    set_clause = ", ".join(f"{col} = %s" for col in FEATURE5_PERSISTED_COLUMNS)
+    sql = (f"UPDATE movies_data_collection SET {set_clause} "
+           f"WHERE movie_name = %s AND left(release_date, 4) = %s")
+    param_rows = [
+        (*(None if pd.isna(row[col]) else float(row[col]) for col in FEATURE5_PERSISTED_COLUMNS),
+         row["movie_name"], str(int(row["release_year"])))
+        for _, row in df.iterrows()
+    ]
+    with conn.cursor() as cur:
+        # execute_batch's cursor.rowcount only reflects the last statement in
+        # the batch, not a running total -- report rows attempted instead of
+        # a misleading "rows updated" count.
+        psycopg2.extras.execute_batch(cur, sql, param_rows)
+    conn.commit()
+    return len(param_rows)
 
 
 def compute_historical_anchor(df: pd.DataFrame, group_col: str) -> pd.Series:
@@ -681,28 +939,47 @@ def compute_summer_window_raw(df: pd.DataFrame) -> pd.Series:
 # with computation_type='derived_python_fn') -- this is where the raw compute
 # logic above (compute_holiday_window_raw etc.) plugs in "by name instead of
 # hardcoded into build_measurable_features", per the plan. Every function
-# here has the same (df, actors_by_movie, actors_by_actor) -> raw pd.Series
-# signature so resolve_factor_raw_and_banded can call any of them uniformly;
-# the raw signal is pre-negation, pre-band -- direction-based sign flip and
-# stated_min/max banding happen once, generically, in the resolver below.
-DERIVED_FACTOR_FNS: dict[str, Callable[[pd.DataFrame, dict, dict], pd.Series]] = {
-    "star_overexposure": lambda df, abm, aba: df["movie_key"].map(
+# here has the same (df, actors_by_movie, actors_by_actor, directors_by_director)
+# -> raw pd.Series signature so resolve_factor_raw_and_banded can call any of
+# them uniformly (the fourth arg, added for Feature 5's director-keyed
+# lookups, is unused by the pre-existing entries); the raw signal is
+# pre-negation, pre-band -- direction-based sign flip and stated_min/max
+# banding happen once, generically, in the resolver below.
+DERIVED_FACTOR_FNS: dict[str, Callable[[pd.DataFrame, dict, dict, dict], pd.Series]] = {
+    "star_overexposure": lambda df, abm, aba, dbd: df["movie_key"].map(
         lambda k: compute_release_overexposure(k, abm, aba)),
-    "excessive_runtime": lambda df, abm, aba: compute_excessive_runtime_raw(df),
-    "budget_scale_efficiency": lambda df, abm, aba: compute_budget_scale_efficiency_raw(df),
-    "trailer_teaser_impact": lambda df, abm, aba: compute_trailer_timing_raw(df),
-    "first_single_timing": lambda df, abm, aba: compute_song_timing_raw(df),
-    "holiday_release_window": lambda df, abm, aba: compute_holiday_window_raw(df),
-    "box_office_clashes": lambda df, abm, aba: compute_clash_raw(df),
-    "exam_schedules": lambda df, abm, aba: compute_exam_season_raw(df),
-    "ipl_sporting_events": lambda df, abm, aba: compute_ipl_season_raw(df),
-    "summer_vacation_window": lambda df, abm, aba: compute_summer_window_raw(df),
+    "excessive_runtime": lambda df, abm, aba, dbd: compute_excessive_runtime_raw(df),
+    "budget_scale_efficiency": lambda df, abm, aba, dbd: compute_budget_scale_efficiency_raw(df),
+    "trailer_teaser_impact": lambda df, abm, aba, dbd: compute_trailer_timing_raw(df),
+    "first_single_timing": lambda df, abm, aba, dbd: compute_song_timing_raw(df),
+    "holiday_release_window": lambda df, abm, aba, dbd: compute_holiday_window_raw(df),
+    "box_office_clashes": lambda df, abm, aba, dbd: compute_clash_raw(df),
+    "exam_schedules": lambda df, abm, aba, dbd: compute_exam_season_raw(df),
+    "ipl_sporting_events": lambda df, abm, aba, dbd: compute_ipl_season_raw(df),
+    "summer_vacation_window": lambda df, abm, aba, dbd: compute_summer_window_raw(df),
+    # Feature 5: cast/crew track-record factors, all keyed on the target row's
+    # own release_year -- actors_data_collection has zero day-level release
+    # dates (verified live), so "prior" here is a strict release_year
+    # comparison; see the module note above compute_lead_actor_key.
+    "lead_prior_films_count": lambda df, abm, aba, dbd: df.apply(
+        lambda r: compute_lead_prior_films_count(r["movie_key"], r["release_year"], abm, aba), axis=1),
+    "lead_prior_film_hit_flag": lambda df, abm, aba, dbd: df.apply(
+        lambda r: compute_lead_prior_film_hit(r["movie_key"], r["release_year"], abm, aba)[0], axis=1),
+    "lead_prior_film_revenue_ratio": lambda df, abm, aba, dbd: df.apply(
+        lambda r: compute_lead_prior_film_hit(r["movie_key"], r["release_year"], abm, aba)[1], axis=1),
+    "director_prior_films_count": lambda df, abm, aba, dbd: df.apply(
+        lambda r: compute_director_prior_films_count(r["director_key"], r["release_year"], dbd), axis=1),
+    "director_prior_hit_rate": lambda df, abm, aba, dbd: df.apply(
+        lambda r: compute_director_prior_hit_rate(r["director_key"], r["release_year"], dbd), axis=1),
+    "ensemble_avg_prior_hit_rate": lambda df, abm, aba, dbd: df.apply(
+        lambda r: compute_ensemble_avg_prior_hit_rate(r["movie_key"], r["release_year"], abm, aba), axis=1),
 }
 
 
 def resolve_factor_raw_and_banded(
     df: pd.DataFrame, factor: dict, actors_by_movie: dict, actors_by_actor: dict,
     india_mask: pd.Series, eav_lookup: dict[str, dict[str, float]],
+    directors_by_director: Optional[dict] = None,
 ) -> tuple[Optional[pd.Series], Optional[pd.Series]]:
     """Resolves one factor_definitions row's value on this corpus. Returns
     (raw, banded): `raw` is pre-band/pre-sign-flip (used for coverage %% and
@@ -734,7 +1011,7 @@ def resolve_factor_raw_and_banded(
         fn = DERIVED_FACTOR_FNS.get(factor.get("derivation_ref"))
         if fn is None:
             return None, None
-        raw = fn(df, actors_by_movie, actors_by_actor)
+        raw = fn(df, actors_by_movie, actors_by_actor, directors_by_director or {})
         if key in INDIA_ONLY_CALENDAR_FACTOR_KEYS:
             raw = raw.where(india_mask)
         # Negative-direction factors' raw signal is "amount of severity" (higher
@@ -774,6 +1051,7 @@ def resolve_factor_raw_and_banded(
 def compute_registry_features(
     df: pd.DataFrame, actors_by_movie: dict, actors_by_actor: dict,
     factor_defs: list[dict], eav_lookup: dict[str, dict[str, float]],
+    directors_by_director: Optional[dict] = None,
 ) -> tuple[pd.DataFrame, list[dict]]:
     """Registry-driven replacement for the old hardcoded build_measurable_features:
     for every candidate/active factor_definitions row, resolve its value on
@@ -791,7 +1069,8 @@ def compute_registry_features(
         if factor["status"] not in ("active", "candidate"):
             continue
         raw, banded = resolve_factor_raw_and_banded(
-            df, factor, actors_by_movie, actors_by_actor, india_mask, eav_lookup)
+            df, factor, actors_by_movie, actors_by_actor, india_mask, eav_lookup,
+            directors_by_director)
         if banded is None:
             continue
 
@@ -851,6 +1130,27 @@ def assemble_features(df: pd.DataFrame, actors: pd.DataFrame, apply_india_filter
         actors_by_actor.setdefault(row["actor_key"], []).append({
             "movie_key": row["movie_name"].strip().lower() + "|" + str(int(row["release_year"])),
             "release_year": int(row["release_year"]),
+            # Feature 5: this credit's own film's disclosed financials
+            # (looked up in build_actor_features via
+            # build_movie_financials_lookup), for the prior-film hit-rate
+            # lookups below.
+            "budget": row.get("own_budget"),
+            "revenue": row.get("own_revenue"),
+            "role_wt": row.get("role_wt"),
+        })
+
+    # Feature 5: director-keyed analog of actors_by_actor -- one entry per
+    # distinct (director, movie) pair (actors_data_collection repeats the same
+    # director on every cast row of a movie, so dedupe by movie_key first or
+    # a multi-cast film would inflate its own director's prior-film count).
+    directors_by_director: dict = {}
+    director_rows = actors.dropna(subset=["director_key"]).drop_duplicates(subset=["director_key", "movie_key"])
+    for _, row in director_rows.iterrows():
+        directors_by_director.setdefault(row["director_key"], []).append({
+            "movie_key": row["movie_key"],
+            "release_year": int(row["release_year"]),
+            "budget": row.get("own_budget"),
+            "revenue": row.get("own_revenue"),
         })
 
     df["r_star"] = df["movie_key"].map(lambda k: compute_r_star(k, actors_by_movie))
@@ -884,9 +1184,25 @@ def assemble_features(df: pd.DataFrame, actors: pd.DataFrame, apply_india_filter
     df["r_concept"] = compute_historical_anchor(df, "primary_genre")
 
     registry_feats, coverage_report = compute_registry_features(
-        df, actors_by_movie, actors_by_actor, FACTOR_DEFS, eav_lookup or {})
+        df, actors_by_movie, actors_by_actor, FACTOR_DEFS, eav_lookup or {}, directors_by_director)
+    # A raw_column factor is free to name its factor_key after its own
+    # source_column (e.g. Feature 3 registers factor_key='genres' straight off
+    # movies_data_collection.genres) -- when it does, drop df's own copy of
+    # that column before concatenating so the result has one "genres" column
+    # (the banded model feature) instead of two same-named columns, which
+    # pandas can't disambiguate (m[key] then returns a DataFrame, not a
+    # Series, breaking every m[key].astype(...) call downstream). Everything
+    # in this function that needed the raw pre-band column (primary_genre
+    # above) already read it before this point.
+    df = df.drop(columns=[c for c in registry_feats.columns if c in df.columns])
     full = pd.concat([df, registry_feats], axis=1)
     full.attrs["coverage_report"] = coverage_report
+    # Feature 5: stash the self-join indices so main() can persist the raw
+    # (unbanded) track-record columns back onto movies_data_collection
+    # (persist_feature5_columns) without rebuilding them a second time.
+    full.attrs["actors_by_movie"] = actors_by_movie
+    full.attrs["actors_by_actor"] = actors_by_actor
+    full.attrs["directors_by_director"] = directors_by_director
     return full
 
 
@@ -1939,7 +2255,12 @@ def main() -> None:
           f"({sum(1 for f in FACTOR_DEFS if f['status'] == 'active')} active, "
           f"{sum(1 for f in FACTOR_DEFS if f['status'] == 'candidate')} candidate).")
 
-    actors = build_actor_features(actors_raw)
+    # Feature 5: budget/revenue lookup keyed off the FULL corpus (not just the
+    # rows this run's --min-budget/--min-revenue floors admit) so a lead/
+    # director's earlier film's disclosed financials are found even when that
+    # earlier film itself never cleared this run's floors.
+    movie_financials = build_movie_financials_lookup(full_corpus_raw)
+    actors = build_actor_features(actors_raw, movie_financials)
 
     # Feature 4, Stage A: disclosure classifier on the full corpus, using only
     # pre-release-always-available features -- run once up front so its
@@ -1968,6 +2289,27 @@ def main() -> None:
 
     full = assemble_features(movies, actors, apply_india_filter=apply_india_filter, eav_lookup=eav_lookup)
     model_df = prepare_model_frame(full)
+
+    # Feature 5: persist the raw cast/crew track-record columns back onto
+    # movies_data_collection (Java's ConflictBalanceService/
+    # NarrativeNoveltyService ensureSchema() convention, applied here from
+    # Python) -- a short-lived second connection since the one used to load
+    # the corpus above was already closed. Best-effort: a persistence hiccup
+    # here shouldn't abort the rest of this run's modeling/reporting.
+    try:
+        feature5_raw = compute_feature5_raw_columns(
+            full, full.attrs["actors_by_movie"], full.attrs["actors_by_actor"],
+            full.attrs["directors_by_director"])
+        persist_df = pd.concat([full[["movie_name", "release_year"]], feature5_raw], axis=1)
+        persist_conn = get_connection(args)
+        try:
+            n_persisted = persist_feature5_columns(persist_conn, persist_df)
+        finally:
+            persist_conn.close()
+        print(f"Feature 5: persisted cast/crew track-record columns for {n_persisted} movie entities "
+              f"onto movies_data_collection ({FEATURE5_PERSISTED_COLUMNS}).")
+    except Exception as exc:  # noqa: BLE001 -- best-effort side write, never fatal to this run
+        print(f"Warning: Feature 5 column persistence failed ({exc}); continuing without it.")
 
     # Feature 4: attach each row's Stage A disclosure_likelihood by the same
     # exact (movie_name, release_date, language) composite key data_sources/
