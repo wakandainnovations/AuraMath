@@ -4,11 +4,23 @@ collect_data.py -- drives the `data_sources` registry (Feature 1).
 
 For every `data_sources` row matching --source/--entity-type, dispatches to the
 connector named by that row's `connector_type` (`html_scrape` -> HtmlScrapeConnector,
-`api` -> ApiConnector, `kaggle_csv` -> KaggleDatasetConnector), upserts the
-mapped fields onto `movies_data_collection`/`actors_data_collection` (adding
-any missing target column via `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`
-first), and writes back `last_fetched_at`/`last_status`/`raw_payload` on the
-`data_sources` row itself.
+`api` -> ApiConnector, `kaggle_csv` -> KaggleDatasetConnector, `file_download` ->
+FileDownloadConnector), upserts the mapped fields onto
+`movies_data_collection`/`actors_data_collection` (adding any missing target
+column via `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` first), and writes back
+`last_fetched_at`/`last_status`/`raw_payload` on the `data_sources` row itself.
+
+Every write here is fill-null-only (`COALESCE(existing, new)`), never a blind
+overwrite -- these sources exist to backfill gaps (Feature 3: 94.3% of rows
+have no `budget`, 96.6% no `revenue`), and a differently-sourced number for a
+column this table's own pipeline already populated should never silently
+replace it.
+
+`kaggle_csv`/`file_download` rows are bulk (`{"rows": [...], "n_rows": N}` --
+one dataset/file covers many movies, not one `entity_key`): each row is
+fuzzy-matched to `movies_data_collection` by (title, release_year) via
+`connectors.bulk_upsert`/`connectors.entity_resolution` (Feature 3) rather
+than requiring an exact `entity_key` match.
 
 Requirements
 ------------
@@ -25,7 +37,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import re
 import sys
 from datetime import datetime, timezone
 from typing import Optional
@@ -35,6 +46,12 @@ import psycopg2.extras
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from connectors.api import ApiConnector  # noqa: E402
+from connectors.bulk_upsert import (  # noqa: E402
+    ensure_target_columns,
+    resolve_and_upsert_bulk_movie_rows,
+    safe_identifier as _safe_identifier,
+)
+from connectors.file_download import FileDownloadConnector  # noqa: E402
 from connectors.html_scrape import HtmlScrapeConnector  # noqa: E402
 from connectors.kaggle_dataset import KaggleDatasetConnector  # noqa: E402
 from connectors.schema import (  # noqa: E402
@@ -43,16 +60,7 @@ from connectors.schema import (  # noqa: E402
     parse_movie_entity_key,
 )
 
-# field_mapping keys land directly in ALTER TABLE / UPDATE SQL below -- only
-# allow identifier-shaped names to rule out injection via a maliciously
-# configured field_mapping.
-_SAFE_IDENTIFIER = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
-
-
-def _safe_identifier(name: str) -> str:
-    if not _SAFE_IDENTIFIER.match(name):
-        raise ValueError(f"Refusing to use non-identifier column name from field_mapping: {name!r}")
-    return name
+_BULK_CONNECTOR_TYPES = {"kaggle_csv", "file_download"}
 
 
 def build_connector(connector_type: str, field_mapping: dict):
@@ -62,22 +70,20 @@ def build_connector(connector_type: str, field_mapping: dict):
         return ApiConnector(field_mapping)
     if connector_type == "kaggle_csv":
         return KaggleDatasetConnector(field_mapping)
+    if connector_type == "file_download":
+        return FileDownloadConnector(field_mapping)
     raise ValueError(f"Unknown connector_type: {connector_type!r}")
 
 
-def ensure_target_columns(conn, table: str, columns: list[str]) -> None:
-    if not columns:
-        return
-    with conn.cursor() as cur:
-        for col in columns:
-            cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {_safe_identifier(col)} text")
-    conn.commit()
-
-
 def upsert_movie_fields(conn, values: dict, movie_name: str, release_date: str, language: str) -> int:
+    """Fill-null upsert (`COALESCE`-guarded) -- never overwrites an
+    already-populated column with a differently-sourced value."""
     if not values:
         return 0
-    set_clause = ", ".join(f"{_safe_identifier(k)} = %s" for k in values)
+    set_clause = ", ".join(
+        f"{_safe_identifier(k)} = COALESCE(movies_data_collection.{_safe_identifier(k)}, %s)"
+        for k in values
+    )
     sql = (f"UPDATE movies_data_collection SET {set_clause} "
            f"WHERE movie_name = %s AND release_date = %s AND language = %s")
     with conn.cursor() as cur:
@@ -86,9 +92,14 @@ def upsert_movie_fields(conn, values: dict, movie_name: str, release_date: str, 
 
 
 def upsert_actor_fields(conn, values: dict, actor_name: str) -> int:
+    """Fill-null upsert (`COALESCE`-guarded) -- same rationale as
+    `upsert_movie_fields`."""
     if not values:
         return 0
-    set_clause = ", ".join(f"{_safe_identifier(k)} = %s" for k in values)
+    set_clause = ", ".join(
+        f"{_safe_identifier(k)} = COALESCE(actors_data_collection.{_safe_identifier(k)}, %s)"
+        for k in values
+    )
     sql = f"UPDATE actors_data_collection SET {set_clause} WHERE actor_name = %s"
     with conn.cursor() as cur:
         cur.execute(sql, [*values.values(), actor_name])
@@ -116,15 +127,27 @@ def process_row(conn, row: dict, dry_run: bool) -> str:
             record_fetch_result(conn, row["id"], f"error: {exc}", None)
         return "failed"
 
-    if row["connector_type"] == "kaggle_csv":
-        # Bulk result -- see connectors/base.py's docstring. Per-row entity
-        # resolution against movies_data_collection/actors_data_collection is
-        # Feature 3's fuzzy-match job, not run here.
-        n_rows = result.get("n_rows", 0)
-        print(f"  [OK] id={row['id']} {row['source_name']}: downloaded {n_rows} row(s) "
-              f"(entity resolution deferred to Feature 3)")
+    if row["connector_type"] in _BULK_CONNECTOR_TYPES:
+        # Bulk result -- see connectors/base.py's docstring. One dataset/file
+        # covers many movies, not this row's single `entity_key`, so each row
+        # is fuzzy-matched to movies_data_collection by (title, release_year)
+        # via connectors.bulk_upsert (Feature 3) instead of an exact-key join.
+        # Only entity_type='movie' bulk sources are supported today -- no
+        # named Feature 3 dataset is actor-keyed.
+        if row["entity_type"] != "movie":
+            print(f"  [FAIL] id={row['id']} {row['source_name']}: bulk connector_type "
+                  f"{row['connector_type']!r} only supports entity_type='movie'")
+            if not dry_run:
+                record_fetch_result(conn, row["id"], "error: bulk connector requires entity_type=movie", None)
+            return "failed"
+
+        counts = resolve_and_upsert_bulk_movie_rows(conn, result.get("rows", []), dry_run=dry_run)
+        mode_note = "DRY-RUN" if dry_run else "OK"
+        print(f"  [{mode_note}] id={row['id']} {row['source_name']}: {counts['attempted']} source row(s), "
+              f"matched {counts['matched']}, unmatched {counts['unmatched']}"
+              + ("" if dry_run else f", updated {counts['rows_updated']} DB row(s)"))
         if not dry_run:
-            record_fetch_result(conn, row["id"], "ok", {"n_rows": n_rows})
+            record_fetch_result(conn, row["id"], "ok", counts)
         return "succeeded"
 
     values = {k: v for k, v in result.items() if v is not None}

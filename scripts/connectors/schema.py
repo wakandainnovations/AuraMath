@@ -24,6 +24,8 @@ TARGET_TABLE_BY_ENTITY_TYPE = {
     "actor": "actors_data_collection",
 }
 
+CONNECTOR_TYPES = ("html_scrape", "api", "kaggle_csv", "file_download")
+
 _CREATE_TABLE_SQL = """
     CREATE TABLE IF NOT EXISTS data_sources (
         id serial PRIMARY KEY,
@@ -31,13 +33,25 @@ _CREATE_TABLE_SQL = """
         entity_key text NOT NULL,
         source_name text NOT NULL,
         url text NOT NULL,
-        connector_type text NOT NULL CHECK (connector_type IN ('html_scrape', 'api', 'kaggle_csv')),
+        connector_type text NOT NULL
+            CHECK (connector_type IN ('html_scrape', 'api', 'kaggle_csv', 'file_download')),
         field_mapping jsonb,
         last_fetched_at timestamptz,
         last_status text,
         raw_payload jsonb,
         UNIQUE (entity_type, entity_key, source_name, url)
     )
+"""
+
+# `file_download` (Feature 3 -- plain downloadable files like IMDb's
+# non-commercial exports, not a Kaggle dataset or a single-entity REST call)
+# was added after some databases already had `data_sources` created with the
+# narrower 3-value CHECK. Widen it in place rather than requiring a manual
+# migration -- cheap catalog op, safe to run on every call.
+_WIDEN_CONNECTOR_TYPE_CHECK_SQL = """
+    ALTER TABLE data_sources DROP CONSTRAINT IF EXISTS data_sources_connector_type_check;
+    ALTER TABLE data_sources ADD CONSTRAINT data_sources_connector_type_check
+        CHECK (connector_type IN ('html_scrape', 'api', 'kaggle_csv', 'file_download'));
 """
 
 # entity_type='movie' entity_key is movie_name||'|'||release_date||'|'||language
@@ -54,6 +68,7 @@ def ensure_data_sources_schema(conn) -> None:
     with conn.cursor() as cur:
         cur.execute(_CREATE_TABLE_SQL)
         cur.execute(_CREATE_INDEX_SQL)
+        cur.execute(_WIDEN_CONNECTOR_TYPE_CHECK_SQL)
     conn.commit()
 
 

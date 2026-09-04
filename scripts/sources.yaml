@@ -1,0 +1,246 @@
+# Feature 3 -- bulk external dataset registry.
+#
+# "Where to actually get the data" for the cast/crew, rating, and
+# budget/revenue-coverage gaps the plan identifies. Each entry below is one
+# named source from the plan; `register_sources.py` reads this file and:
+#   1. inserts one `data_sources` row (Feature 1) per entry that isn't
+#      `skip_registration: true` -- `field_mapping` is built from `fields`;
+#   2. for every `fields[].factor` block, upserts a `candidate`
+#      `factor_definitions` row (Feature 2) for that target column, so a new
+#      source column never has to be hand-wired into `feature_columns()`.
+#
+# `skip_registration: true` entries are still listed (nothing named in the
+# plan is silently dropped) but intentionally NOT inserted as a `data_sources`
+# row -- each `notes:` field says why: genuinely manual (ticket price index),
+# explicitly not to be scraped (Box Office Mojo), purpose unconfirmed
+# (kulfiy), needs a page-structure review first (the_numbers), already
+# covered by an existing per-actor row (sacnilk), doesn't fit the URL-based
+# connector shape (Sensex/Nifty -- a `yfinance` library call, not a fetch
+# URL), or needs a local multi-file join collect_data.py's generic per-row
+# dispatch doesn't do (World Bank, IMDb non-commercial -- each has its own
+# dedicated backfill_*.py script instead, built on the same
+# connectors.entity_resolution/bulk_upsert helpers).
+#
+# `role: resolution_key` fields (movie_name/release_year) exist only to
+# fuzzy-match a bulk row to movies_data_collection (Feature 3's
+# entity-resolution job) -- they're included in field_mapping so the
+# connector selects/renames them, but connectors.bulk_upsert never writes
+# them back onto the matched row (connectors.entity_resolution.RESOLUTION_ONLY_FIELDS).
+
+sources:
+  - source_name: tmdb_5000
+    entity_type: movie
+    connector_type: kaggle_csv
+    url: tmdb/tmdb-movie-metadata
+    target_csv: tmdb_5000_movies.csv
+    skip_registration: false
+    notes: >
+      TMDB 5000 Movie Dataset. Best clean fill for `genres` (the column
+      movie_revenue_impact_model.py already expects but the live table
+      lacks) and TMDB's own popularity/rating signals; mostly Hollywood
+      coverage. Cast/crew ship as embedded JSON strings in this CSV -- the
+      generic KaggleDatasetConnector only renames columns, it doesn't parse
+      embedded JSON, so cast/crew are intentionally left unmapped here. The
+      Movies Dataset's separate credits.csv (below) is the named source for
+      structured cast/crew (feeds Feature 5), and even that needs a
+      same-dataset join on a numeric `id` this connector doesn't do yet --
+      see that entry's note.
+    fields:
+      - source_column: title
+        target_column: movie_name
+        role: resolution_key
+      - source_column: release_date
+        target_column: release_year
+        role: resolution_key
+      - source_column: genres
+        target_column: genres
+        role: data
+        factor:
+          name: "TMDB Genres (raw)"
+          category: Narrative
+          direction: Bidirectional
+          data_type: categorical
+          stated_min: 0
+          stated_max: 1
+          notes: >
+            Raw TMDB genres JSON string (e.g. [{"id":28,"name":"Action"}]) --
+            registered so the column/gap is tracked, but it needs parsing
+            into a usable categorical before it's a real model input;
+            candidate/raw_column only, not promotable to active as-is.
+      - source_column: vote_average
+        target_column: tmdb_vote_average
+        role: data
+        factor:
+          name: "TMDB Vote Average"
+          category: Narrative
+          direction: Positive
+          data_type: numeric
+          stated_min: 0
+          stated_max: 10
+          notes: "TMDB's own user rating -- distinct from imdb_rating (IMDb non-commercial export, see below), kept as its own column/factor rather than conflated."
+      - source_column: popularity
+        target_column: tmdb_popularity
+        role: data
+        factor:
+          name: "TMDB Popularity Score"
+          category: Marketing
+          direction: Positive
+          data_type: numeric
+          stated_min: 0
+          stated_max: 1000
+
+  - source_name: the_movies_dataset
+    entity_type: movie
+    connector_type: kaggle_csv
+    url: rounakbanik/the-movies-dataset
+    target_csv: movies_metadata.csv
+    skip_registration: false
+    notes: >
+      45k movies -- the largest single fill for cast job history (Feature 5)
+      once credits.csv is wired in, plus a keyword signal (keywords.csv) that
+      could serve as a rough proxy for the existing candidate factor
+      `genre_template_adherence`. Only movies_metadata.csv (title-addressable
+      on its own) is registered here: credits.csv and keywords.csv in this
+      same Kaggle dataset key on a numeric `id`, not title, so joining them
+      onto movies_data_collection needs a local id-based join (pandas merge
+      on `id` before the title fuzzy-match) that the current single-CSV
+      KaggleDatasetConnector doesn't perform. Extending the connector to
+      support a same-dataset join (or a dedicated backfill_cast_crew.py
+      following the backfill_world_bank_macro.py/backfill_imdb_ratings.py
+      pattern in this directory) is named follow-up work for Feature 5, not
+      done here.
+    fields:
+      - source_column: title
+        target_column: movie_name
+        role: resolution_key
+      - source_column: release_date
+        target_column: release_year
+        role: resolution_key
+      - source_column: overview
+        target_column: overview
+        role: data
+        factor: null   # free-text synopsis; not yet a derived factor on its own
+
+  - source_name: imdb_non_commercial
+    entity_type: movie
+    connector_type: file_download
+    url: https://datasets.imdbws.com/title.ratings.tsv.gz
+    skip_registration: true   # documentation row only -- see backfill_imdb_ratings.py
+    notes: >
+      Official IMDb non-commercial export (datasets.imdbws.com), not Kaggle,
+      free for personal/research use, updated daily.
+      title.ratings.tsv.gz (fills imdb_rating) + title.principals.tsv.gz
+      (accurate cast ordering -- a better role_position source than
+      actors_data_collection's current data) + name.basics.tsv.gz.
+      title.ratings.tsv.gz alone has no title text (only tconst,
+      averageRating, numVotes) -- entity resolution needs a local join
+      against title.basics.tsv.gz (tconst -> primaryTitle/startYear) first,
+      which collect_data.py's single-URL-per-row dispatch doesn't do. That
+      two-file join is implemented in backfill_imdb_ratings.py (reuses
+      connectors.entity_resolution/bulk_upsert); not registered as a
+      directly-runnable collect_data.py row to avoid implying `--source
+      imdb_non_commercial` alone would work.
+    fields:
+      - target_column: imdb_rating
+        factor:
+          name: "IMDb Rating"
+          category: Narrative
+          direction: Positive
+          data_type: numeric
+          stated_min: 0
+          stated_max: 10
+
+  - source_name: world_bank
+    entity_type: movie
+    connector_type: api
+    url: https://api.worldbank.org/v2/country/all/indicator/NY.GDP.MKTP.CD
+    skip_registration: true   # documentation row only -- see backfill_world_bank_macro.py
+    notes: >
+      No key needed. Backfills the remaining gap in gdp_usd_billions
+      (90.2% filled today) / inflation_rate_pct (89.7%) -- already the
+      dominant source for both, this only closes the last ~10%. Also the
+      source for a year->country->USD FX table if Feature 0's currency
+      spot-check turns up residual non-USD rows. World Bank's response is a
+      per-country *time series* (many years in one call), not one value per
+      URL, so it doesn't fit ApiConnector's single dot-path shape --
+      implemented instead as backfill_world_bank_macro.py using `requests`
+      directly, keyed on (country, release_year) rather than a fuzzy movie
+      title (gdp_usd_billions/inflation_rate_pct are direct inputs the
+      budget-adjustment step already reads, not a registered factor in their
+      own right, so no `fields[].factor` block here -- registering one would
+      wrongly imply they're independent candidate model features).
+    fields:
+      - target_column: gdp_usd_billions
+        factor: null
+      - target_column: inflation_rate_pct
+        factor: null
+
+  - source_name: sacnilk
+    entity_type: movie
+    connector_type: html_scrape
+    skip_registration: true
+    notes: >
+      Day-wise Indian box-office tracker -- useful for corroborating/
+      backfilling `revenue` on Indian titles at finer granularity than
+      TMDB-style totals. Already partially wired: 729 actor-level
+      sacnilk_url rows were migrated into data_sources by Feature 1's
+      migrate_data_sources.py. A movie-level bulk registration needs a
+      sample page's CSS-selector field_mapping reviewed first -- not guessed
+      at here.
+
+  - source_name: the_numbers
+    entity_type: movie
+    connector_type: html_scrape
+    skip_registration: true
+    notes: >
+      the-numbers.com budget/domestic/international gross pages -- more
+      complete for older/smaller titles than TMDB. No bulk CSV/API; needs a
+      per-title URL pattern and a CSS-selector field_mapping reviewed against
+      a live page, and their terms/request-volume limits checked, before
+      registering real rows.
+
+  - source_name: box_office_mojo
+    entity_type: movie
+    connector_type: null
+    skip_registration: true
+    notes: >
+      Do NOT scrape live -- boxofficemojo.com's terms discourage bulk
+      scraping. Use a periodic community Kaggle mirror instead if
+      daily/weekend market-level breakdowns are needed later.
+
+  - source_name: kulfiy
+    entity_type: actor
+    connector_type: html_scrape
+    skip_registration: true
+    notes: >
+      What "Kulfiy" (kulfiy.com) actually is isn't documented anywhere in
+      this repo. 113 actor-level kulfiy_url rows already exist (migrated by
+      Feature 1's migrate_data_sources.py, connector_type=html_scrape, empty
+      field_mapping). Confirm its purpose with whoever populated these URLs
+      before writing a field_mapping for it -- not guessed at here.
+
+  - source_name: ticket_price_index
+    entity_type: movie
+    connector_type: null
+    skip_registration: true
+    notes: >
+      No clean scrape-ready per-city dataset exists. Hand-curate
+      ticket_price_index(period_start, period_end, region, city_tier,
+      atp_usd, source_url) from PVR Inox's public quarterly
+      investor-relations presentations and the FICCI-EY "Media &
+      Entertainment" annual report -- a manually-updated quarterly reference
+      table, not an automated connector. Table DDL + the join-to-movie logic
+      is Feature 6's job; this row exists only so the source is on the
+      record for this feature's "register every named source" scope.
+
+  - source_name: sensex_nifty
+    entity_type: movie
+    connector_type: null
+    skip_registration: true
+    notes: >
+      BSE Sensex (^BSESN) / NSE Nifty (^NSEI) via the `yfinance` Python
+      library -- a package call against a time series, not a single fetch
+      URL, so it doesn't fit this repo's html_scrape/api/kaggle_csv/
+      file_download connector shapes. market_index_daily population and the
+      sensex_close_at_release/sensex_90d_change_pct features are Feature 6's
+      job; listed here only for the registry record.

@@ -128,7 +128,7 @@ write to them directly, but the column names appear in responses.
 | `author_categories`         | Persisted category labels written by `/user-report` and `/users/sync` |
 | `movies_data_collection`    | 544k-row global movie corpus (budget/revenue/cast/marketing telemetry) backing the standalone revenue-prediction pipeline, see [§13](#13-movie-revenue-prediction-pipeline) |
 | `actors_data_collection`    | Per-movie cast/crew credits, self-joined for cast track-record factors in §13 |
-| `data_sources`              | Feature 1: registry of per-entity source URLs (`sacnilk`/`kulfiy`/`fandango`/...) driving `scripts/collect_data.py`'s connectors |
+| `data_sources`              | Feature 1: registry of per-entity source URLs (`sacnilk`/`kulfiy`/`fandango`/...) driving `scripts/collect_data.py`'s connectors. Extended by Feature 3 with bulk external datasets (Kaggle, IMDb non-commercial exports) — see [§13d](#13d-bulk-external-dataset-registry-feature-3) |
 | `factor_definitions`        | Feature 2: live replacement for the old hardcoded 80-factor catalogue — governs which columns the revenue model trains on. Read/written via the [Factor Registry Admin API](#13-movie-revenue-prediction-pipeline) |
 | `movie_factor_values`       | Feature 2: generic per-movie EAV overflow table for factors with no dedicated column yet |
 
@@ -2039,24 +2039,26 @@ always-NaN feature instead of crashing the whole run.
 #### 13b. Data-source registry + connectors (Feature 1)
 
 Generalizes the per-row URL pattern already on `actors_data_collection`
-(`sacnilk_url`/`kulfiy_url`/`fandango_url`) into a `data_sources` table plus three connector
-implementations, so adding a new scrape/API/Kaggle source is a data-registration step, not a new
-hardcoded column. No REST API — this is a Python-only registry, driven from the CLI or from
+(`sacnilk_url`/`kulfiy_url`/`fandango_url`) into a `data_sources` table plus connector
+implementations, so adding a new scrape/API/Kaggle/file source is a data-registration step, not a
+new hardcoded column. No REST API — this is a Python-only registry, driven from the CLI or from
 `scripts/connectors/schema.register_source(...)` directly. See `scripts/connectors/README.md` for
 the full connector reference.
 
 | Script | Purpose |
 |--------|---------|
 | `python3 scripts/migrate_data_sources.py [--db-*]` | One-time backfill of `data_sources` from the legacy `sacnilk_url`/`kulfiy_url`/`fandango_url` columns on `actors_data_collection`. Safe to re-run (`ON CONFLICT DO NOTHING`). |
-| `python3 scripts/collect_data.py --source <name> --entity-type {movie,actor} [--dry-run]` | Loads matching `data_sources` rows, calls the right connector (`html_scrape`/`api`/`kaggle_csv`), upserts the mapped fields onto `movies_data_collection`/`actors_data_collection` (adding columns with `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` as needed), and writes back `last_fetched_at`/`last_status`/`raw_payload`. |
+| `python3 scripts/collect_data.py --source <name> --entity-type {movie,actor} [--dry-run]` | Loads matching `data_sources` rows, calls the right connector (`html_scrape`/`api`/`kaggle_csv`/`file_download`), upserts the mapped fields onto `movies_data_collection`/`actors_data_collection` (adding columns with `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` as needed, filling only currently-`NULL` columns — see [§13d](#13d-bulk-external-dataset-registry-feature-3)), and writes back `last_fetched_at`/`last_status`/`raw_payload`. |
 
 `data_sources` columns: `id, entity_type ('movie'|'actor'), entity_key, source_name, url,
-connector_type ('html_scrape'|'api'|'kaggle_csv'), field_mapping (jsonb), last_fetched_at,
-last_status, raw_payload (jsonb)`. `entity_key` for a movie is
+connector_type ('html_scrape'|'api'|'kaggle_csv'|'file_download'), field_mapping (jsonb),
+last_fetched_at, last_status, raw_payload (jsonb)`. `entity_key` for a movie is
 `movie_name|release_date|language`; for an actor it's the bare `actor_name` — the same
 `movie_name|release_date|language` composite is reused by Feature 2's `movie_factor_values.movie_key`
 (§13c), so a hand-entered factor value and a scraped source can both be traced to the exact same
-`movies_data_collection` row.
+`movies_data_collection` row. `kaggle_csv`/`file_download` rows are bulk (one dataset/file covers
+many movies) and use the sentinel `entity_key = "__bulk__"` instead of one real movie's key — see
+§13d for how those rows get matched to actual `movies_data_collection` rows.
 
 #### 13c. Factor Registry (Feature 2)
 
@@ -2155,4 +2157,59 @@ composite — matching `movies_data_collection`'s own primary key — whereas
 since `dedupe_movies()` collapses every dubbed-language release of a film into one training row.
 The script translates between the two automatically when resolving an `eav`-typed factor; API
 callers only ever need the canonical three-part form shown above.
+
+#### 13d. Bulk external dataset registry (Feature 3)
+
+Where the raw data behind §13a's model actually comes from. Every named source from the
+project plan (Kaggle datasets, IMDb's official non-commercial export, World Bank Open Data,
+plus the sources that are deliberately *not* auto-registered — Box Office Mojo, a hand-curated
+ticket-price index, Sensex/Nifty, and two sources pending confirmation) is declared once in
+`scripts/sources.yaml` and registered through Feature 1/2's tables — no dataset gets wired into
+`movie_revenue_impact_model.py`'s SQL by hand the way today's 12 measurable factors are.
+
+| Script | Purpose |
+|--------|---------|
+| `python3 scripts/register_sources.py [--sources-file <path>] [--dry-run]` | Reads `sources.yaml` and, for every entry not marked `skip_registration: true`, upserts a `data_sources` row (Feature 1) plus a `candidate` `factor_definitions` row (Feature 2) for each of its target columns that names a `factor:` block. Idempotent — safe to re-run. |
+| `python3 scripts/backfill_world_bank_macro.py [--dry-run]` | Fills the remaining ~10% gap in `gdp_usd_billions`/`inflation_rate_pct` from the World Bank Open Data API, keyed on `(country, release_year)` — not a fuzzy title match, since World Bank has no notion of a movie. `country` is a free-text, sometimes comma-separated co-production list; the first-listed country is treated as the primary market (a documented approximation, same category as `FESTIVE_WINDOWS`). |
+| `python3 scripts/backfill_imdb_ratings.py [--min-votes <n>] [--dry-run]` | Fills `imdb_rating` from IMDb's non-commercial export (`datasets.imdbws.com`, not Kaggle). Joins `title.basics.tsv.gz` + `title.ratings.tsv.gz` locally on `tconst` (ratings alone has no title text to match on), then fuzzy-matches the joined rows the same way `collect_data.py`'s bulk sources do. |
+
+**Why two dedicated backfill scripts instead of just more `data_sources` rows:** the generic
+connector dispatch (`collect_data.py`) assumes one `fetch(url)` call produces either one entity's
+values or one self-contained bulk file. World Bank's API returns a whole country's GDP *time
+series* per call (not fitting a single dot-path), and IMDb's ratings file alone has no title text
+to resolve against (fitting neither shape) — both are still registered as documentation-only
+`data_sources` rows (`skip_registration: true` in `sources.yaml`) so the source is on the record,
+but their actual fetch/join logic lives in these standalone scripts instead.
+
+**Entity resolution (`scripts/connectors/entity_resolution.py`):** a bulk source's rows are
+addressed by whatever title string that source used, not by `movies_data_collection`'s exact
+primary key — titles rarely match byte-for-byte across sources (punctuation, "The" prefixes,
+re-release naming). `resolve_movie_entity_key(conn, title, release_year)` fuzzy-matches via
+pg_trgm's `%` operator against `idx_movies_data_collection_trgm` (already used the same way by
+`NarrativeNoveltyService`/`GenreLookalikeService` on the Java side), ranked by `similarity()`,
+rejecting anything below a similarity threshold (default `0.35`) rather than accepting a weak
+best-match.
+
+**Fill-null-only writes, everywhere in this feature (`scripts/connectors/bulk_upsert.py`):** every
+write these scripts make is `COALESCE(existing_value, new_value)`, never a blind overwrite —
+these sources exist to backfill gaps (94.3% of rows have no `budget`, 96.6% no `revenue`), and a
+differently-sourced number for a column this table's own pipeline already populated should never
+silently replace it. `collect_data.py`'s single-entity upserts (`html_scrape`/`api` rows) were
+changed to the same `COALESCE` semantics as part of this feature, for the same reason.
+
+**New connector type — `FileDownloadConnector`** (`scripts/connectors/file_download.py`): for a
+plain downloadable file at a fixed URL (gzip auto-detected from a `.gz` suffix, tab- or
+comma-delimited) rather than a Kaggle dataset or a single-entity REST call — the shape IMDb's
+non-commercial exports need. `connector_type` on `data_sources` was widened from 3 to 4 allowed
+values to add it (migrated in place via `ensure_data_sources_schema`, safe on an already-live
+database).
+
+**Known gap, flagged rather than silently faked:** TMDB 5000's cast/crew and The Movies Dataset's
+`credits.csv`/`keywords.csv` ship as JSON strings / a separate CSV keyed on a numeric `id` — the
+current single-CSV `KaggleDatasetConnector` only renames columns, it doesn't parse embedded JSON
+or join a second file. Only the title-addressable columns from each (`genres`, TMDB's own
+rating/popularity, `overview`) are registered today; extending the connector (or a dedicated
+`backfill_cast_crew.py` following this section's two-script pattern) to join `credits.csv` in is
+named follow-up work for the cast/crew track-record factors, not done here — see `sources.yaml`'s
+notes on `the_movies_dataset` for the exact reasoning.
 

@@ -1,23 +1,50 @@
-# Data-source connectors (Feature 1)
+# Data-source connectors (Feature 1, extended by Feature 3)
 
 Generalizes the per-row URL pattern already on `actors_data_collection`
 (`sacnilk_url`/`kulfiy_url`/`fandango_url`) into a queryable registry table,
-`data_sources`, plus three connector implementations that know how to actually
+`data_sources`, plus connector implementations that know how to actually
 fetch from it. See `schema.py`'s module docstring for how this table relates
 to Feature 2's `factor_definitions`.
 
 ## Model
 
 - **`data_sources`** (see `schema.py`): one row per (entity, source, url).
-  `connector_type` picks which of the three connectors below handles it;
-  `field_mapping` configures *that* connector without any code change.
+  `connector_type` picks which connector below handles it; `field_mapping`
+  configures *that* connector without any code change.
 - **Connectors** (`base.py`'s `Connector` protocol): `fetch(url) -> dict`.
   - `HtmlScrapeConnector` -- `field_mapping` is `{target_field: css_selector}`.
   - `ApiConnector` -- `field_mapping` is `{target_field: dot.path.into.json}`.
   - `KaggleDatasetConnector` -- `field_mapping` is `{source_csv_col: target_col}`;
     returns bulk `{"rows": [...], "n_rows": N}` since one dataset covers many
-    movies/actors (entity resolution against `movies_data_collection` is
-    Feature 3's fuzzy-match job, not this connector's).
+    movies at once.
+  - `FileDownloadConnector` (Feature 3) -- same `field_mapping`/bulk-result
+    shape as `KaggleDatasetConnector`, for a plain downloadable file at a
+    fixed URL (gzip auto-detected) rather than a Kaggle dataset -- e.g. IMDb's
+    non-commercial exports.
+- **`connectors/entity_resolution.py`** (Feature 3) -- fuzzy `(title,
+  release_year)` matching against `movies_data_collection` via pg_trgm's `%`
+  operator on `idx_movies_data_collection_trgm`, the same approach
+  `NarrativeNoveltyService`/`GenreLookalikeService` use on the Java side.
+  Needed because a bulk connector's rows are addressed by whatever title
+  string the source used, not by `movies_data_collection`'s exact primary key.
+- **`connectors/bulk_upsert.py`** (Feature 3) -- `resolve_and_upsert_bulk_movie_rows`
+  wires `entity_resolution` together with a **fill-null-only** (`COALESCE`)
+  write: a bulk source is backfilling gaps, so a differently-sourced value
+  for an already-populated column is never written over it. Shared by
+  `collect_data.py` (for `data_sources` rows with `connector_type` in
+  `kaggle_csv`/`file_download`) and by `backfill_world_bank_macro.py`/
+  `backfill_imdb_ratings.py` (sources whose real fetch shape -- a per-country
+  time series, a two-file join -- doesn't fit the generic per-row dispatch;
+  see `sources.yaml`'s notes on each).
+- **`sources.yaml`** (one directory up, Feature 3) -- the declarative list of
+  every named external dataset from the plan (TMDB 5000, The Movies Dataset,
+  IMDb non-commercial, World Bank, Sacnilk, The Numbers, Box Office Mojo,
+  ticket price index, Sensex/Nifty), each with its `field_mapping` and, where
+  applicable, the `factor_definitions` metadata for the columns it fills.
+  `register_sources.py` (one directory up) reads it and registers everything
+  that isn't `skip_registration: true` (manual-only, not-to-be-scraped,
+  purpose-unconfirmed, or needing a local multi-file join -- see that file's
+  header comment).
 - **`collect_data.py`** (one directory up): the CLI driver --
   `python3 collect_data.py --source sacnilk --entity-type actor [--dry-run]`.
 - **`migrate_data_sources.py`** (one directory up): the one-time backfill from
@@ -79,9 +106,17 @@ connector instance.
 
 ## Tests
 
-`tests/` has one unit test per connector type, using local HTML/JSON fixtures
-under `tests/fixtures/` -- no live network calls. Run with:
+`tests/` has one unit test per connector type plus `entity_resolution`/
+`bulk_upsert` (a fake psycopg2-shaped connection stands in for Postgres --
+still no live network or database calls). Run with:
 
 ```bash
 python3 -m unittest discover -s scripts/connectors/tests -t scripts -v
+```
+
+`scripts/tests/` (one directory up) covers `backfill_world_bank_macro.py`/
+`backfill_imdb_ratings.py` the same way:
+
+```bash
+python3 -m unittest discover -s scripts/tests -t scripts -v
 ```
