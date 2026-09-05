@@ -3234,6 +3234,25 @@ def main() -> None:
         champion_scaler, champion_model = fit_champion_on_full_corpus(
             champion_factories[champion_name], model_df, cols, sample_weight=sample_weight)
 
+        # Feature 10: the champion's OWN out-of-fold predictions/accuracy --
+        # NOT the fixed-GBR accuracy_summary/predictions computed earlier in
+        # this function (that pipeline predates compare_models() and stays a
+        # GBR-specific baseline in output/movie_revenue_predictions.csv,
+        # unchanged, per the plan's "keep cross_validated_predictions_for
+        # machinery unchanged" note on Feature 8). Persisting to Postgres
+        # under model_name=champion_name with GBR's numbers would silently
+        # mislabel a different model's accuracy as the champion's -- this
+        # genuinely diverges in practice (e.g. a catboost champion's own
+        # 49.4% median |%err| vs. GBR's 51.8% on the same India-only corpus).
+        champion_oof_pred_log = cross_validated_predictions_for_model(
+            model_df, cols, champion_factories[champion_name], sample_weight=sample_weight)
+        champion_predictions, champion_accuracy_summary = evaluate_full_corpus_accuracy(
+            model_df, champion_oof_pred_log)
+        if args.confidence_bootstrap_iters > 0:
+            champion_predictions = attach_confidence_band(
+                champion_predictions, model_df, cols, model_df["disclosure_likelihood"],
+                sample_weight=sample_weight, n_iters=args.confidence_bootstrap_iters)
+
         if args.skip_shap:
             print("Skipping SHAP explanation step (--skip-shap).")
         else:
@@ -3274,6 +3293,8 @@ def main() -> None:
             [json.dumps(d) for d in shap_top_drivers_by_row], index=model_df.index, name="top_shap_drivers")
         predictions = predictions.join(shap_drivers_series, how="left")
         write_prediction_outputs(predictions, accuracy_summary, args.output_dir)
+        if champion_name is not None:
+            champion_predictions = champion_predictions.join(shap_drivers_series, how="left")
 
     # Feature 10/11: persist backtested predictions, factor scores, and this
     # run's accuracy summary (appended to model_comparison_history, Feature
@@ -3288,9 +3309,10 @@ def main() -> None:
             db_conn = get_connection(args)
             try:
                 n_persisted = persist_movie_revenue_predictions(
-                    db_conn, predictions, champion_name, model_version, factor_keys_used)
+                    db_conn, champion_predictions, champion_name, model_version, factor_keys_used)
                 persist_factor_impact_scores(db_conn, factor_table)
-                persist_model_comparison_history(db_conn, champion_name, accuracy_summary, factor_keys_used)
+                persist_model_comparison_history(
+                    db_conn, champion_name, champion_accuracy_summary, factor_keys_used)
             finally:
                 db_conn.close()
             print(f"Feature 10: persisted {n_persisted} movie_revenue_predictions row(s), "
