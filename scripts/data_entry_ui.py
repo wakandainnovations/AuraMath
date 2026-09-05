@@ -220,16 +220,36 @@ EDIT_TEMPLATE = """
  table.cast input { width: 100%; padding: 3px; }
  .backlink { display:block; margin-bottom: 1rem; }
  .flash { background: #eaffea; border: 1px solid #b6e6b6; padding: 6px 10px; border-radius: 4px; margin-bottom: 1rem; }
+ .flash.error { background: #ffecec; border-color: #e6b6b6; }
 </style></head><body>
 <a class="backlink" href="{{ back_url }}">&larr; back to list</a>
 {% if saved %}<div class="flash">Saved.</div>{% endif %}
+{% if error %}<div class="flash error">{{ error }}</div>{% endif %}
 <h1>{{ movie.movie_name }}</h1>
-<div class="identity">{{ movie.release_date }} &middot; {{ movie.language }}{% if movie.id %} &middot; id {{ movie.id }}{% endif %}</div>
+<div class="identity">{% if movie.id %}id {{ movie.id }}{% endif %}</div>
 
 <form method="post" action="{{ url_for('save_movie') }}">
-  <input type="hidden" name="movie_name" value="{{ movie.movie_name }}">
-  <input type="hidden" name="release_date" value="{{ movie.release_date }}">
-  <input type="hidden" name="language" value="{{ movie.language }}">
+  <input type="hidden" name="orig_movie_name" value="{{ movie.movie_name }}">
+  <input type="hidden" name="orig_release_date" value="{{ movie.release_date }}">
+  <input type="hidden" name="orig_language" value="{{ movie.language }}">
+
+  <fieldset><legend>Identity</legend>
+    <div class="field">
+      <label for="movie_name">Movie name</label>
+      <input type="text" id="movie_name" name="movie_name" value="{{ movie.movie_name }}">
+    </div>
+    <div class="field">
+      <label for="release_date">Release date (YYYY-MM-DD or YYYY)</label>
+      <input type="text" id="release_date" name="release_date" value="{{ movie.release_date }}">
+    </div>
+    <div class="field">
+      <label for="language">Language</label>
+      <input type="text" id="language" name="language" value="{{ movie.language }}">
+    </div>
+    <div class="field"><span class="hint">These three together are this row's primary key -- changing any of
+      them renames the row (and re-links its cast/crew rows below) rather than creating a new one. If another
+      movie already has the combination you type, the save is rejected rather than merging the two.</span></div>
+  </fieldset>
 
   <fieldset><legend>Core</legend>
   {% for col, label, kind, hint in fields[:9] %}
@@ -353,6 +373,7 @@ def edit_movie():
     release_date = request.args.get("release_date", "")
     language = request.args.get("language", "")
     saved = request.args.get("saved") == "1"
+    error = request.args.get("error")
 
     conn = get_conn()
     try:
@@ -379,13 +400,25 @@ def edit_movie():
                         incomplete=request.args.get("from_incomplete", ""),
                         page=request.args.get("from_page", 0))
     return render_template_string(
-        EDIT_TEMPLATE, movie=movie, cast=cast, fields=MOVIE_FIELDS, saved=saved, back_url=back_url)
+        EDIT_TEMPLATE, movie=movie, cast=cast, fields=MOVIE_FIELDS, saved=saved, error=error, back_url=back_url)
 
 
 @app.route("/movie/save", methods=["POST"])
 def save_movie():
     f = request.form
-    movie_name, release_date, language = f["movie_name"], f["release_date"], f["language"]
+    orig_movie_name = f["orig_movie_name"]
+    orig_release_date = f["orig_release_date"]
+    orig_language = f["orig_language"]
+
+    movie_name = f.get("movie_name", "").strip()
+    release_date = f.get("release_date", "").strip()
+    language = f.get("language", "").strip()
+    if not movie_name or not release_date or not language:
+        return redirect(url_for("edit_movie", movie_name=orig_movie_name, release_date=orig_release_date,
+                                 language=orig_language,
+                                 error="Movie name, release date, and language can't be blank."))
+
+    identity_changed = (movie_name, release_date, language) != (orig_movie_name, orig_release_date, orig_language)
 
     text_cols = ["genre", "country", "directors", "production_companies", "cbfc_rating",
                  "release_event_type", "release_event_name", "release_event_detail",
@@ -393,7 +426,7 @@ def save_movie():
     num_cols = ["runtime_mins", "budget", "revenue", "trailer_views", "trailer_comments",
                 "teaser_views", "teaser_comments", "song_views", "song_comments"]
 
-    updates: dict = {}
+    updates: dict = {"movie_name": movie_name, "release_date": release_date, "language": language}
     for c in text_cols:
         v = f.get(c, "").strip()
         updates[c] = v if v else None
@@ -407,12 +440,41 @@ def save_movie():
     set_clause = ", ".join(f"{c} = %s" for c in updates)
     conn = get_conn()
     try:
+        if identity_changed:
+            # movie_name/release_date/language together are the primary key --
+            # renaming into a combination that already belongs to a different
+            # row would either violate the PK constraint or silently merge two
+            # movies' data. Check first and reject with a clear message
+            # instead of either outcome.
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM movies_data_collection WHERE movie_name = %s "
+                    "AND release_date = %s AND language = %s",
+                    (movie_name, release_date, language),
+                )
+                if cur.fetchone() is not None:
+                    return redirect(url_for(
+                        "edit_movie", movie_name=orig_movie_name, release_date=orig_release_date,
+                        language=orig_language,
+                        error=f"Another movie already exists at ({movie_name!r}, {release_date!r}, "
+                              f"{language!r}) -- pick a combination that isn't already in use."))
+
         with conn.cursor() as cur:
             cur.execute(
                 f"UPDATE movies_data_collection SET {set_clause} "
                 f"WHERE movie_name = %s AND release_date = %s AND language = %s",
-                list(updates.values()) + [movie_name, release_date, language],
+                list(updates.values()) + [orig_movie_name, orig_release_date, orig_language],
             )
+            if identity_changed and (movie_name, release_date) != (orig_movie_name, orig_release_date):
+                # actors_data_collection keys cast/crew rows on (movie_name, release_date)
+                # (language isn't part of its primary key) -- re-point them at the new
+                # identity so this movie's cast doesn't silently disappear from the edit
+                # page after a rename.
+                cur.execute(
+                    "UPDATE actors_data_collection SET movie_name = %s, release_date = %s "
+                    "WHERE movie_name = %s AND release_date = %s",
+                    (movie_name, release_date, orig_movie_name, orig_release_date),
+                )
         conn.commit()
 
         if f.get("action") == "save_next":
