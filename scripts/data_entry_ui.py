@@ -239,7 +239,7 @@ EDIT_TEMPLATE = """
       <input type="text" id="movie_name" name="movie_name" value="{{ movie.movie_name }}">
     </div>
     <div class="field">
-      <label for="release_date">Release date (YYYY-MM-DD or YYYY)</label>
+      <label for="release_date">Release date (YYYY-MM-DD)</label>
       <input type="text" id="release_date" name="release_date" value="{{ movie.release_date }}">
     </div>
     <div class="field">
