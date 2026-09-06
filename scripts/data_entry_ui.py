@@ -174,6 +174,18 @@ LIST_TEMPLATE = """
 <div class="controls">
   <form method="get">
     <input type="text" name="q" placeholder="Search movie name..." value="{{ q }}">
+    <select name="language" onchange="this.form.submit()">
+      <option value="">All languages</option>
+      {% for lang in languages %}
+      <option value="{{ lang }}" {{ 'selected' if lang == language else '' }}>{{ lang }}</option>
+      {% endfor %}
+    </select>
+    <select name="year" onchange="this.form.submit()">
+      <option value="">All years</option>
+      {% for yr in years %}
+      <option value="{{ yr }}" {{ 'selected' if yr == year else '' }}>{{ yr }}</option>
+      {% endfor %}
+    </select>
     <label><input type="checkbox" name="incomplete" value="1" {{ 'checked' if incomplete else '' }} onchange="this.form.submit()"> incomplete only</label>
     <button type="submit">Search</button>
   </form>
@@ -189,14 +201,14 @@ LIST_TEMPLATE = """
   <td><span class="bar"><span class="fill" style="width:{{ (m.filled*100//m.total) if m.total else 0 }}%"></span></span>
       <span class="badge">{{ m.filled }}/{{ m.total }}</span></td>
   <td>{{ m.cast_count }}</td>
-  <td><a href="{{ url_for('edit_movie', movie_name=m.movie_name, release_date=m.release_date, language=m.language, from_q=q, from_incomplete=('1' if incomplete else ''), from_page=page) }}">Edit</a></td>
+  <td><a href="{{ url_for('edit_movie', movie_name=m.movie_name, release_date=m.release_date, language=m.language, from_q=q, from_language=language, from_year=year, from_incomplete=('1' if incomplete else ''), from_page=page) }}">Edit</a></td>
 </tr>
 {% endfor %}
 </table>
 <div class="pager">
-  {% if page > 0 %}<a href="?q={{ q }}&incomplete={{ '1' if incomplete else '' }}&page={{ page-1 }}">&larr; Newer</a>{% endif %}
+  {% if page > 0 %}<a href="?q={{ q }}&language={{ language }}&year={{ year }}&incomplete={{ '1' if incomplete else '' }}&page={{ page-1 }}">&larr; Newer</a>{% endif %}
   <span class="badge">page {{ page+1 }}</span>
-  {% if has_next %}<a href="?q={{ q }}&incomplete={{ '1' if incomplete else '' }}&page={{ page+1 }}">Older &rarr;</a>{% endif %}
+  {% if has_next %}<a href="?q={{ q }}&language={{ language }}&year={{ year }}&incomplete={{ '1' if incomplete else '' }}&page={{ page+1 }}">Older &rarr;</a>{% endif %}
 </div>
 </body></html>
 """
@@ -232,6 +244,8 @@ EDIT_TEMPLATE = """
   <input type="hidden" name="orig_movie_name" value="{{ movie.movie_name }}">
   <input type="hidden" name="orig_release_date" value="{{ movie.release_date }}">
   <input type="hidden" name="orig_language" value="{{ movie.language }}">
+  <input type="hidden" name="filter_language" value="{{ filter_language }}">
+  <input type="hidden" name="filter_year" value="{{ filter_year }}">
 
   <fieldset><legend>Identity</legend>
     <div class="field">
@@ -321,6 +335,8 @@ EDIT_TEMPLATE = """
 def list_movies():
     q = request.args.get("q", "").strip()
     incomplete = request.args.get("incomplete") == "1"
+    language = request.args.get("language", "").strip()
+    year = request.args.get("year", "").strip()
     page = max(0, int(request.args.get("page", 0) or 0))
 
     where = [INDIA_MARKET_SQL]
@@ -328,6 +344,13 @@ def list_movies():
     if q:
         where.append("movie_name ILIKE %s")
         params.append(f"%{q}%")
+    if language:
+        where.append("LOWER(language) = LOWER(%s)")
+        params.append(language)
+    if year:
+        # release_date is stored as text, always YYYY-MM-DD -- no need for a date cast.
+        where.append("LEFT(release_date, 4) = %s")
+        params.append(year)
     if incomplete:
         where.append("(budget IS NULL OR revenue IS NULL OR genre IS NULL OR genre = '' "
                       "OR directors IS NULL OR directors = '')")
@@ -336,6 +359,24 @@ def list_movies():
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Distinct languages among India-market rows, for the filter dropdown --
+            # unaffected by the other filters above so the option list doesn't shrink
+            # as you narrow the results.
+            cur.execute(
+                f"SELECT DISTINCT language, LOWER(language) AS lang_sort "
+                f"FROM movies_data_collection WHERE {INDIA_MARKET_SQL} "
+                f"ORDER BY lang_sort",
+                [INDIA_MARKET_PARAM],
+            )
+            languages = [r["language"] for r in cur.fetchall()]
+
+            cur.execute(
+                f"SELECT DISTINCT LEFT(release_date, 4) AS yr FROM movies_data_collection "
+                f"WHERE {INDIA_MARKET_SQL} AND release_date ~ '^[0-9]{{4}}-' ORDER BY yr DESC",
+                [INDIA_MARKET_PARAM],
+            )
+            years = [r["yr"] for r in cur.fetchall()]
+
             cur.execute(f"SELECT count(*) AS n FROM movies_data_collection {where_sql}", params)
             total = cur.fetchone()["n"]
 
@@ -363,6 +404,7 @@ def list_movies():
 
     return render_template_string(
         LIST_TEMPLATE, movies=movies, total=total, q=q, incomplete=incomplete,
+        language=language, languages=languages, year=year, years=years,
         page=page, has_next=(page + 1) * PAGE_SIZE < total,
     )
 
@@ -396,11 +438,15 @@ def edit_movie():
     finally:
         conn.close()
 
+    filter_language = request.args.get("from_language", "")
+    filter_year = request.args.get("from_year", "")
     back_url = url_for("list_movies", q=request.args.get("from_q", ""),
+                        language=filter_language, year=filter_year,
                         incomplete=request.args.get("from_incomplete", ""),
                         page=request.args.get("from_page", 0))
     return render_template_string(
-        EDIT_TEMPLATE, movie=movie, cast=cast, fields=MOVIE_FIELDS, saved=saved, error=error, back_url=back_url)
+        EDIT_TEMPLATE, movie=movie, cast=cast, fields=MOVIE_FIELDS, saved=saved, error=error, back_url=back_url,
+        filter_language=filter_language, filter_year=filter_year)
 
 
 @app.route("/movie/save", methods=["POST"])
@@ -409,13 +455,15 @@ def save_movie():
     orig_movie_name = f["orig_movie_name"]
     orig_release_date = f["orig_release_date"]
     orig_language = f["orig_language"]
+    filter_language = f.get("filter_language", "").strip()
+    filter_year = f.get("filter_year", "").strip()
 
     movie_name = f.get("movie_name", "").strip()
     release_date = f.get("release_date", "").strip()
     language = f.get("language", "").strip()
     if not movie_name or not release_date or not language:
         return redirect(url_for("edit_movie", movie_name=orig_movie_name, release_date=orig_release_date,
-                                 language=orig_language,
+                                 language=orig_language, from_language=filter_language, from_year=filter_year,
                                  error="Movie name, release date, and language can't be blank."))
 
     identity_changed = (movie_name, release_date, language) != (orig_movie_name, orig_release_date, orig_language)
@@ -455,7 +503,7 @@ def save_movie():
                 if cur.fetchone() is not None:
                     return redirect(url_for(
                         "edit_movie", movie_name=orig_movie_name, release_date=orig_release_date,
-                        language=orig_language,
+                        language=orig_language, from_language=filter_language, from_year=filter_year,
                         error=f"Another movie already exists at ({movie_name!r}, {release_date!r}, "
                               f"{language!r}) -- pick a combination that isn't already in use."))
 
@@ -478,25 +526,33 @@ def save_movie():
         conn.commit()
 
         if f.get("action") == "save_next":
+            next_where = ["(release_date < %(rd)s OR (release_date = %(rd)s AND movie_name > %(mn)s) "
+                          "OR (release_date = %(rd)s AND movie_name = %(mn)s AND language > %(lg)s))"]
+            next_params = {"rd": release_date, "mn": movie_name, "lg": language}
+            if filter_language:
+                next_where.append("LOWER(language) = LOWER(%(fl)s)")
+                next_params["fl"] = filter_language
+            if filter_year:
+                next_where.append("LEFT(release_date, 4) = %(fy)s")
+                next_params["fy"] = filter_year
             with conn.cursor() as cur:
                 cur.execute(
-                    """SELECT movie_name, release_date, language FROM movies_data_collection
-                       WHERE release_date < %(rd)s
-                          OR (release_date = %(rd)s AND movie_name > %(mn)s)
-                          OR (release_date = %(rd)s AND movie_name = %(mn)s AND language > %(lg)s)
-                       ORDER BY release_date DESC, movie_name ASC, language ASC
-                       LIMIT 1""",
-                    {"rd": release_date, "mn": movie_name, "lg": language},
+                    f"""SELECT movie_name, release_date, language FROM movies_data_collection
+                        WHERE {" AND ".join(next_where)}
+                        ORDER BY release_date DESC, movie_name ASC, language ASC
+                        LIMIT 1""",
+                    next_params,
                 )
                 nxt = cur.fetchone()
             if nxt:
                 return redirect(url_for("edit_movie", movie_name=nxt[0], release_date=nxt[1],
-                                         language=nxt[2], saved=1))
+                                         language=nxt[2], saved=1, from_language=filter_language,
+                                         from_year=filter_year))
     finally:
         conn.close()
 
     return redirect(url_for("edit_movie", movie_name=movie_name, release_date=release_date,
-                             language=language, saved=1))
+                             language=language, saved=1, from_language=filter_language, from_year=filter_year))
 
 
 @app.route("/movie/cast/add", methods=["POST"])

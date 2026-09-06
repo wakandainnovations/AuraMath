@@ -44,6 +44,7 @@ src/main/resources/secrets.txt
 
 ### Python ###
 __pycache__/
+.venv/
 /output/
 # Feature 8: persisted revenue_model_*.joblib/disclosure_classifier_*.joblib artifacts -- generated, not source.
 /models/
